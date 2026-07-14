@@ -72,6 +72,12 @@
       "prompt": "This Codex task has two workspace roots and its prompts landed in the wrong project's Prompt Harness. Bind the native session to D:\\PHD\\historyCMAB, migrate its prompts and images, and keep an audit trail without deleting source JSONL.",
       "expected_output": "An append-only session binding makes the destination authoritative; the exact native transcript is reconciled there, retained images are copied content-addressably, matching rows in the old store receive append-only exclusions, derived views are rebuilt, and both stores pass doctor.",
       "files": []
+    },
+    {
+      "id": 13,
+      "prompt": "I kept a Codex CLI task open while upgrading Prompt Harness. The task still has the old plugin version in its startup context and now shows UserPromptSubmit hook (failed) because that cache directory disappeared. Make future long-lived CLI and Desktop tasks keep capturing after upgrades without storing prompt text in error logs.",
+      "expected_output": "The hook resolves the newest available installed launcher at invocation time, safely no-ops if no runtime remains, suppresses capture exceptions at the hook boundary, writes prompt-free diagnostics, and passes a regression that simulates a deleted originally loaded cache.",
+      "files": []
     }
   ]
 }

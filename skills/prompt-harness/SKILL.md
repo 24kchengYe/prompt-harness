@@ -80,7 +80,7 @@ Read [event-schema.md](../../references/event-schema.md) when changing the event
 
 ## Hook behavior
 
-The plugin's `UserPromptSubmit` hook performs a bounded local append/copy, queues detached reconciliation, and returns success so source checking does not block the model. Full discovery occurs only when source cursors are absent or an operator explicitly forces it; normal turns read changed tails. A standalone installer is available for Claude Code and global Codex hooks. Do not enable both the Codex plugin hook and the global Codex hook:
+The plugin's `UserPromptSubmit` hook performs a bounded local append/copy, queues detached reconciliation, and returns success so source checking does not block the model. Its command resolves an available Prompt Harness launcher at invocation time instead of permanently depending on the versioned plugin root loaded when a task started. Tasks created with version `0.7.0+` therefore survive later plugin cache replacement; if the runtime is entirely absent, the hook exits successfully and records no prompt. Capture exceptions produce prompt-free diagnostics under `~/.prompt-harness/state/`. Full discovery occurs only when source cursors are absent or an operator explicitly forces it; normal turns read changed tails. A standalone installer is available for Claude Code and global Codex hooks. Do not enable both the Codex plugin hook and the global Codex hook:
 
 ```powershell
 python "$env:PLUGIN_ROOT\scripts\install_hooks.py" --platform claude
@@ -101,6 +101,7 @@ The installer must back up existing configuration before editing it and preserve
 ## Failure handling
 
 - If a hook record is missing, inspect the hook payload, transcript path, project-root resolution, and hook trust state before changing the ledger.
+- If Codex reports `UserPromptSubmit hook (failed)` after a plugin upgrade, compare the task-start Prompt Harness version with the current cache. A pre-`0.7.0` task may retain a deleted `$PLUGIN_ROOT`; restart that task or use Stop recovery. For `0.7.0+`, inspect `~/.prompt-harness/state/plugin-hook-errors.jsonl` and `hook-errors.jsonl` before changing data.
 - If image capture is missing, inspect `state/image-misses.jsonl`, the transcript image block, file existence, raster signature, and per-event limits. Do not fetch remote URLs as a fallback.
 - If automatic history is missing, inspect `state/auto-sync.json`, `state/source-cursors.json`, `state/auto-sync-pending.json`, `state/auto-sync-errors.jsonl`, project resolution, and `auto_sync` config before running a manual backfill.
 - If a task has multiple roots or its `cwd` points to the wrong project, verify the native session ID and transcript `session_meta`, inspect `list-bindings`, then use `bind-session --migrate` rather than copying or deleting ledger files by hand.

@@ -32,6 +32,8 @@ flowchart LR
 
 The live path resolves and initializes the project, sanitizes one prompt, appends one JSON line under a lock, and updates a small session summary. If the user sent raster images, it additionally validates bounded local bytes, writes each unique image to a SHA-256-addressed path, and appends an attachment relation. It then launches a detached `auto-sync` process and returns without waiting. It never fetches a remote URL or calls a model, so reconciliation does not block the user's AI turn.
 
+Plugin Hook definitions are loaded when a Codex task starts, while marketplace upgrades may replace versioned cache directories. The bundled command therefore does not execute a permanently captured `$PLUGIN_ROOT` path directly. At each invocation it first uses the loaded root when it still exists, otherwise locates the newest installed Prompt Harness launcher in the active Codex cache. The launcher treats a fully removed runtime as a successful no-op and converts capture exceptions into prompt-free diagnostics. Tasks created with this launcher continue working across later plugin upgrades; tasks created by older releases still need a restart or Stop recovery if their original cache has already disappeared.
+
 Codex tasks created before a plugin hook was installed may keep their original plugin-hook set. An optional `Stop` recovery path initializes the project, uses that task's session ID to read only the latest human row from its native rollout after the turn completes, and schedules the same reconciliation. It records `source.mode=stop_recovery`. New tasks still use `UserPromptSubmit`; matching turn IDs plus prompt hashes prevent the two paths from duplicating an event.
 
 ## Automatic bootstrap and reconciliation
@@ -82,6 +84,8 @@ The user's home directory and filesystem roots are explicitly rejected as projec
 ## Concurrency and recovery
 
 Writes use a cross-platform one-byte advisory lock, append-plus-fsync for events, image relations, supersession relations, and exclusion relations, content-addressed atomic image writes, and atomic replacement for cursors and derived JSON/Markdown files. Canonical JSONL is not silently rewritten. A malformed line can therefore be diagnosed without losing neighboring events.
+
+Hook-boundary diagnostics live under `~/.prompt-harness/state/hook-errors.jsonl` and `plugin-hook-errors.jsonl`. They contain runtime metadata and exception text, never stdin or the submitted prompt body.
 
 ## Derived views
 

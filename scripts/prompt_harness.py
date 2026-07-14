@@ -457,6 +457,28 @@ def harness_home() -> Path:
     return Path(harness_home).expanduser() if harness_home else Path.home() / ".prompt-harness"
 
 
+def record_hook_runtime_error(payload: dict[str, Any], error: Exception) -> None:
+    """Persist hook diagnostics without copying the submitted prompt body."""
+
+    entry = {
+        "timestamp": iso_z(),
+        "component": "capture_hook",
+        "error_type": type(error).__name__,
+        "message": str(error)[:1000],
+        "session_id": payload.get("session_id"),
+        "turn_id": payload.get("turn_id"),
+        "hook_event_name": payload.get("hook_event_name"),
+        "cwd": payload.get("cwd"),
+        "transcript_path": payload.get("transcript_path"),
+    }
+    with contextlib.suppress(Exception):
+        path = harness_home() / "state" / "hook-errors.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(path.with_suffix(".lock")):
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
 def registry_path() -> Path:
     return harness_home() / "projects.json"
 
@@ -1806,10 +1828,7 @@ def record_hook_miss(store: Path, payload: dict[str, Any]) -> None:
             handle.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
-def capture_hook(args: argparse.Namespace) -> int:
-    payload = read_hook_payload()
-    if payload is None:
-        return 0
+def capture_hook_payload(args: argparse.Namespace, payload: dict[str, Any]) -> int:
     platform = args.platform
     if platform == "auto":
         platform = "codex" if payload.get("turn_id") or payload.get("model") else "claude"
@@ -1891,6 +1910,17 @@ def capture_hook(args: argparse.Namespace) -> int:
         source_path=transcript_path,
     )
     return 0
+
+
+def capture_hook(args: argparse.Namespace) -> int:
+    payload = read_hook_payload()
+    if payload is None:
+        return 0
+    try:
+        return capture_hook_payload(args, payload)
+    except Exception as exc:  # Hook capture is best-effort and must not interrupt the active task.
+        record_hook_runtime_error(payload, exc)
+        return 0
 
 
 def claude_project_dir(claude_home: Path, root: Path) -> Path | None:

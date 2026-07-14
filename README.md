@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.6.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.7.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -36,6 +36,7 @@ Prompt Harness 将这些内容整理为：
 | 能力 | 说明 |
 |---|---|
 | 实时捕获 | 通过 `UserPromptSubmit` Hook 在用户提交提示词时快速追加一条事件 |
+| 长任务升级兼容 | Hook 每次运行时解析当前可用插件副本；长时间打开的 CLI/Desktop 任务不会因旧版本缓存被刷新而报错 |
 | 自动引导与对账 | 没有账本时首次全量发现；之后每条输入只检查并读取发生变化的会话文件尾部 |
 | 会话项目绑定 | 多根工作区、旧任务或错误 `cwd` 可显式绑定到一个项目；切换和迁移保持追加式审计 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
@@ -89,7 +90,7 @@ codex plugin add prompt-harness@24kchengye
 
 安装后请：
 
-1. 新建或重新打开一个 Codex 任务；正在运行的旧任务不会热加载刚安装的 Hook。
+1. 新建或重新打开一个 Codex 任务；正在运行的旧任务不会热加载刚安装的 Hook。`0.7.0+` 创建的任务在后续插件升级后会自动前滚到当前可用运行时。
 2. 在 Codex 中运行 `/hooks`，检查并信任 Prompt Harness 的 `UserPromptSubmit` Hook。
 3. 在目标项目里发送一条测试提示词。
 4. 用后文的 `doctor` 命令验证是否已写入。
@@ -106,6 +107,8 @@ codex plugin list
 codex plugin marketplace upgrade 24kchengye
 codex plugin add prompt-harness@24kchengye
 ```
+
+更新后 Hook 定义的哈希会变化，请在 `/hooks` 中重新检查并信任。若某个任务创建于 `0.7.0` 之前且旧缓存已经被清理，它仍可能继续引用已不存在的脚本路径；重开任务即可加载稳定启动器，或者使用后文的旧任务 `Stop` 恢复路径。
 
 卸载插件：
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 - 2026-07-15
+
+- Add a version-resilient plugin hook launcher that resolves the newest available Prompt Harness cache at invocation time, so long-lived Codex CLI and Desktop tasks survive plugin upgrades that remove their originally loaded version directory.
+- Make a missing plugin runtime a successful no-op instead of a visible `UserPromptSubmit hook (failed)` error.
+- Suppress capture-runtime exceptions at the hook boundary and record prompt-free diagnostics under `~/.prompt-harness/state/`.
+- Add regression coverage for deleted old caches, absent runtimes, and privacy-safe launcher failures.
+
 ## 0.6.0 - 2026-07-15
 
 - Add an append-only user-level session binding ledger so a Claude or Codex conversation can be explicitly assigned to one project even when a task exposes multiple workspace roots or stale `cwd` metadata.
