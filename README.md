@@ -1,13 +1,13 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.2.3-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.3.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
 **把散落在 Claude Code 和 Codex 会话中的人类提示词，变成每个项目私有、可追溯、可检索的事实层。**
 
-Prompt Harness 同时提供实时 `UserPromptSubmit` Hook 和历史会话回填。它只保留用户真正输入的指令，排除助手回复、工具输出、子代理、自动注入上下文和导入镜像，并生成事实 Markdown、会话索引和一个无需服务器的交互式 HTML 时间线。
+Prompt Harness 同时提供实时 `UserPromptSubmit` Hook 和历史会话回填。它只保留用户真正输入的指令与用户发送的图片，排除助手回复、工具输出、子代理、自动注入上下文和导入镜像，并生成带图片的事实 Markdown、会话索引和一个无需服务器的交互式 HTML 时间线。
 
 这个事实层将作为后续 badcase 分析、可复现测试和跨模型回归的稳定输入。
 
@@ -39,10 +39,12 @@ Prompt Harness 将这些内容整理为：
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
 | 模型元数据 | 优先使用 Hook 捕获值；历史记录可从 Claude assistant 行或 Codex `turn_context` 可靠推导 |
+| 图片归档 | 保存用户发送的常见栅格图片，按内容哈希去重并嵌入 `PROMPTS.md`；不联网下载 |
+| 文件附件 | 普通文件不复制正文，只在能解析时把附件路径保留在提示词事实中 |
 | 去重与镜像排除 | 合并 Claude 分支历史副本，排除导入 Codex 的 Claude 镜像，同时保留真正的 Codex 续写 |
 | 事实与总结分离 | `PROMPTS.md` 只记录事实；可变化的会话与项目总结单独放在 `reports/` |
 | 离线可视化 | 生成单文件 `timeline.html`，支持会话节点、搜索、Claude/Codex 筛选和提示词展开 |
-| 隐私保护 | 默认不提交提示词数据，省略附件正文并遮盖常见密钥、Token 和密码形态 |
+| 隐私保护 | 默认不提交提示词与图片数据，省略普通附件正文并遮盖常见密钥、Token 和密码形态 |
 | 可验证性 | `doctor` 检查事件 ID、哈希、项目归属、隐私清洗和 JSONL 完整性 |
 
 ## 工作方式
@@ -55,13 +57,15 @@ flowchart LR
   H --> N["清洗与项目归属"]
   B --> N
   N --> E["append-only events/*.jsonl"]
+  N --> A["assets/images + manifest.jsonl"]
   E --> M["事实 PROMPTS.md"]
+  A --> M
   E --> S["可变会话总结"]
   E --> V["离线 HTML 时间线"]
   E -. "event_id" .-> R["未来 badcase 测试"]
 ```
 
-Hook 路径保持很轻：定位项目、清洗一条提示词、加锁追加 JSONL、更新会话元数据，然后立即返回。实时捕获不会做全盘扫描、网络请求或模型调用。
+Hook 路径保持有界：定位项目、清洗一条提示词、加锁追加 JSONL；如有图片，再校验并复制到本地内容哈希路径。实时捕获不会做全盘扫描、网络请求或模型调用。
 
 ## 从公开 GitHub 安装到 Codex
 
@@ -207,6 +211,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 {
   "ok": true,
   "event_count": 388,
+  "image_count": 12,
   "errors": [],
   "warnings": []
 }
@@ -240,6 +245,9 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 <project>/.prompt-harness/
 ├── config.json                       # 项目标识与隐私策略
 ├── events/YYYY/MM/prompts-*.jsonl    # 追加写入的事实源
+├── assets/
+│   ├── images/<sha256>.*              # 用户发送的内容寻址图片
+│   └── manifest.jsonl                 # 图片与 event_id 的追加式关系
 ├── sessions/
 │   ├── claude/*.json                 # Claude 会话派生元数据
 │   └── codex/*.json                  # Codex 会话派生元数据
@@ -261,6 +269,7 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 | 类型 | 文件 | 规则 |
 |---|---|---|
 | 权威事实 | `events/**/*.jsonl` | 日常写入 append-only；只有显式修复命令会净化旧行 |
+| 图片事实 | `assets/images/`、`assets/manifest.jsonl` | 图片按哈希存储；关系按 `event_id` 追加 |
 | 可读事实 | `index/PROMPTS.md` | 只有最小标题、逐条元数据和完整清洗后提示词 |
 | 派生索引 | `catalog.json`、`sessions.json` | 可以重建 |
 | 可变总结 | `reports/*.md` | 允许随新会话改变结论 |
@@ -281,10 +290,13 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 - Session: `...`
 - Event: `phe_...`
 - Source mode: `hook`
+- Images: `1`
 
 ```text
 用户实际输入的提示词
 ```
+
+![P00042 image 1](../assets/images/<sha256>.png)
 ````
 
 平台始终显示。模型只在有可靠证据时显示：
@@ -304,6 +316,7 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 - 会话、轮次、时间、项目根目录和来源引用；
 - 可获得的模型与权限模式；
 - SHA-256、清洗统计和未来 badcase 链接。
+- 用户发送的 PNG、JPEG、GIF、WebP、BMP 图片，以及图片与提示词事件的关系。
 
 排除：
 
@@ -312,10 +325,10 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 - subagent、sidechain 和自动压缩通知；
 - 注入的 `AGENTS.md`、环境、权限与续写包装；
 - Codex 的 `turn_aborted`、内部建议生成和重复 goal 续跑包装；
-- 图片、文档或 base64 附件正文；
+- 普通文件、文档及其他非图片附件正文；
 - Codex 中仅仅镜像 Claude 历史的导入行。
 
-如果用户在提示词中手动写了一个文件路径，路径文本会保留；Prompt Harness 不会为了归档而打开这个路径并复制文件正文。
+如果用户在提示词中手动写了文件路径，或者普通附件块中能解析出本地路径，路径文本会保留；Prompt Harness 不会为了归档而打开这个普通文件并复制正文。图片是明确例外：用户发送的常见栅格图片会保存到 `.prompt-harness/assets/images/`，远程 URL 不下载，SVG 不保存。
 
 ## 去重原则
 
@@ -353,6 +366,7 @@ HTML 读取的是重建后的事实视图，不包含助手输出。
 - `sessions/`
 - `index/`
 - `reports/`
+- `assets/`
 - `visualizations/`
 - `state/`
 - badcase case/run 数据
@@ -360,7 +374,7 @@ HTML 读取的是重建后的事实视图，不包含助手输出。
 此外：
 
 - 常见 API Key、access token、password 和 bearer token 会被替换；
-- 图片、文档和 base64 载荷会替换为省略标记；
+- 用户图片只保存在私有的 `assets/images/`；普通文件正文与非图片 base64 载荷会省略；
 - 全局注册表 `~/.prompt-harness/projects.json` 只记录项目位置，不存提示词；
 - 任何公开导出前都应运行 `doctor`，并人工检查或使用 secret scanner。
 
@@ -398,7 +412,7 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 
 ### Hook 会拖慢每次对话吗？
 
-实时路径只做本地文本清洗和一次加锁追加，不扫描全部历史，不联网，也不调用模型。历史扫描只在显式运行 `backfill` 时发生。
+实时路径只做本地文本清洗、追加和有界图片复制，不扫描全部历史，不联网，也不调用模型。历史扫描只在显式运行 `backfill` 时发生。
 
 ## 故障排查顺序
 
@@ -426,6 +440,7 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 - 自动认定一次会话是否成功；
 - 上传提示词到云端；
 - 读取用户提示词中引用的文件正文；
+- 下载远程图片 URL 或保存 SVG；
 - 自动发布项目提示词数据；
 - 执行 Phase 2 的 badcase 回归测试。
 
@@ -471,7 +486,7 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 - 默认分支：`main`
 - Marketplace：`24kchengye`
 - Plugin：`prompt-harness@24kchengye`
-- 当前版本：`0.2.3`
+- 当前版本：`0.3.0`
 - 可见性：Public
 - License：[MIT](LICENSE)
 

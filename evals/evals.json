@@ -3,8 +3,8 @@
   "evals": [
     {
       "id": 1,
-      "prompt": "Set up prompt capture for this project. Verify that repeated identical human prompts remain separate, API keys are redacted, and an attached image body is not stored.",
-      "expected_output": "A private .prompt-harness ledger is initialized, live hook records pass doctor, repeated submissions produce separate events, secrets are redacted, and attachment bytes are omitted.",
+      "prompt": "Set up prompt capture for this project. Verify that repeated identical human prompts remain separate, API keys are redacted, a sent PNG is archived privately, and an attached PDF only contributes its parseable path.",
+      "expected_output": "A private .prompt-harness ledger is initialized, live hook records pass doctor, repeated submissions produce separate events, secrets are redacted, the PNG is content-addressed and embedded in PROMPTS.md, and the PDF body is not copied.",
       "files": []
     },
     {
@@ -17,6 +17,24 @@
       "id": 3,
       "prompt": "Find every human prompt about major revision in this project and give me the generated Markdown archive path so it can later seed a badcase analysis.",
       "expected_output": "Search results come from canonical human-prompt events, the Markdown index is rebuilt, and stable event IDs are available for future badcase links.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "In an old Codex task, test whether this prompt is captured automatically. Do not run backfill. After the assistant finishes, report event_id, source.mode, platform, model, and image count.",
+      "expected_output": "The check accounts for post-turn Stop timing, reads the next turn without mutating the ledger, and reports stop_recovery metadata or a concrete UTF-8/trust/log diagnosis.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Backfill a Claude base64 PNG and a Codex data-URL JPEG into a ledger that already contains both prompt events, then run it twice.",
+      "expected_output": "No prompt events are rewritten or duplicated; missing image relations are appended once, content-addressed assets are reused, PROMPTS.md embeds both images, and doctor passes.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Archive an image-only user turn containing a remote HTTPS image, an SVG, and a valid local PNG.",
+      "expected_output": "The empty-text prompt event is retained, only the validated local PNG is stored, remote/SVG inputs are omitted with diagnostic records, no network fetch occurs, and doctor reports the omissions as warnings rather than corrupting the ledger.",
       "files": []
     }
   ]

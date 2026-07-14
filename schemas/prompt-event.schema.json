@@ -17,9 +17,9 @@
       "type": "object",
       "required": ["text", "sha256", "chars", "secret_redactions", "attachments_omitted"],
       "properties": {
-        "text": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 0},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-        "chars": {"type": "integer", "minimum": 1},
+        "chars": {"type": "integer", "minimum": 0},
         "secret_redactions": {"type": "integer", "minimum": 0},
         "attachments_omitted": {"type": "integer", "minimum": 0}
       }

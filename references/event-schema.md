@@ -54,6 +54,34 @@ Each line in `events/YYYY/MM/prompts-YYYY-MM-DD.jsonl` is one self-contained JSO
 - Generated indexes are never canonical and may be overwritten.
 - A future badcase record references `event_id`; it does not copy or mutate the source prompt.
 
+## Image attachment sidecar
+
+User-sent raster images do not change the prompt event envelope. Bytes are stored at `assets/images/<sha256>.<ext>` and each event relation is appended to `assets/manifest.jsonl`:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "prompt_image",
+  "attachment_id": "phi_<stable event-and-content hash>",
+  "event_id": "phe_<prompt event hash>",
+  "captured_at": "2026-07-14T04:00:01.000Z",
+  "asset": {
+    "path": "assets/images/<sha256>.png",
+    "sha256": "<sha256>",
+    "bytes": 12345,
+    "media_type": "image/png"
+  },
+  "source": {
+    "kind": "local_path | data_url | base64",
+    "original_name": "diagram.png",
+    "transcript_path": null,
+    "line": null
+  }
+}
+```
+
+The attachment ID is deterministic for one `event_id` plus image hash, so Stop recovery and backfill can add missing image relations without duplicating them or rewriting prompt events. Image-only user turns use an empty prompt string and remain valid because the manifest supplies the attached fact.
+
 ## Identity
 
 Native event or turn identifiers are preferred for event identity. Historical branch recovery uses exact timestamp plus prompt hash to recognize copied history while retaining all native source IDs. A live hook lacking a native turn identifier receives a fresh nonce so repeated identical human prompts are preserved rather than collapsed.

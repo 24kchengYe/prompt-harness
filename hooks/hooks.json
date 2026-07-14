@@ -7,7 +7,7 @@
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/prompt_harness.py\" capture-hook --platform codex",
             "commandWindows": "python \"$env:PLUGIN_ROOT\\scripts\\prompt_harness.py\" capture-hook --platform codex",
-            "timeout": 5,
+            "timeout": 20,
             "statusMessage": "Archiving project prompt"
           }
         ]

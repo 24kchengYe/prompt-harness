@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import io
 import json
 import os
@@ -21,6 +22,10 @@ assert spec and spec.loader
 ph = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ph)
 
+ONE_PIXEL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
 
 def retained_workspace(name: str) -> Path:
     path = ARTIFACTS / f"{name}-{uuid.uuid4().hex[:8]}"
@@ -34,6 +39,157 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class PromptHarnessTests(unittest.TestCase):
+    def test_hook_archives_user_image_and_keeps_only_file_path(self) -> None:
+        base = retained_workspace("hook-image")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        image_path = base / "sent.png"
+        image_path.write_bytes(ONE_PIXEL_PNG)
+        document_path = base / "brief.pdf"
+        payload = {
+            "session_id": "image-session",
+            "turn_id": "image-turn",
+            "cwd": str(project),
+            "prompt": "请分析我发送的材料。",
+            "local_images": [str(image_path)],
+            "attachments": [{"type": "file", "path": str(document_path)}],
+        }
+        env = os.environ.copy()
+        env["PROMPT_HARNESS_HOME"] = str(base / "harness-home")
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPT), "capture-hook", "--platform", "codex"],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        store = project / ".prompt-harness"
+        event = list(ph.iter_events(store))[0]
+        self.assertIn(f"[attached file: {document_path}]", event["prompt"]["text"])
+        self.assertFalse(document_path.exists())
+        images = list(ph.iter_prompt_images(store))
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["event_id"], event["event_id"])
+        asset_path = store / images[0]["asset"]["path"]
+        self.assertEqual(asset_path.read_bytes(), ONE_PIXEL_PNG)
+        self.assertFalse((store / "state" / "image-misses.jsonl").exists())
+        ph.rebuild_index_for_store(store)
+        prompts = (store / "index" / "PROMPTS.md").read_text(encoding="utf-8")
+        self.assertIn(f"![P00001 image 1](../{images[0]['asset']['path']})", prompts)
+        self.assertIn("assets/", (store / ".gitignore").read_text(encoding="utf-8"))
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
+    def test_backfill_images_is_idempotent_for_claude_and_codex(self) -> None:
+        base = retained_workspace("backfill-images")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
+        claude_path = claude_home / "projects" / encoded / "claude-image.jsonl"
+        image_b64 = base64.b64encode(ONE_PIXEL_PNG).decode("ascii")
+        write_jsonl(
+            claude_path,
+            [
+                {
+                    "type": "user",
+                    "uuid": "claude-image-native",
+                    "timestamp": "2026-07-14T01:00:00Z",
+                    "cwd": str(project),
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "Claude image prompt"},
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                            },
+                        ]
+                    },
+                }
+            ],
+        )
+        codex_path = codex_home / "sessions" / "2026" / "rollout-codex-image.jsonl"
+        write_jsonl(
+            codex_path,
+            [
+                {"type": "session_meta", "payload": {"id": "codex-image-session", "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T01:01:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Codex image prompt"},
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{image_b64}"},
+                        ],
+                    },
+                },
+            ],
+        )
+        args = type(
+            "Args",
+            (),
+            {
+                "project": project,
+                "platform": "all",
+                "claude_home": claude_home,
+                "codex_home": codex_home,
+                "rebuild_index": True,
+            },
+        )()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ph.backfill(args), 0)
+        store = project / ".prompt-harness"
+        first_events = list(ph.iter_events(store))
+        first_images = list(ph.iter_prompt_images(store))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ph.backfill(args), 0)
+        self.assertEqual(len(list(ph.iter_events(store))), len(first_events))
+        self.assertEqual(len(list(ph.iter_prompt_images(store))), len(first_images))
+        self.assertEqual(len(first_events), 2)
+        self.assertEqual(len(first_images), 2)
+        self.assertEqual(len(list((store / "assets" / "images").glob("*"))), 1)
+        prompts = (store / "index" / "PROMPTS.md").read_text(encoding="utf-8")
+        self.assertEqual(prompts.count("../assets/images/"), 2)
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
+    def test_image_only_prompt_keeps_valid_local_raster_and_omits_unsafe_sources(self) -> None:
+        base = retained_workspace("image-only")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        png = base / "ok.png"
+        png.write_bytes(ONE_PIXEL_PNG)
+        svg = base / "unsafe.svg"
+        svg.write_text("<svg xmlns='http://www.w3.org/2000/svg'/>", encoding="utf-8")
+        payload = {
+            "session_id": "image-only-session",
+            "turn_id": "image-only-turn",
+            "cwd": str(project),
+            "images": [str(png), str(svg), "https://example.invalid/remote.png"],
+        }
+        args = type("Args", (), {"platform": "codex", "project": project})()
+        stdin = io.StringIO(json.dumps(payload))
+        original_stdin = sys.stdin
+        try:
+            sys.stdin = stdin
+            self.assertEqual(ph.capture_hook(args), 0)
+        finally:
+            sys.stdin = original_stdin
+        store = project / ".prompt-harness"
+        events = list(ph.iter_events(store))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["prompt"]["text"], "")
+        self.assertEqual(len(list(ph.iter_prompt_images(store))), 1)
+        result = ph.doctor_store(store, project)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(any("image attachments were omitted" in warning for warning in result["warnings"]))
+
     def test_hook_privacy_and_repeated_prompt_identity(self) -> None:
         base = retained_workspace("hook")
         project = base / "project"
@@ -332,6 +488,58 @@ Recent Codex tasks in this project:
         self.assertEqual(events[0]["context"]["model"], "gpt-recovery-test")
         self.assertEqual(events[0]["prompt"]["text"], "old thread human prompt")
         self.assertTrue(ph.doctor_store(project / ".prompt-harness", project)["ok"])
+
+    def test_stop_recovery_attaches_image_to_existing_hook_event(self) -> None:
+        base = retained_workspace("stop-recovery-image")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "existing-image-session"
+        turn_id = "existing-image-turn"
+        image_b64 = base64.b64encode(ONE_PIXEL_PNG).decode("ascii")
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T11:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "hook event missing its image"},
+                            {"type": "input_image", "image_url": f"data:image/png;base64,{image_b64}"},
+                        ],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                    },
+                },
+            ],
+        )
+        store, _ = ph.init_store(project)
+        existing = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="hook",
+            prompt_text="hook event missing its image",
+            session_id=session_id,
+            occurred_at="2026-07-14T11:00:00.000Z",
+            turn_id=turn_id,
+        )
+        self.assertTrue(ph.append_event(store, existing))
+        result = ph.recover_codex_stop(
+            {"session_id": session_id, "cwd": str(project)},
+            project=project,
+            codex_home=codex_home,
+        )
+        self.assertEqual(result["reason"], "already_recorded")
+        self.assertEqual(result["event_id"], existing["event_id"])
+        self.assertEqual(result["images"]["saved"], 1)
+        self.assertEqual(len(list(ph.iter_events(store))), 1)
+        self.assertEqual(len(list(ph.iter_prompt_images(store))), 1)
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
 
     def test_stop_recovery_reads_utf8_payload_under_gbk_stdio(self) -> None:
         base = retained_workspace("stop-recovery-utf8")

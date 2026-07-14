@@ -10,6 +10,8 @@ not part of the ledger.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import collections
 import contextlib
 import datetime as dt
@@ -20,6 +22,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -28,6 +31,18 @@ from typing import Any, Iterable, Iterator
 SCHEMA_VERSION = "1.0.0"
 STORE_NAME = ".prompt-harness"
 RECORD_TYPE = "user_prompt"
+IMAGE_RECORD_TYPE = "prompt_image"
+MAX_IMAGES_PER_EVENT = 20
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+IMAGE_MEDIA = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+}
+IMAGE_SUFFIXES = set(IMAGE_MEDIA.values()) | {".jpeg"}
 PROJECT_MARKERS = (
     ".git",
     "AGENTS.md",
@@ -71,6 +86,8 @@ This directory is managed by Prompt Harness.
 - `sessions/` contains derived per-session metadata.
 - `index/` contains rebuildable catalogs, `PROMPTS.md`, and session views.
 - `reports/` contains project-specific narrative analyses and curated exports.
+- `assets/images/` contains content-addressed copies of user-sent raster images.
+- `assets/manifest.jsonl` links those images to immutable prompt `event_id` values.
 - `visualizations/timeline.html` is a rebuildable, local prompt timeline.
 - `state/` contains locks and ingestion state.
 - `badcases/` is reserved for the future evaluation harness.
@@ -86,6 +103,7 @@ events/
 sessions/
 index/
 reports/
+assets/
 visualizations/
 state/
 badcases/cases/
@@ -363,6 +381,20 @@ def atomic_write(path: Path, text: str) -> None:
             os.unlink(tmp_name)
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+
+
 def write_json(path: Path, value: Any) -> None:
     atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
@@ -405,6 +437,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         "sessions/codex",
         "index",
         "reports",
+        "assets/images",
         "visualizations",
         "state",
         "badcases/cases",
@@ -419,6 +452,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
             config = {}
     else:
         config = {}
+    changed_config = False
     if not config:
         config = {
             "schema_version": SCHEMA_VERSION,
@@ -430,16 +464,29 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
                 "store_prompt_text": True,
                 "store_assistant_messages": False,
                 "store_file_bodies": False,
+                "store_user_images": True,
                 "redact_obvious_secrets": True,
                 "git_private_by_default": True,
             },
             "future": {"badcase_schema": "reserved"},
         }
+        changed_config = True
+    else:
+        privacy = config.setdefault("privacy", {})
+        if "store_user_images" not in privacy:
+            privacy["store_user_images"] = True
+            changed_config = True
+    if changed_config:
         write_json(config_path, config)
     if not (store / "README.md").exists():
         atomic_write(store / "README.md", PROJECT_README)
-    if not (store / ".gitignore").exists():
-        atomic_write(store / ".gitignore", PROJECT_GITIGNORE)
+    gitignore_path = store / ".gitignore"
+    if not gitignore_path.exists():
+        atomic_write(gitignore_path, PROJECT_GITIGNORE)
+    else:
+        gitignore_text = gitignore_path.read_text(encoding="utf-8", errors="replace")
+        if not re.search(r"(?m)^assets/?$", gitignore_text):
+            atomic_write(gitignore_path, gitignore_text.rstrip() + "\nassets/\n")
     if not (store / "badcases" / "README.md").exists():
         atomic_write(store / "badcases" / "README.md", BADCASE_README)
     register_project(root, store)
@@ -613,6 +660,370 @@ def append_event(store: Path, event: dict[str, Any], existing_ids: set[str] | No
     return True
 
 
+def image_manifest_file(store: Path) -> Path:
+    return store / "assets" / "manifest.jsonl"
+
+
+def iter_prompt_images(store: Path) -> Iterator[dict[str, Any]]:
+    path = image_manifest_file(store)
+    if path.exists():
+        for _, value in read_jsonl(path):
+            if value.get("record_type") == IMAGE_RECORD_TYPE:
+                yield value
+
+
+def image_candidate_from_value(
+    value: Any,
+    *,
+    media_type: str | None = None,
+    name: str | None = None,
+    base_dir: str | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.lower().startswith("data:image/"):
+        return {"kind": "data_url", "value": raw, "media_type": media_type, "name": name}
+    if raw.lower().startswith(("http://", "https://")):
+        return {"kind": "remote_url", "value": raw, "media_type": media_type, "name": name}
+    if raw.lower().startswith("file://"):
+        parsed = urllib.parse.urlparse(raw)
+        path = urllib.parse.unquote(parsed.path)
+        if os.name == "nt" and re.match(r"^/[A-Za-z]:/", path):
+            path = path[1:]
+        raw = path
+    return {
+        "kind": "local_path",
+        "value": raw,
+        "media_type": media_type,
+        "name": name,
+        "base_dir": base_dir,
+    }
+
+
+def image_candidates_from_blocks(content: Any, *, base_dir: str | None = None) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") not in {"image", "input_image", "local_image"}:
+            continue
+        source = block.get("source") if isinstance(block.get("source"), dict) else {}
+        media_type = str(source.get("media_type") or block.get("media_type") or "") or None
+        name = str(block.get("name") or source.get("name") or "") or None
+        if source.get("type") == "base64" and isinstance(source.get("data"), str):
+            candidates.append(
+                {
+                    "kind": "base64",
+                    "value": source["data"],
+                    "media_type": media_type,
+                    "name": name,
+                }
+            )
+            continue
+        direct = (
+            block.get("image_url")
+            or block.get("path")
+            or block.get("url")
+            or source.get("path")
+            or source.get("url")
+        )
+        candidate = image_candidate_from_value(direct, media_type=media_type, name=name, base_dir=base_dir)
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def image_candidates_from_hook_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    base_dir = str(payload.get("cwd") or "") or None
+    for key in ("local_images", "images", "attachments"):
+        values = payload.get(key)
+        if values is None:
+            continue
+        for value in values if isinstance(values, list) else [values]:
+            if isinstance(value, dict):
+                before = len(candidates)
+                candidates.extend(image_candidates_from_blocks([value], base_dir=base_dir))
+                if len(candidates) == before:
+                    direct = value.get("path") or value.get("url") or value.get("image_url")
+                    media_type = str(value.get("media_type") or "").lower()
+                    block_type = str(value.get("type") or "").lower()
+                    direct_suffix = Path(str(direct or "")).suffix.lower()
+                    looks_like_image = (
+                        key in {"local_images", "images"}
+                        or media_type.startswith("image/")
+                        or block_type in {"image", "input_image", "local_image"}
+                        or direct_suffix in IMAGE_SUFFIXES
+                    )
+                    if looks_like_image:
+                        candidate = image_candidate_from_value(
+                            direct,
+                            media_type=media_type or None,
+                            name=str(value.get("name") or "") or None,
+                            base_dir=base_dir,
+                        )
+                        if candidate:
+                            candidates.append(candidate)
+            else:
+                value_suffix = Path(str(value or "")).suffix.lower()
+                if key in {"local_images", "images"} or value_suffix in IMAGE_SUFFIXES:
+                    candidate = image_candidate_from_value(value, base_dir=base_dir)
+                    if candidate:
+                        candidates.append(candidate)
+    for key in ("prompt", "user_prompt", "userPrompt", "input", "content"):
+        candidates.extend(image_candidates_from_blocks(payload.get(key), base_dir=base_dir))
+    message = payload.get("message")
+    if isinstance(message, dict):
+        candidates.extend(image_candidates_from_blocks(message.get("content"), base_dir=base_dir))
+    specific = payload.get("hookSpecificInput")
+    if isinstance(specific, dict):
+        candidates.extend(image_candidates_from_hook_payload(specific))
+    return candidates
+
+
+def attachment_path_from_block(block: dict[str, Any]) -> str | None:
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    value = (
+        block.get("path")
+        or block.get("file_path")
+        or source.get("path")
+        or source.get("file_path")
+    )
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def file_path_notes_from_hook_payload(payload: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("attachments", "files"):
+        values = payload.get(key)
+        if values is None:
+            continue
+        for value in values if isinstance(values, list) else [values]:
+            if isinstance(value, dict):
+                media_type = str(value.get("media_type") or "").lower()
+                block_type = str(value.get("type") or "").lower()
+                path = attachment_path_from_block(value)
+                if (
+                    path
+                    and not media_type.startswith("image/")
+                    and block_type not in {"image", "input_image", "local_image"}
+                    and Path(path).suffix.lower() not in IMAGE_SUFFIXES
+                ):
+                    paths.append(path)
+            elif isinstance(value, str):
+                stripped = value.strip()
+                if stripped and not stripped.lower().startswith(("http://", "https://", "data:image/")):
+                    if Path(stripped).suffix.lower() not in IMAGE_SUFFIXES:
+                        paths.append(stripped)
+    message = payload.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), list):
+        for block in message["content"]:
+            if isinstance(block, dict) and block.get("type") in {"document", "file", "input_file"}:
+                path = attachment_path_from_block(block)
+                if path:
+                    paths.append(path)
+    specific = payload.get("hookSpecificInput")
+    if isinstance(specific, dict):
+        paths.extend(file_path_notes_from_hook_payload(specific))
+    return list(dict.fromkeys(paths))
+
+
+def append_file_path_notes(prompt: str, paths: list[str]) -> str:
+    missing = [path for path in paths if path not in prompt]
+    if not missing:
+        return prompt
+    notes = "\n".join(f"[attached file: {path}]" for path in missing)
+    return f"{prompt.rstrip()}\n{notes}".lstrip()
+
+
+def sniff_raster_image(data: bytes) -> tuple[str, str] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    if data.startswith(b"BM"):
+        return "image/bmp", ".bmp"
+    return None
+
+
+def candidate_display_name(candidate: dict[str, Any]) -> str | None:
+    if candidate.get("name"):
+        return Path(str(candidate["name"])).name
+    value = str(candidate.get("value") or "")
+    if candidate.get("kind") == "local_path":
+        return Path(value).name
+    if candidate.get("kind") == "remote_url":
+        return Path(urllib.parse.urlparse(value).path).name or None
+    return None
+
+
+def decode_image_candidate(candidate: dict[str, Any]) -> tuple[bytes, str, str, str | None]:
+    kind = str(candidate.get("kind") or "")
+    value = str(candidate.get("value") or "")
+    declared_media = str(candidate.get("media_type") or "").lower()
+    if kind == "remote_url":
+        raise ValueError("remote image URLs are not downloaded")
+    if kind == "local_path":
+        path = Path(value).expanduser()
+        if not path.is_absolute() and candidate.get("base_dir"):
+            path = Path(str(candidate["base_dir"])) / path
+        if not path.is_file():
+            raise ValueError("local image path is missing")
+        if path.stat().st_size > MAX_IMAGE_BYTES:
+            raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes")
+        data = path.read_bytes()
+    elif kind == "data_url":
+        header, separator, encoded = value.partition(",")
+        if not separator or ";base64" not in header.lower():
+            raise ValueError("unsupported non-base64 image data URL")
+        declared_media = header[5:].split(";", 1)[0].lower()
+        compact = re.sub(r"\s+", "", encoded)
+        if len(compact) * 3 // 4 > MAX_IMAGE_BYTES:
+            raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes")
+        try:
+            data = base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid base64 image") from exc
+    elif kind == "base64":
+        compact = re.sub(r"\s+", "", value)
+        if len(compact) * 3 // 4 > MAX_IMAGE_BYTES:
+            raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes")
+        try:
+            data = base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid base64 image") from exc
+    else:
+        raise ValueError("unsupported image source")
+    if not data or len(data) > MAX_IMAGE_BYTES:
+        raise ValueError(f"image exceeds {MAX_IMAGE_BYTES} bytes or is empty")
+    detected = sniff_raster_image(data)
+    if not detected:
+        raise ValueError("unsupported or unrecognized raster image")
+    media_type, extension = detected
+    if declared_media and declared_media.startswith("image/") and declared_media in IMAGE_MEDIA:
+        extension = IMAGE_MEDIA[declared_media] if declared_media == media_type else extension
+    return data, media_type, extension, candidate_display_name(candidate)
+
+
+def persist_prompt_images(
+    store: Path,
+    event_id: str,
+    candidates: list[dict[str, Any]],
+    *,
+    source_path: str | None = None,
+    source_line: int | None = None,
+) -> dict[str, int]:
+    if not candidates:
+        return {"seen": 0, "saved": 0, "omitted": 0}
+    decoded: list[tuple[dict[str, Any], bytes, str, str, str | None, str]] = []
+    failures: list[dict[str, Any]] = []
+    total_bytes = 0
+    seen_hashes: set[str] = set()
+    for candidate in candidates[:MAX_IMAGES_PER_EVENT]:
+        try:
+            data, media_type, extension, original_name = decode_image_candidate(candidate)
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in seen_hashes:
+                continue
+            if total_bytes + len(data) > MAX_IMAGE_TOTAL_BYTES:
+                raise ValueError(f"event images exceed {MAX_IMAGE_TOTAL_BYTES} bytes")
+            seen_hashes.add(digest)
+            total_bytes += len(data)
+            decoded.append((candidate, data, media_type, extension, original_name, digest))
+        except ValueError as exc:
+            failures.append(
+                {
+                    "source_kind": str(candidate.get("kind") or "unknown"),
+                    "original_name": candidate_display_name(candidate),
+                    "reason": str(exc),
+                }
+            )
+    if len(candidates) > MAX_IMAGES_PER_EVENT:
+        failures.append(
+            {
+                "source_kind": "limit",
+                "original_name": None,
+                "reason": f"more than {MAX_IMAGES_PER_EVENT} images were attached",
+            }
+        )
+
+    manifest = image_manifest_file(store)
+    lock = store / "state" / "write.lock"
+    saved = 0
+    with file_lock(lock):
+        existing = {str(item.get("attachment_id") or "") for item in iter_prompt_images(store)}
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        rendered: list[str] = []
+        for candidate, data, media_type, extension, original_name, digest in decoded:
+            attachment_id = "phi_" + sha256_text(f"{event_id}|{digest}")[:32]
+            relative_path = f"assets/images/{digest}{extension}"
+            asset_path = store / Path(relative_path)
+            if asset_path.exists():
+                current = asset_path.read_bytes()
+                if hashlib.sha256(current).hexdigest() != digest:
+                    failures.append(
+                        {
+                            "source_kind": str(candidate.get("kind") or "unknown"),
+                            "original_name": original_name,
+                            "reason": "content-addressed image path is corrupt",
+                        }
+                    )
+                    continue
+            else:
+                atomic_write_bytes(asset_path, data)
+            if attachment_id in existing:
+                continue
+            record = {
+                "schema_version": "1.0.0",
+                "record_type": IMAGE_RECORD_TYPE,
+                "attachment_id": attachment_id,
+                "event_id": event_id,
+                "captured_at": iso_z(),
+                "asset": {
+                    "path": relative_path,
+                    "sha256": digest,
+                    "bytes": len(data),
+                    "media_type": media_type,
+                },
+                "source": {
+                    "kind": str(candidate.get("kind") or "unknown"),
+                    "original_name": original_name,
+                    "transcript_path": source_path,
+                    "line": source_line,
+                },
+            }
+            rendered.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            existing.add(attachment_id)
+            saved += 1
+        if rendered:
+            with manifest.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write("\n".join(rendered) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        if failures:
+            miss_path = store / "state" / "image-misses.jsonl"
+            with miss_path.open("a", encoding="utf-8", newline="\n") as handle:
+                for failure in failures:
+                    handle.write(
+                        json.dumps(
+                            {"recorded_at": iso_z(), "event_id": event_id, **failure},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                handle.flush()
+                os.fsync(handle.fileno())
+    return {"seen": len(candidates), "saved": saved, "omitted": len(failures)}
+
+
 def text_from_blocks(content: Any, *, include_attachments: bool = True) -> tuple[str, bool]:
     if isinstance(content, str):
         return content, False
@@ -629,11 +1040,12 @@ def text_from_blocks(content: Any, *, include_attachments: bool = True) -> tuple
             saw_tool = True
         elif block_type in {"text", "input_text", "output_text"}:
             parts.append(str(block.get("text", "")))
-        elif include_attachments and block_type in {"image", "document", "file"}:
-            source = block.get("source") if isinstance(block.get("source"), dict) else {}
-            path = block.get("path") or source.get("path")
-            suffix = f": {path}" if path else ""
-            parts.append(f"[{block_type} attachment omitted{suffix}]")
+        elif include_attachments and block_type in {"document", "file", "input_file"}:
+            path = attachment_path_from_block(block)
+            if path:
+                parts.append(f"[attached file: {path}]")
+            else:
+                parts.append(f"[{block_type} attachment omitted]")
     return "\n".join(part for part in parts if part), saw_tool
 
 
@@ -648,20 +1060,29 @@ def read_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
                 yield line_no, value
 
 
-def latest_user_from_transcript(path: Path, platform: str) -> str:
-    latest = ""
-    for _, obj in read_jsonl(path):
+def latest_user_record_from_transcript(path: Path, platform: str) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    for line_no, obj in read_jsonl(path):
         if platform == "claude" and obj.get("type") == "user" and isinstance(obj.get("message"), dict):
-            text, saw_tool = text_from_blocks(obj["message"].get("content"))
-            if text.strip() and not saw_tool:
-                latest = text
+            content = obj["message"].get("content")
+            text, saw_tool = text_from_blocks(content)
+            images = image_candidates_from_blocks(content, base_dir=str(path.parent))
+            if (text.strip() or images) and not (saw_tool and not text.strip() and not images):
+                latest = {"text": text, "images": images, "line": line_no}
         elif platform == "codex" and obj.get("type") == "response_item":
             payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
             if payload.get("type") == "message" and payload.get("role") == "user":
-                text, _ = text_from_blocks(payload.get("content"))
-                if text.strip():
-                    latest = text
+                content = payload.get("content")
+                text, _ = text_from_blocks(content)
+                images = image_candidates_from_blocks(content, base_dir=str(path.parent))
+                if text.strip() or images:
+                    latest = {"text": text, "images": images, "line": line_no}
     return latest
+
+
+def latest_user_from_transcript(path: Path, platform: str) -> str:
+    record = latest_user_record_from_transcript(path, platform)
+    return str(record.get("text") or "") if record else ""
 
 
 def prompt_from_hook_payload(payload: dict[str, Any]) -> str:
@@ -717,15 +1138,18 @@ def latest_codex_prompt_event(path: Path) -> dict[str, Any] | None:
         payload = obj["payload"]
         if payload.get("type") != "message" or payload.get("role") != "user":
             continue
-        raw_text, _ = text_from_blocks(payload.get("content"))
-        if is_automatic_prompt(raw_text):
+        content = payload.get("content")
+        raw_text, _ = text_from_blocks(content)
+        images = image_candidates_from_blocks(content, base_dir=str(path.parent))
+        if raw_text.strip() and is_automatic_prompt(raw_text) and not images:
             continue
         text, sanitation = sanitize_prompt(raw_text, backfill=True)
-        if not text or is_automatic_prompt(text):
+        if (not text and not images) or (text and is_automatic_prompt(text) and not images):
             continue
         occurred = parse_iso(obj.get("timestamp"))
         return {
             "text": text,
+            "images": images,
             "sanitation": sanitation,
             "timestamp": iso_z(occurred) if occurred else iso_z(),
             "line": line_no,
@@ -733,6 +1157,30 @@ def latest_codex_prompt_event(path: Path) -> dict[str, Any] | None:
             "turn_id": codex_turn_id(payload),
             "native_event_id": str(payload.get("id") or obj.get("id") or "") or None,
         }
+    return None
+
+
+def find_equivalent_event(
+    store: Path,
+    *,
+    platform: str,
+    session_id: str,
+    turn_id: str | None,
+    prompt_hash: str,
+    occurred_at: str,
+) -> dict[str, Any] | None:
+    for event in iter_events(store):
+        if event.get("source", {}).get("platform") != platform:
+            continue
+        if str(event.get("session", {}).get("id") or "") != session_id:
+            continue
+        if turn_id and str(event.get("session", {}).get("turn_id") or "") == turn_id:
+            return event
+        if (
+            event.get("prompt", {}).get("sha256") == prompt_hash
+            and event.get("occurred_at") == occurred_at
+        ):
+            return event
     return None
 
 
@@ -745,19 +1193,14 @@ def equivalent_event_exists(
     prompt_hash: str,
     occurred_at: str,
 ) -> bool:
-    for event in iter_events(store):
-        if event.get("source", {}).get("platform") != platform:
-            continue
-        if str(event.get("session", {}).get("id") or "") != session_id:
-            continue
-        if turn_id and str(event.get("session", {}).get("turn_id") or "") == turn_id:
-            return True
-        if (
-            event.get("prompt", {}).get("sha256") == prompt_hash
-            and event.get("occurred_at") == occurred_at
-        ):
-            return True
-    return False
+    return find_equivalent_event(
+        store,
+        platform=platform,
+        session_id=session_id,
+        turn_id=turn_id,
+        prompt_hash=prompt_hash,
+        occurred_at=occurred_at,
+    ) is not None
 
 
 def recover_codex_stop(
@@ -783,20 +1226,31 @@ def recover_codex_stop(
         return {"captured": False, "reason": "human_prompt_not_found", "session_id": session_id}
     store, _ = init_store(root)
     prompt_hash = sha256_text(candidate["text"])
-    if equivalent_event_exists(
+    existing_event = find_equivalent_event(
         store,
         platform="codex",
         session_id=session_id,
         turn_id=candidate.get("turn_id"),
         prompt_hash=prompt_hash,
         occurred_at=candidate["timestamp"],
-    ):
+    )
+    if existing_event:
+        image_result = persist_prompt_images(
+            store,
+            str(existing_event.get("event_id") or ""),
+            candidate.get("images") or [],
+            source_path=str(rollout),
+            source_line=candidate.get("line"),
+        )
         return {
             "captured": False,
             "reason": "already_recorded",
             "project": str(root),
+            "event_id": existing_event.get("event_id"),
             "session_id": session_id,
             "turn_id": candidate.get("turn_id"),
+            "model": normalize_model(existing_event.get("context", {}).get("model")) or candidate.get("model"),
+            "images": image_result,
         }
     event = build_event(
         root=root,
@@ -816,6 +1270,13 @@ def recover_codex_stop(
         sanitation=candidate.get("sanitation"),
     )
     captured = append_event(store, event)
+    image_result = persist_prompt_images(
+        store,
+        event["event_id"],
+        candidate.get("images") or [],
+        source_path=str(rollout),
+        source_line=candidate.get("line"),
+    )
     return {
         "captured": captured,
         "reason": "captured" if captured else "duplicate_event_id",
@@ -824,6 +1285,7 @@ def recover_codex_stop(
         "session_id": session_id,
         "turn_id": candidate.get("turn_id"),
         "model": candidate.get("model"),
+        "images": image_result,
     }
 
 
@@ -887,14 +1349,21 @@ def capture_hook(args: argparse.Namespace) -> int:
     root = find_project_root(cwd, args.project)
     store, _ = init_store(root)
     prompt = prompt_from_hook_payload(payload)
+    prompt = append_file_path_notes(prompt, file_path_notes_from_hook_payload(payload))
+    images = image_candidates_from_hook_payload(payload)
     transcript_path = payload.get("transcript_path")
-    if not prompt.strip() and transcript_path and Path(str(transcript_path)).exists():
-        prompt = latest_user_from_transcript(Path(str(transcript_path)), platform)
-    if not prompt.strip():
+    source_line = None
+    if not prompt.strip() and not images and transcript_path and Path(str(transcript_path)).exists():
+        latest = latest_user_record_from_transcript(Path(str(transcript_path)), platform)
+        if latest:
+            prompt = str(latest.get("text") or "")
+            images = latest.get("images") or []
+            source_line = latest.get("line")
+    if not prompt.strip() and not images:
         record_hook_miss(store, payload)
         return 0
     prompt, sanitation = sanitize_prompt(prompt)
-    if not prompt or is_automatic_prompt(prompt):
+    if (not prompt and not images) or (prompt and is_automatic_prompt(prompt) and not images):
         return 0
     session_id = str(payload.get("session_id") or "unknown")
     occurred_at = str(payload.get("timestamp") or iso_z())
@@ -907,12 +1376,21 @@ def capture_hook(args: argparse.Namespace) -> int:
         occurred_at=occurred_at,
         turn_id=str(payload.get("turn_id")) if payload.get("turn_id") else None,
         transcript_path=str(transcript_path) if transcript_path else None,
+        source_path=str(transcript_path) if transcript_path and source_line else None,
+        source_line=source_line,
         cwd=str(cwd),
         model=str(payload.get("model")) if payload.get("model") else None,
         permission_mode=str(payload.get("permission_mode")) if payload.get("permission_mode") else None,
         sanitation=sanitation,
     )
     append_event(store, event)
+    persist_prompt_images(
+        store,
+        event["event_id"],
+        images,
+        source_path=str(transcript_path) if transcript_path else None,
+        source_line=source_line,
+    )
     return 0
 
 
@@ -958,11 +1436,13 @@ def collect_claude_candidates(claude_home: Path, root: Path) -> list[dict[str, A
                 continue
             if obj.get("isSidechain") or obj.get("isMeta"):
                 continue
-            text, saw_tool = text_from_blocks(obj["message"].get("content"))
-            if saw_tool and not text.strip():
+            content = obj["message"].get("content")
+            text, saw_tool = text_from_blocks(content)
+            images = image_candidates_from_blocks(content, base_dir=str(path.parent))
+            if saw_tool and not text.strip() and not images:
                 continue
             text, sanitation = sanitize_prompt(text, backfill=True)
-            if is_automatic_prompt(text):
+            if (not text and not images) or (text and is_automatic_prompt(text) and not images):
                 continue
             occurred = parse_iso(obj.get("timestamp"))
             raw.append(
@@ -971,6 +1451,7 @@ def collect_claude_candidates(claude_home: Path, root: Path) -> list[dict[str, A
                     "session_id": session_id,
                     "timestamp": iso_z(occurred) if occurred else iso_z(),
                     "text": text,
+                    "images": images,
                     "sanitation": sanitation,
                     "native_event_id": str(obj.get("uuid") or obj.get("promptId") or "") or None,
                     "path": str(path),
@@ -1029,7 +1510,9 @@ def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any
             timestamp = parse_iso(obj.get("timestamp"))
             if imported and original_max and timestamp and timestamp <= original_max:
                 continue
-            text, _ = text_from_blocks(payload.get("content"))
+            content = payload.get("content")
+            text, _ = text_from_blocks(content)
+            images = image_candidates_from_blocks(content, base_dir=str(path.parent))
             goal_objective = extract_codex_goal_objective(text)
             if goal_objective:
                 goal_key = (session_id, sha256_text(goal_objective))
@@ -1038,7 +1521,7 @@ def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any
                 seen_goal_objectives.add(goal_key)
                 text = goal_objective
             text, sanitation = sanitize_prompt(text, backfill=True)
-            if is_automatic_prompt(text):
+            if (not text and not images) or (text and is_automatic_prompt(text) and not images):
                 continue
             native_event_id = str(payload.get("id") or obj.get("id") or "") or None
             raw.append(
@@ -1047,6 +1530,7 @@ def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any
                     "session_id": session_id,
                     "timestamp": iso_z(timestamp) if timestamp else iso_z(),
                     "text": text,
+                    "images": images,
                     "sanitation": sanitation,
                     "native_event_id": native_event_id,
                     "turn_id": codex_turn_id(payload),
@@ -1071,6 +1555,15 @@ def merge_branch_copies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             merged["alias_session_ids"] = []
             unique[key] = merged
         merged = unique[key]
+        known_images = {
+            (str(candidate.get("kind") or ""), str(candidate.get("value") or ""))
+            for candidate in merged.get("images", [])
+        }
+        for candidate in item.get("images", []):
+            image_key = (str(candidate.get("kind") or ""), str(candidate.get("value") or ""))
+            if image_key not in known_images:
+                merged.setdefault("images", []).append(candidate)
+                known_images.add(image_key)
         merged["source_refs"].append(
             {
                 "session_id": item["session_id"],
@@ -1097,6 +1590,18 @@ def backfill(args: argparse.Namespace) -> int:
         for event in existing
         if event.get("record_type") == RECORD_TYPE
     )
+    existing_by_key: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = collections.defaultdict(list)
+    for event in existing:
+        if event.get("record_type") != RECORD_TYPE:
+            continue
+        event_key = (
+            event.get("source", {}).get("platform"),
+            event.get("session", {}).get("id"),
+            event.get("prompt", {}).get("sha256"),
+        )
+        existing_by_key[event_key].append(event)
+    for items in existing_by_key.values():
+        items.sort(key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
     candidates: list[dict[str, Any]] = []
     if args.platform in {"all", "claude"}:
         candidates.extend(collect_claude_candidates(Path(args.claude_home), root))
@@ -1104,12 +1609,23 @@ def backfill(args: argparse.Namespace) -> int:
         candidates.extend(collect_codex_candidates(Path(args.codex_home), root))
     candidates.sort(key=lambda item: (item["timestamp"], item["platform"], item["session_id"]))
     source_counts: collections.Counter = collections.Counter()
-    added = skipped = 0
+    added = skipped = image_seen = image_saved = image_omitted = 0
     for item in candidates:
         prompt_hash = sha256_text(item["text"])
         count_key = (item["platform"], item["session_id"], prompt_hash)
         source_counts[count_key] += 1
         if source_counts[count_key] <= existing_counts[count_key]:
+            prior = existing_by_key[count_key][source_counts[count_key] - 1]
+            image_result = persist_prompt_images(
+                store,
+                str(prior.get("event_id") or ""),
+                item.get("images") or [],
+                source_path=item.get("path"),
+                source_line=item.get("line"),
+            )
+            image_seen += image_result["seen"]
+            image_saved += image_result["saved"]
+            image_omitted += image_result["omitted"]
             skipped += 1
             continue
         event = build_event(
@@ -1132,11 +1648,33 @@ def backfill(args: argparse.Namespace) -> int:
         if append_event(store, event, existing_ids):
             added += 1
             existing_counts[count_key] += 1
+            existing_by_key[count_key].append(event)
+            image_result = persist_prompt_images(
+                store,
+                event["event_id"],
+                item.get("images") or [],
+                source_path=item.get("path"),
+                source_line=item.get("line"),
+            )
+            image_seen += image_result["seen"]
+            image_saved += image_result["saved"]
+            image_omitted += image_result["omitted"]
         else:
             skipped += 1
     if args.rebuild_index:
         rebuild_index_for_store(store)
-    print(json.dumps({"project": str(root), "candidates": len(candidates), "added": added, "skipped": skipped}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "project": str(root),
+                "candidates": len(candidates),
+                "added": added,
+                "skipped": skipped,
+                "images": {"seen": image_seen, "saved": image_saved, "omitted": image_omitted},
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -1209,7 +1747,11 @@ def title_from_prompts(prompts: list[str]) -> str:
     return fallback
 
 
-def build_derived_views(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def build_derived_views(
+    events: list[dict[str, Any]],
+    images_by_event: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    images_by_event = images_by_event or {}
     source_cache: dict[tuple[str, str], dict[int, str]] = {}
     views: list[dict[str, Any]] = []
     grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
@@ -1245,6 +1787,7 @@ def build_derived_views(events: list[dict[str, Any]]) -> tuple[list[dict[str, An
             "chars": event.get("prompt", {}).get("chars"),
             "sha256": event.get("prompt", {}).get("sha256"),
             "prompt": str(event.get("prompt", {}).get("text") or ""),
+            "images": images_by_event.get(str(event.get("event_id") or ""), []),
         }
         views.append(view)
         grouped[session_key].append(view)
@@ -1305,8 +1848,15 @@ def rebuild_session_metadata_for_store(store: Path, events: list[dict[str, Any]]
 
 def rebuild_index_for_store(store: Path) -> dict[str, Any]:
     events = sorted(iter_events(store), key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
+    prompt_images = sorted(
+        iter_prompt_images(store),
+        key=lambda item: (str(item.get("event_id") or ""), str(item.get("attachment_id") or "")),
+    )
+    images_by_event: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for image in prompt_images:
+        images_by_event[str(image.get("event_id") or "")].append(image)
     rebuild_session_metadata_for_store(store, events)
-    event_views, sessions = build_derived_views(events)
+    event_views, sessions = build_derived_views(events, images_by_event)
     by_platform = collections.Counter(event.get("source", {}).get("platform") for event in events)
     by_session = collections.Counter(
         f"{event.get('source', {}).get('platform')}:{event.get('session', {}).get('id')}" for event in events
@@ -1321,6 +1871,8 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
         "session_counts": dict(sorted(by_session.items())),
         "secret_redactions": redactions,
         "attachments_omitted": omissions,
+        "image_count": len(prompt_images),
+        "image_event_count": len(images_by_event),
         "first_occurred_at": events[0].get("occurred_at") if events else None,
         "last_occurred_at": events[-1].get("occurred_at") if events else None,
     }
@@ -1340,11 +1892,21 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
                 f"- Session: `{view.get('session_id')}`",
                 f"- Event: `{view.get('event_id')}`",
                 f"- Source mode: `{view.get('source_mode')}`",
+                f"- Images: `{len(view.get('images') or [])}`",
                 "",
                 fenced(view["prompt"]),
                 "",
             ]
         )
+        for image_number, image_record in enumerate(view.get("images") or [], 1):
+            relative_path = str(image_record.get("asset", {}).get("path") or "").replace("\\", "/")
+            if relative_path:
+                lines.extend(
+                    [
+                        f"![P{view['number']:05d} image {image_number}](../{relative_path})",
+                        "",
+                    ]
+                )
     atomic_write(store / "index" / "PROMPTS.md", "\n".join(lines))
     summary_lines = [
         "# Session summaries",
@@ -1566,17 +2128,67 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
             errors.append(f"obvious secret pattern remains in {event_id}")
         if not is_within(event.get("project", {}).get("root"), root):
             errors.append(f"project root mismatch in {event_id}")
+    attachment_ids: set[str] = set()
+    image_hashes: dict[Path, str] = {}
+    image_count = 0
+    image_root = (store / "assets" / "images").resolve()
+    for image in iter_prompt_images(store):
+        image_count += 1
+        attachment_id = str(image.get("attachment_id") or "")
+        if not attachment_id:
+            errors.append(f"missing attachment_id in image record #{image_count}")
+        elif attachment_id in attachment_ids:
+            errors.append(f"duplicate attachment_id {attachment_id}")
+        attachment_ids.add(attachment_id)
+        event_id = str(image.get("event_id") or "")
+        if event_id not in ids:
+            errors.append(f"image {attachment_id} references missing event_id {event_id}")
+        asset = image.get("asset") if isinstance(image.get("asset"), dict) else {}
+        relative = Path(str(asset.get("path") or ""))
+        asset_path = (store / relative).resolve()
+        try:
+            common = Path(os.path.commonpath((str(image_root), str(asset_path))))
+        except ValueError:
+            common = Path()
+        if common != image_root:
+            errors.append(f"image {attachment_id} escapes assets/images")
+            continue
+        if not asset_path.is_file():
+            errors.append(f"image asset is missing for {attachment_id}: {relative}")
+            continue
+        expected_size = int(asset.get("bytes") or -1)
+        if asset_path.stat().st_size != expected_size:
+            errors.append(f"image size mismatch for {attachment_id}")
+        if asset_path not in image_hashes:
+            image_hashes[asset_path] = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+        if image_hashes[asset_path] != str(asset.get("sha256") or ""):
+            errors.append(f"image hash mismatch for {attachment_id}")
     config_path = store / "config.json"
     if not config_path.exists():
         errors.append("config.json is missing")
     if not (store / ".gitignore").exists():
         warnings.append("nested .gitignore is missing")
+    else:
+        ignored = (store / ".gitignore").read_text(encoding="utf-8", errors="replace")
+        if not re.search(r"(?m)^assets/?$", ignored):
+            warnings.append("assets/ is not ignored by the nested .gitignore")
     misses = store / "state" / "hook-misses.jsonl"
     if misses.exists():
         miss_count = sum(1 for _ in read_jsonl(misses))
         if miss_count:
             warnings.append(f"{miss_count} hook payloads contained no recoverable user prompt; inspect {misses}")
-    return {"ok": not errors, "event_count": count, "errors": errors, "warnings": warnings}
+    image_misses = store / "state" / "image-misses.jsonl"
+    if image_misses.exists():
+        image_miss_count = sum(1 for _ in read_jsonl(image_misses))
+        if image_miss_count:
+            warnings.append(f"{image_miss_count} image attachments were omitted; inspect {image_misses}")
+    return {
+        "ok": not errors,
+        "event_count": count,
+        "image_count": image_count,
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def doctor(args: argparse.Namespace) -> int:

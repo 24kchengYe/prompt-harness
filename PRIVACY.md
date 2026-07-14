@@ -8,14 +8,15 @@ Prompt histories can contain unpublished work, personal context, file paths, and
 - A nested `.gitignore` excludes canonical events, generated indexes, session summaries, state, and badcase data.
 - The global project registry stores locations and timestamps only, never prompt bodies.
 - Runtime capture redacts common API-key, access-token, password, and bearer-token patterns.
-- Embedded image/document/base64 payloads are replaced with an omission marker.
+- User-sent raster images are copied into project-local, content-addressed `assets/images/` files and linked by `assets/manifest.jsonl`.
+- Ordinary file bodies and non-image attachment payloads are never copied. A parseable local attachment path is retained as prompt text.
 - Assistant output, tools, subagents, and machine-injected instructions are excluded.
 
 Redaction is a safety net, not a proof that arbitrary secrets are impossible. Run `doctor`, inspect any export, and use a secret scanner before publishing data. The source code may be public; prompt ledgers should remain private unless each record has been reviewed and deliberately released.
 
 ## File references
 
-If a human writes a path in a prompt, that path stays in the prompt text. The capture process does not open the file or store its body. Native hook attachment blocks are represented by a short omission marker and an optional source path.
+If a human writes a path in a prompt, that path stays in the prompt text. For an ordinary native file attachment, Prompt Harness keeps a parseable path but does not open or copy the file body. User-sent raster images are the explicit exception: PNG, JPEG, GIF, WebP, and BMP bytes are copied locally, bounded to 20 images and 50 MB total per event. Remote image URLs are not downloaded, SVG is rejected, and image assets are ignored by Git with the rest of the private ledger.
 
 ## Configuration safety
 

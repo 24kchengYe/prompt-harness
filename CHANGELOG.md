@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 - 2026-07-14
+
+- Archive user-sent PNG, JPEG, GIF, WebP, and BMP images under project-local, content-addressed `assets/images/` paths.
+- Link image assets to immutable prompt events through an append-only attachment manifest and embed them in `index/PROMPTS.md`.
+- Recover images from Claude base64 blocks, Codex data URLs, and Codex local-image paths during live capture, Stop recovery, and historical backfill.
+- Preserve parseable ordinary file-attachment paths in prompt text without copying file bodies.
+- Validate image paths, hashes, sizes, event links, and privacy ignores in `doctor`.
+- Increase hook timeouts to accommodate bounded local image copies without network access.
+
 ## 0.2.3 - 2026-07-14
 
 - Read hook payloads from UTF-8 bytes instead of the Windows console code page.

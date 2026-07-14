@@ -85,7 +85,7 @@ def update_file(path: Path, script: Path, platform: str, remove: bool, dry_run: 
                     {
                         "type": "command",
                         "command": command_for(script, platform),
-                        "timeout": 5,
+                        "timeout": 20,
                         "statusMessage": "Archiving project prompt",
                     }
                 ]
@@ -136,7 +136,7 @@ def update_stop_recovery_file(
                     {
                         "type": "command",
                         "command": stop_recovery_command(script),
-                        "timeout": 10,
+                        "timeout": 20,
                         "statusMessage": "Recovering legacy task prompt",
                     }
                 ]
