@@ -54,6 +54,8 @@ Derived views use `state/index-dirty.json` to skip redundant rebuilds when recon
 
 The recovery path scans native local transcripts. Claude Code branch copies are merged when timestamp and normalized prompt hash match; native IDs and every source reference are retained for provenance. Codex subagent rollouts are excluded. If a Codex rollout was imported from Claude, rows at or before the source transcript's latest timestamp are mirror data; only genuinely new Codex continuation prompts are candidates.
 
+Automatic source ownership is an exact-root rule. A Claude transcript's first recorded `cwd` and a Codex rollout's `session_meta.cwd` must normalize to the project root exactly. Path containment is deliberately insufficient, so a parent project cannot absorb sessions launched in descendant folders. An active append-only session binding is authoritative and is the only supported cross-root override. Full discovery writes an authoritative cursor set, and incremental checks prune cursors whose sessions are no longer in scope.
+
 ## Reconciliation
 
 A backfill first reconciles native message IDs and exact source path/line identities. It uses `(turn ID, prompt hash)` to match a source row to a source-less live hook event, then checks exact occurrence-time identity. During a complete historical scan it may finally match unclaimed occurrences by platform, session, and prompt hash. Incremental tails never use occurrence fallback because a tail may contain only the newest repeated prompt. This avoids re-adding a captured event or treating a changed attachment representation as a new prompt, while preserving distinct source lines even when one turn repeats identical text. If the prompt event already exists but its historical image relation does not, backfill appends only the missing relation.
@@ -61,6 +63,8 @@ A backfill first reconciles native message IDs and exact source path/line identi
 Legacy versions represented images as prompt-text omission markers. If both an old marker event and a clean image-linked event already exist, Prompt Harness appends a relation to `state/event-supersessions.jsonl`; it does not delete either JSONL line. Active views, search, and future harness consumers use the clean canonical event.
 
 If an older version captured a Codex AGENTS/environment envelope as a human prompt, reconciliation appends `state/event-exclusions.jsonl` with reason `automatic_context_not_human_input`. Raw event lines remain auditable; active views omit the excluded row.
+
+If an older version captured an unbound session launched below the project root, reconciliation appends a project-scoped exact-root exclusion. The raw event is not deleted. Because exclusion evaluation consults the current session binding, explicitly binding that session to the project re-enables the event; rebinding it elsewhere hides the event again.
 
 ## Project resolution
 
@@ -73,7 +77,7 @@ Resolution order is:
 5. nearest `AGENTS.md`, `CLAUDE.md`, or common language project marker;
 6. current working directory.
 
-This keeps each project isolated without requiring every prompt to name the project.
+Resolution only identifies a candidate root. Automatic routing then applies a second gate: the native session launch `cwd` must equal the candidate root after normalization. A descendant directory does not inherit its parent's ledger. If the descendant has its own project marker, it may resolve as its own root and create its own ledger. An active native-session binding intentionally bypasses the exact-root relationship by making its destination authoritative.
 
 Bindings live in `~/.prompt-harness/session-bindings.jsonl`. Rebinding appends a new record whose `replaces_binding_id` points to the previous active record; the latest valid record wins. A binding may retain the native transcript path so full discovery can include that exact source even when its historical `cwd` points elsewhere.
 

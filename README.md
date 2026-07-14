@@ -1,13 +1,13 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.7.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.8.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
 **把散落在 Claude Code 和 Codex 会话中的人类提示词，变成每个项目私有、可追溯、可检索的事实层。**
 
-Prompt Harness 同时提供实时 `UserPromptSubmit` Hook、旧任务轮末恢复和自动历史对账。第一次在任一项目对话时，它会自动创建 `.prompt-harness`，先保存当前输入，再在独立后台进程中检查并补齐该项目全部 Claude Code 与 Codex 会话。它只保留用户真正输入的指令与用户发送的图片，排除助手回复、工具输出、子代理、自动注入上下文和导入镜像。
+Prompt Harness 同时提供实时 `UserPromptSubmit` Hook、旧任务轮末恢复和自动历史对账。第一次从项目根目录开始对话时，它会自动创建 `.prompt-harness`，先保存当前输入，再在独立后台进程中检查并补齐启动目录恰好等于该项目根目录的 Claude Code 与 Codex 会话。父项目不会自动吸收从子目录启动的会话；确需跨根归属时可显式绑定。它只保留用户真正输入的指令与用户发送的图片，排除助手回复、工具输出、子代理、自动注入上下文和导入镜像。
 
 这个事实层将作为后续 badcase 分析、可复现测试和跨模型回归的稳定输入。
 
@@ -38,6 +38,7 @@ Prompt Harness 将这些内容整理为：
 | 实时捕获 | 通过 `UserPromptSubmit` Hook 在用户提交提示词时快速追加一条事件 |
 | 长任务升级兼容 | Hook 每次运行时解析当前可用插件副本；长时间打开的 CLI/Desktop 任务不会因旧版本缓存被刷新而报错 |
 | 自动引导与对账 | 没有账本时首次全量发现；之后每条输入只检查并读取发生变化的会话文件尾部 |
+| 精确项目隔离 | 自动归属要求会话启动目录与项目根目录完全相同；父项目不吸收子目录会话 |
 | 会话项目绑定 | 多根工作区、旧任务或错误 `cwd` 可显式绑定到一个项目；切换和迁移保持追加式审计 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
@@ -75,7 +76,7 @@ flowchart LR
   E -. "event_id" .-> Q["未来 badcase 测试"]
 ```
 
-Hook 前台路径保持有界：定位项目、自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程，不等待对账完成，也不联网或调用模型。项目第一次启用时做一次全量发现；之后每条输入都立即对账，但只比较已知源文件的大小与修改时间，并从保存的字节游标读取新增 JSONL 行。项目锁合并同项目重叠请求，全局锁避免多个项目同时重扫磁盘。
+Hook 前台路径保持有界：先验证原生会话 `cwd` 与候选项目根目录完全相同（或存在显式绑定），再自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程，不等待对账完成，也不联网或调用模型。项目第一次启用时做一次全量发现；之后每条输入都立即对账，但只比较已知源文件的大小与修改时间，并从保存的字节游标读取新增 JSONL 行。项目锁合并同项目重叠请求，全局锁避免多个项目同时重扫磁盘。
 
 ## 从公开 GitHub 安装到 Codex
 
@@ -173,12 +174,14 @@ python scripts/install_hooks.py --platform claude --remove
 
 安装并信任 Hook 后，无需先手动运行 `init` 或 `backfill`：
 
-1. 在一个新任务或旧任务中发送第一条提示词；
+1. 从项目根目录启动或打开一个新任务/旧任务并发送第一条提示词；
 2. Prompt Harness 自动创建项目目录并同步保存当前输入；
-3. 首次后台发现全项目 Claude/Codex 历史，之后只增量读取变化的会话文件；
+3. 首次后台发现所有“启动目录恰好等于项目根”的 Claude/Codex 历史，之后只增量读取变化的会话文件；
 4. 结果写入 `.prompt-harness/state/auto-sync.json`，可用 `doctor` 检查。
 
 当前输入每次都会实时保存并触发后台校验，没有五分钟节流。`.prompt-harness/state/source-cursors.json` 记录每个源文件的大小、修改时间、字节偏移和行号；未变化文件不解析。只有游标尚未建立、显式 `auto-sync --force`，或单个源文件被截断/改写时才降级为更重的读取。
+
+若任务从 `<project>\child` 启动，而 `child` 本身不是独立项目根，它不会写入父项目 `<project>\.prompt-harness`。若 `child` 有自己的 `.git`、`AGENTS.md`、`CLAUDE.md` 等项目标记，它可以作为独立根创建自己的 Harness。需要有意把该会话归到父项目时，使用 `bind-session --migrate`。
 
 ### 1. 初始化项目
 
@@ -460,6 +463,10 @@ HTML 读取的是重建后的事实视图，不包含助手输出。
 ### 多根工作区或错误 cwd 导致账本落错位置怎么办？
 
 运行 `bind-session --migrate`。此后该会话的 Hook、Stop 恢复和历史对账都会优先使用显式项目绑定；迁移会重建两侧派生视图，但只追加事实与排除关系，不删除原始事件。
+
+### 为什么从项目子目录启动的会话没有进入父项目？
+
+这是精确根隔离的预期行为。自动归属只接受“会话启动目录 = 项目根目录”，防止一个大目录吞掉下面多个独立项目。请从目标项目根目录启动任务；如果这个跨根归属是有意的，再显式运行 `bind-session --migrate`。
 
 ### 为什么模型显示 `unavailable`？
 

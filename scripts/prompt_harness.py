@@ -35,6 +35,7 @@ RECORD_TYPE = "user_prompt"
 IMAGE_RECORD_TYPE = "prompt_image"
 EXCLUSION_RECORD_TYPE = "event_exclusion"
 SESSION_BINDING_RECORD_TYPE = "session_project_binding"
+EXACT_ROOT_EXCLUSION_PREFIX = "cwd_outside_exact_project_root_"
 MAX_IMAGES_PER_EVENT = 20
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
@@ -527,6 +528,28 @@ def bound_project_root(platform: str, session_id: str) -> Path | None:
     return None if is_unsafe_broad_project_root(root) else root
 
 
+def session_belongs_to_project_root(
+    *,
+    platform: str,
+    session_id: str,
+    cwd: Any,
+    root: Path,
+    bindings: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    """Route a session only to its exact launch root unless explicitly bound.
+
+    Active bindings are authoritative. In their absence, parent/child path
+    containment is intentionally insufficient: the normalized session cwd must
+    equal the normalized project root.
+    """
+
+    binding_map = bindings if bindings is not None else active_session_bindings()
+    binding = binding_map.get(session_binding_key(platform, session_id))
+    if binding:
+        return normalize_path(binding.get("project_root")) == normalize_path(root)
+    return bool(cwd) and normalize_path(cwd) == normalize_path(root)
+
+
 def bound_source_paths(platform: str, root: Path) -> list[Path]:
     target = normalize_path(root)
     paths: list[Path] = []
@@ -791,6 +814,24 @@ def excluded_event_ids(store: Path) -> set[str]:
             if binding and str(binding.get("project_id") or "") == reassignment.group(1):
                 excluded.add(event_id)
             continue
+        exact_root_scope = re.fullmatch(
+            rf"{re.escape(EXACT_ROOT_EXCLUSION_PREFIX)}(prj_[0-9a-f]+)",
+            reason,
+        )
+        if exact_root_scope:
+            if events_by_id is None:
+                events_by_id = {str(event.get("event_id") or ""): event for event in iter_events(store)}
+            event = events_by_id.get(event_id)
+            if not event:
+                excluded.add(event_id)
+                continue
+            platform = str(event.get("source", {}).get("platform") or "")
+            session_id = str(event.get("session", {}).get("id") or "")
+            binding = session_binding(platform, session_id)
+            if binding and str(binding.get("project_id") or "") == exact_root_scope.group(1):
+                continue
+            excluded.add(event_id)
+            continue
         excluded.add(event_id)
     return excluded
 
@@ -896,6 +937,40 @@ def repair_automatic_context_events(store: Path) -> int:
             ):
                 repaired += 1
                 excluded.add(event_id)
+    return repaired
+
+
+def repair_out_of_scope_events(root: Path, store: Path) -> int:
+    """Hide legacy events automatically captured from a non-root session cwd.
+
+    The immutable event remains in the canonical ledger. An active explicit
+    binding to this project dynamically re-enables it.
+    """
+
+    excluded = excluded_event_ids(store)
+    bindings = active_session_bindings()
+    reason = EXACT_ROOT_EXCLUSION_PREFIX + project_id(root)
+    repaired = 0
+    for event in iter_events(store):
+        event_id = str(event.get("event_id") or "")
+        if not event_id or event_id in excluded:
+            continue
+        platform = str(event.get("source", {}).get("platform") or "").lower()
+        session_id = str(event.get("session", {}).get("id") or "")
+        cwd = event.get("context", {}).get("cwd")
+        if platform not in {"claude", "codex"} or not cwd:
+            continue
+        if session_belongs_to_project_root(
+            platform=platform,
+            session_id=session_id,
+            cwd=cwd,
+            root=root,
+            bindings=bindings,
+        ):
+            continue
+        if append_event_exclusion(store, event_id=event_id, reason=reason):
+            repaired += 1
+            excluded.add(event_id)
     return repaired
 
 
@@ -1684,9 +1759,23 @@ def recover_codex_stop(
     )
     if is_unsafe_broad_project_root(root):
         return {"captured": False, "reason": "unsafe_broad_project_root", "project": str(root)}
-    store, _ = init_store(root)
     if not session_id:
         return {"captured": False, "reason": "missing_session_id", "project": str(root)}
+    if not session_belongs_to_project_root(
+        platform="codex",
+        session_id=session_id,
+        cwd=cwd,
+        root=root,
+    ):
+        return {
+            "captured": False,
+            "reason": "cwd_not_exact_project_root",
+            "project": str(root),
+            "session_id": session_id,
+            "session_cwd": str(cwd),
+            "source_path": str(rollout) if rollout else None,
+        }
+    store, _ = init_store(root)
     if not rollout:
         return {
             "captured": False,
@@ -1795,7 +1884,7 @@ def capture_stop_recovery(args: argparse.Namespace) -> int:
     if payload is None:
         return 0
     result = recover_codex_stop(payload, project=args.project, codex_home=args.codex_home)
-    if result.get("project"):
+    if result.get("project") and result.get("reason") != "cwd_not_exact_project_root":
         root = Path(str(result["project"]))
         result["auto_sync"] = schedule_auto_sync(
             root,
@@ -1850,6 +1939,13 @@ def capture_hook_payload(args: argparse.Namespace, payload: dict[str, Any]) -> i
         session_id=session_id,
     )
     if is_unsafe_broad_project_root(root):
+        return 0
+    if not session_belongs_to_project_root(
+        platform=platform,
+        session_id=session_id,
+        cwd=cwd,
+        root=root,
+    ):
         return 0
     store, _ = init_store(root)
     prompt = prompt_from_hook_payload(payload)
@@ -1951,6 +2047,32 @@ def claude_project_dir(claude_home: Path, root: Path) -> Path | None:
     return best_folder
 
 
+def claude_session_cwd(path: Path) -> str | None:
+    """Read the first recorded cwd, which represents the Claude session root."""
+
+    for _, obj in read_jsonl(path):
+        cwd = obj.get("cwd")
+        if cwd:
+            return str(cwd)
+    return None
+
+
+def claude_source_belongs_to_root(
+    path: Path,
+    root: Path,
+    *,
+    session_id: str | None = None,
+    bindings: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    return session_belongs_to_project_root(
+        platform="claude",
+        session_id=session_id or path.stem,
+        cwd=claude_session_cwd(path),
+        root=root,
+        bindings=bindings,
+    )
+
+
 def collect_claude_candidates_from_rows(
     path: Path,
     rows: list[tuple[int, dict[str, Any]]],
@@ -1998,7 +2120,10 @@ def collect_claude_candidates_from_paths(
     rows_by_path: dict[str, list[tuple[int, dict[str, Any]]]] | None = None,
 ) -> list[dict[str, Any]]:
     raw: list[dict[str, Any]] = []
+    bindings = active_session_bindings()
     for path in sorted(set(paths)):
+        if not path.is_file() or not claude_source_belongs_to_root(path, root, bindings=bindings):
+            continue
         rows = (rows_by_path or {}).get(normalize_path(path))
         rows = rows if rows is not None else list(read_jsonl(path))
         raw.extend(collect_claude_candidates_from_rows(path, rows, root))
@@ -2054,11 +2179,35 @@ def codex_meta_belongs_to_root(
     session_id = str(meta.get("id") or meta.get("session_id") or "")
     if session_id and force_session_ids and session_id in force_session_ids:
         return True
-    if is_within(meta.get("cwd"), root):
-        return True
     binding_map = bindings if bindings is not None else active_session_bindings()
-    binding = binding_map.get(session_binding_key("codex", session_id))
-    return bool(binding and normalize_path(binding.get("project_root")) == normalize_path(root))
+    return session_belongs_to_project_root(
+        platform="codex",
+        session_id=session_id,
+        cwd=meta.get("cwd"),
+        root=root,
+        bindings=binding_map,
+    )
+
+
+def transcript_source_belongs_to_root(
+    path: Path,
+    platform: str,
+    root: Path,
+    *,
+    session_id: str | None = None,
+    bindings: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    if platform == "claude":
+        return claude_source_belongs_to_root(
+            path,
+            root,
+            session_id=session_id,
+            bindings=bindings,
+        )
+    if platform == "codex":
+        meta = codex_meta_from_path(path)
+        return bool(meta and codex_meta_belongs_to_root(meta, root, bindings=bindings))
+    return False
 
 
 def collect_codex_candidates_from_paths(
@@ -2206,6 +2355,7 @@ def reconcile_candidates(
     """
     superseded = repair_legacy_image_duplicates(store)
     excluded = repair_automatic_context_events(store)
+    excluded_out_of_scope = repair_out_of_scope_events(root, store)
     existing = list(iter_active_events(store))
     existing_ids = {str(event.get("event_id")) for event in existing}
     existing_by_key: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = collections.defaultdict(list)
@@ -2350,6 +2500,7 @@ def reconcile_candidates(
         "images": {"seen": image_seen, "saved": image_saved, "omitted": image_omitted},
         "superseded_legacy_events": superseded,
         "excluded_automatic_events": excluded,
+        "excluded_out_of_scope_events": excluded_out_of_scope,
         "index_rebuilt": index_rebuilt,
     }
 
@@ -2447,10 +2598,22 @@ def write_cursor_snapshots(
     snapshots: dict[str, dict[str, Any]],
     *,
     full_scan: bool,
+    scanned_platforms: set[str] | None = None,
 ) -> dict[str, Any]:
     state = read_source_cursors(store)
-    sources = dict(state.get("sources") or {})
-    sources.update(snapshots)
+    prior_sources = dict(state.get("sources") or {})
+    if full_scan and scanned_platforms:
+        sources = {
+            key: value
+            for key, value in prior_sources.items()
+            if not isinstance(value, dict) or str(value.get("platform") or "unknown") not in scanned_platforms
+        }
+        sources.update(snapshots)
+    elif full_scan:
+        sources = dict(snapshots)
+    else:
+        sources = prior_sources
+        sources.update(snapshots)
     now = iso_z()
     state.update(
         {
@@ -2557,25 +2720,53 @@ def incremental_backfill_project(
 
     known = dict(cursor_state.get("sources") or {})
     paths: dict[str, tuple[Path, str, str]] = {}
+    eligible_known: dict[str, dict[str, Any]] = {}
+    preserved_unselected: dict[str, dict[str, Any]] = {}
+    bindings = active_session_bindings()
     for key, cursor in known.items():
         if not isinstance(cursor, dict) or not cursor.get("path"):
             continue
         source_kind = str(cursor.get("platform") or "unknown")
         if platform != "all" and source_kind != platform:
+            preserved_unselected[key] = cursor
             continue
         path = Path(str(cursor["path"]))
-        paths[key] = (path, source_kind, str(cursor.get("session_id") or path.stem))
+        source_session_id = str(cursor.get("session_id") or path.stem)
+        if not transcript_source_belongs_to_root(
+            path,
+            source_kind,
+            root,
+            session_id=source_session_id,
+            bindings=bindings,
+        ):
+            continue
+        eligible_known[key] = cursor
+        paths[key] = (path, source_kind, source_session_id)
 
     for value in source_paths:
         path = Path(value).expanduser()
         kind = infer_source_platform(path, source_platform)
         if kind == "unknown" or (platform != "all" and kind != platform):
             continue
+        if not transcript_source_belongs_to_root(
+            path,
+            kind,
+            root,
+            session_id=session_id or path.stem,
+            bindings=bindings,
+        ):
+            continue
         paths[normalize_path(path)] = (path, kind, session_id or path.stem)
 
     if source_platform == "codex" and not any(kind == "codex" and sid == session_id for _, kind, sid in paths.values()):
         rollout = find_codex_rollout(codex_home or (Path.home() / ".codex"), session_id)
-        if rollout:
+        if rollout and transcript_source_belongs_to_root(
+            rollout,
+            "codex",
+            root,
+            session_id=session_id,
+            bindings=bindings,
+        ):
             paths[normalize_path(rollout)] = (rollout, "codex", session_id)
 
     # Claude keeps all project sessions in one small direct folder. Listing that
@@ -2584,6 +2775,8 @@ def incremental_backfill_project(
         folder = claude_project_dir(claude_home or (Path.home() / ".claude"), root)
         if folder:
             for path in folder.glob("*.jsonl"):
+                if not claude_source_belongs_to_root(path, root, bindings=bindings):
+                    continue
                 paths[normalize_path(path)] = (path, "claude", path.stem)
 
     rows_by_platform: dict[str, dict[str, list[tuple[int, dict[str, Any]]]]] = {
@@ -2591,7 +2784,7 @@ def incremental_backfill_project(
         "codex": {},
     }
     changed_paths: dict[str, tuple[Path, str, str]] = {}
-    updated_sources = dict(known)
+    updated_sources = {**preserved_unselected, **eligible_known}
     bytes_read = 0
     for key, (path, kind, source_session_id) in paths.items():
         try:
@@ -2684,8 +2877,11 @@ def backfill_project(
     codex_paths: list[Path] = []
     if platform in {"all", "claude"}:
         folder = claude_project_dir(claude_base, root)
+        bindings = active_session_bindings()
         claude_paths = sorted(
-            set((list(folder.glob("*.jsonl")) if folder else []) + bound_source_paths("claude", root))
+            path
+            for path in set((list(folder.glob("*.jsonl")) if folder else []) + bound_source_paths("claude", root))
+            if claude_source_belongs_to_root(path, root, bindings=bindings)
         )
         for path in claude_paths:
             sources[normalize_path(path)] = (path, "claude", path.stem)
@@ -2717,7 +2913,12 @@ def backfill_project(
         rebuild_index=rebuild_index,
         full_dataset=True,
     )
-    write_cursor_snapshots(store, snapshots, full_scan=True)
+    write_cursor_snapshots(
+        store,
+        snapshots,
+        full_scan=True,
+        scanned_platforms={"claude", "codex"} if platform == "all" else {platform},
+    )
     return {"mode": "full", "sources_scanned": len(sources), **result}
 
 
@@ -3181,16 +3382,28 @@ def auto_sync_project(
                             )
                             extra_sources: dict[str, tuple[Path, str, str]] = {}
                             known_after_full = read_source_cursors(store).get("sources") or {}
+                            bindings = active_session_bindings()
                             for request in pending_requests:
                                 if not request.get("source_path"):
                                     continue
                                 path = Path(str(request["source_path"]))
                                 kind = infer_source_platform(path, str(request.get("source_platform") or "unknown"))
-                                if kind in {"claude", "codex"} and normalize_path(path) not in known_after_full:
+                                request_session_id = str(request.get("session_id") or path.stem)
+                                if (
+                                    kind in {"claude", "codex"}
+                                    and normalize_path(path) not in known_after_full
+                                    and transcript_source_belongs_to_root(
+                                        path,
+                                        kind,
+                                        root,
+                                        session_id=request_session_id,
+                                        bindings=bindings,
+                                    )
+                                ):
                                     extra_sources[normalize_path(path)] = (
                                         path,
                                         kind,
-                                        str(request.get("session_id") or path.stem),
+                                        request_session_id,
                                     )
                             if extra_sources:
                                 write_source_cursors(

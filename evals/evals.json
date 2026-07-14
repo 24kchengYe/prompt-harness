@@ -78,6 +78,12 @@
       "prompt": "I kept a Codex CLI task open while upgrading Prompt Harness. The task still has the old plugin version in its startup context and now shows UserPromptSubmit hook (failed) because that cache directory disappeared. Make future long-lived CLI and Desktop tasks keep capturing after upgrades without storing prompt text in error logs.",
       "expected_output": "The hook resolves the newest available installed launcher at invocation time, safely no-ops if no runtime remains, suppresses capture exceptions at the hook boundary, writes prompt-free diagnostics, and passes a regression that simulates a deleted originally loaded cache.",
       "files": []
+    },
+    {
+      "id": 14,
+      "prompt": "This parent directory contains several projects. Capture only Claude and Codex sessions launched exactly at the selected project root; do not absorb sessions launched one directory below. Keep an intentional cross-root session possible through explicit binding, and repair old parent-ledger contamination without deleting raw events.",
+      "expected_output": "Live capture, Stop recovery, full backfill, and incremental cursors all enforce exact normalized launch-root equality; unbound descendant sessions are excluded, explicit bindings remain authoritative, legacy descendant rows receive append-only dynamic exclusions, and full scans prune stale out-of-scope cursors.",
+      "files": []
     }
   ]
 }

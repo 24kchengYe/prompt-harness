@@ -239,6 +239,123 @@ class PromptHarnessTests(unittest.TestCase):
         self.assertIn("claude:opened-claude-session", state["sessions"])
         self.assertEqual(ph.doctor_store(store, project)["auto_sync"]["status"], "completed")
 
+    def test_full_backfill_requires_exact_session_root_unless_bound(self) -> None:
+        base = retained_workspace("exact-root-backfill")
+        project = base / "project"
+        child = project / "child"
+        child.mkdir(parents=True)
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
+        claude_folder = claude_home / "projects" / encoded
+        claude_exact = claude_folder / "claude-exact.jsonl"
+        claude_child = claude_folder / "claude-child.jsonl"
+        write_jsonl(
+            claude_exact,
+            [{"type": "user", "timestamp": "2026-07-15T00:00:00Z", "cwd": str(project), "message": {"content": "claude exact"}}],
+        )
+        write_jsonl(
+            claude_child,
+            [{"type": "user", "timestamp": "2026-07-15T00:01:00Z", "cwd": str(child), "message": {"content": "claude child"}}],
+        )
+
+        codex_exact = codex_home / "sessions" / "2026" / "rollout-codex-exact.jsonl"
+        codex_child = codex_home / "sessions" / "2026" / "rollout-codex-child.jsonl"
+        write_jsonl(
+            codex_exact,
+            [
+                {"type": "session_meta", "payload": {"id": "codex-exact", "cwd": str(project)}},
+                {"type": "response_item", "timestamp": "2026-07-15T00:02:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "codex exact"}]}},
+            ],
+        )
+        write_jsonl(
+            codex_child,
+            [
+                {"type": "session_meta", "payload": {"id": "codex-child", "cwd": str(child)}},
+                {"type": "response_item", "timestamp": "2026-07-15T00:03:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "codex child"}]}},
+            ],
+        )
+
+        first = ph.backfill_project(
+            project,
+            platform="all",
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        store = project / ".prompt-harness"
+        self.assertEqual(first["sources_scanned"], 2)
+        self.assertEqual({event["prompt"]["text"] for event in ph.iter_active_events(store)}, {"claude exact", "codex exact"})
+
+        ph.append_session_binding(
+            platform="claude",
+            session_id="claude-child",
+            project_root=project,
+            source_path=claude_child,
+        )
+        ph.append_session_binding(
+            platform="codex",
+            session_id="codex-child",
+            project_root=project,
+            source_path=codex_child,
+        )
+        second = ph.backfill_project(
+            project,
+            platform="all",
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(second["sources_scanned"], 4)
+        self.assertEqual(second["added"], 2)
+        self.assertEqual(
+            {event["prompt"]["text"] for event in ph.iter_active_events(store)},
+            {"claude exact", "claude child", "codex exact", "codex child"},
+        )
+
+    def test_live_hook_skips_descendant_session_until_explicitly_bound(self) -> None:
+        base = retained_workspace("exact-root-live-hook")
+        project = base / "project"
+        child = project / "child"
+        child.mkdir(parents=True)
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        args = type("Args", (), {"platform": "codex", "project": None})()
+        session_id = "child-live-session"
+        ph.capture_hook_payload(
+            args,
+            {"session_id": session_id, "cwd": str(child), "prompt": "must stay outside parent"},
+        )
+        self.assertFalse((project / ".prompt-harness").exists())
+
+        ph.append_session_binding(platform="codex", session_id=session_id, project_root=project)
+        ph.capture_hook_payload(
+            args,
+            {"session_id": session_id, "cwd": str(child), "prompt": "explicitly routed to parent"},
+        )
+        events = list(ph.iter_active_events(project / ".prompt-harness"))
+        self.assertEqual([event["prompt"]["text"] for event in events], ["explicitly routed to parent"])
+
+    def test_full_cursor_snapshot_prunes_stale_descendant_sources(self) -> None:
+        base = retained_workspace("exact-root-cursors")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        stale = {"path": str(project / "child" / "stale.jsonl"), "platform": "codex", "session_id": "stale"}
+        current = {"path": str(project / "current.jsonl"), "platform": "codex", "session_id": "current"}
+        ph.write_cursor_snapshots(store, {"stale": stale}, full_scan=False)
+        state = ph.write_cursor_snapshots(store, {"current": current}, full_scan=True)
+        self.assertEqual(state["sources"], {"current": current})
+
+        claude = {"path": str(project / "claude.jsonl"), "platform": "claude", "session_id": "claude"}
+        stale_codex = {"path": str(project / "stale-codex.jsonl"), "platform": "codex", "session_id": "old"}
+        ph.write_cursor_snapshots(store, {"claude": claude, "stale-codex": stale_codex}, full_scan=False)
+        codex_only = ph.write_cursor_snapshots(
+            store,
+            {"current": current},
+            full_scan=True,
+            scanned_platforms={"codex"},
+        )
+        self.assertEqual(codex_only["sources"], {"claude": claude, "current": current})
+
     def test_backfill_keeps_distinct_messages_in_the_same_codex_turn(self) -> None:
         base = retained_workspace("same-turn")
         project = base / "project"
@@ -929,6 +1046,89 @@ Recent Codex tasks in this project:
         self.assertEqual(events[0]["context"]["model"], "gpt-recovery-test")
         self.assertEqual(events[0]["prompt"]["text"], "old thread human prompt")
         self.assertTrue(ph.doctor_store(project / ".prompt-harness", project)["ok"])
+
+    def test_stop_recovery_skips_descendant_session_until_explicitly_bound(self) -> None:
+        base = retained_workspace("exact-root-stop")
+        project = base / "project"
+        child = project / "child"
+        child.mkdir(parents=True)
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "child-stop-session"
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(child)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-15T01:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "child stop prompt"}],
+                    },
+                },
+            ],
+        )
+        payload = {"session_id": session_id, "cwd": str(child)}
+        skipped = ph.recover_codex_stop(payload, codex_home=codex_home)
+        self.assertEqual(skipped["reason"], "cwd_not_exact_project_root")
+        self.assertFalse((project / ".prompt-harness").exists())
+
+        ph.append_session_binding(
+            platform="codex",
+            session_id=session_id,
+            project_root=project,
+            source_path=rollout,
+        )
+        captured = ph.recover_codex_stop(payload, codex_home=codex_home)
+        self.assertTrue(captured["captured"])
+        self.assertEqual(Path(captured["project"]), project.resolve())
+
+    def test_reconcile_hides_legacy_descendant_events_but_binding_reenables_them(self) -> None:
+        base = retained_workspace("exact-root-repair")
+        project = base / "project"
+        child = project / "child"
+        other = base / "other"
+        child.mkdir(parents=True)
+        other.mkdir()
+        store, _ = ph.init_store(project)
+        exact = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="hook",
+            prompt_text="exact legacy event",
+            session_id="exact-session",
+            cwd=str(project),
+        )
+        descendant = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="hook",
+            prompt_text="descendant legacy event",
+            session_id="descendant-session",
+            cwd=str(child),
+        )
+        self.assertTrue(ph.append_event(store, exact))
+        self.assertTrue(ph.append_event(store, descendant))
+        result = ph.reconcile_candidates(project, store, [], rebuild_index=True, full_dataset=True)
+        self.assertEqual(result["excluded_out_of_scope_events"], 1)
+        self.assertEqual(len(list(ph.iter_events(store))), 2)
+        self.assertEqual([event["event_id"] for event in ph.iter_active_events(store)], [exact["event_id"]])
+
+        ph.append_session_binding(
+            platform="codex",
+            session_id="descendant-session",
+            project_root=project,
+        )
+        self.assertEqual(len(list(ph.iter_active_events(store))), 2)
+        ph.append_session_binding(
+            platform="codex",
+            session_id="descendant-session",
+            project_root=other,
+        )
+        self.assertEqual([event["event_id"] for event in ph.iter_active_events(store)], [exact["event_id"]])
 
     def test_stop_recovery_missing_session_does_not_select_latest_unrelated_rollout(self) -> None:
         base = retained_workspace("stop-recovery-missing-session")

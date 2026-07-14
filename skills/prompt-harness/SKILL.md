@@ -9,18 +9,18 @@ Use the bundled `scripts/prompt_harness.py` as the only writer for prompt ledger
 
 ## Automatic behavior
 
-After installation and trust, the user should not need to initialize each project manually. Every valid hook invocation:
+After installation and trust, the user should not need to initialize each project manually. A hook invocation is valid for automatic routing only when the native session launch `cwd` exactly equals the resolved project root, or when the native session has an active explicit binding to that project. Every valid hook invocation:
 
 1. resolves the project and creates `.prompt-harness` if absent;
 2. synchronously stores the current prompt and user images;
 3. launches a detached `auto-sync` process that performs first-use discovery or reads only appended transcript tails;
 4. returns without waiting for the historical scan.
 
-The first valid interaction performs one full Claude/Codex discovery for that project. Every later interaction reconciles immediately from `state/source-cursors.json`: unchanged files are not parsed and changed JSONL files are read from their saved byte offsets. There is no time throttle. A project lock coalesces overlapping requests in `state/auto-sync-pending.json`, and one global lock serializes disk-heavy work across projects. Inspect `state/auto-sync.json` for `mode`, `sources_changed`, `bytes_read`, completion, and failures.
+The first valid interaction performs one full Claude/Codex discovery for exact-root or explicitly bound sessions in that project. Every later interaction reconciles immediately from `state/source-cursors.json`: unchanged files are not parsed and changed JSONL files are read from their saved byte offsets. There is no time throttle. A project lock coalesces overlapping requests in `state/auto-sync-pending.json`, and one global lock serializes disk-heavy work across projects. Inspect `state/auto-sync.json` for `mode`, `sources_changed`, `bytes_read`, completion, and failures.
 
 ## Core workflow
 
-1. Identify the project root. Prefer an explicit path from the user, then an active native-session binding; otherwise use the nearest existing `.prompt-harness`, Git root, `AGENTS.md`, or `CLAUDE.md`.
+1. Identify the candidate project root. Prefer an explicit path from the user, then an active native-session binding; otherwise use the nearest existing `.prompt-harness`, Git root, `AGENTS.md`, or `CLAUDE.md`. Resolving a parent candidate is not sufficient for automatic capture: require the session launch `cwd` to equal that root exactly. Only an active `bind-session` record may intentionally override this exact-root gate.
 2. Initialize the ledger:
 
    ```powershell
@@ -60,6 +60,8 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 - Treat `events/**/*.jsonl` as the append-only source of truth.
 - Apply `state/event-supersessions.jsonl` when selecting active events. It compensates for migrated duplicates without deleting raw event lines.
 - Apply `state/event-exclusions.jsonl` when selecting active events. It compensates for automatic context that older versions incorrectly captured.
+- Treat exact project-root identity as the automatic ownership boundary. Do not include an unbound Claude/Codex session whose launch `cwd` is a child of, parent of, or merely contained by the project root.
+- Legacy events captured from descendant sessions remain immutable; reconciliation appends a project-scoped exclusion. An active binding to that project dynamically re-enables the event.
 - Treat `assets/manifest.jsonl` as the append-only image-to-event relation ledger and `assets/images/` as content-addressed user-image facts.
 - Treat `index/catalog.json`, `index/PROMPTS.md`, `index/sessions.json`, `sessions/**/*.json`, `reports/SESSION_SUMMARIES.md`, and `visualizations/timeline.html` as rebuildable views.
 - Treat `P00001` labels as derived chronological positions. Backfilling an earlier prompt must renumber later P labels; use the immutable `event_id` for durable links and badcase references.
@@ -104,6 +106,7 @@ The installer must back up existing configuration before editing it and preserve
 - If Codex reports `UserPromptSubmit hook (failed)` after a plugin upgrade, compare the task-start Prompt Harness version with the current cache. A pre-`0.7.0` task may retain a deleted `$PLUGIN_ROOT`; restart that task or use Stop recovery. For `0.7.0+`, inspect `~/.prompt-harness/state/plugin-hook-errors.jsonl` and `hook-errors.jsonl` before changing data.
 - If image capture is missing, inspect `state/image-misses.jsonl`, the transcript image block, file existence, raster signature, and per-event limits. Do not fetch remote URLs as a fallback.
 - If automatic history is missing, inspect `state/auto-sync.json`, `state/source-cursors.json`, `state/auto-sync-pending.json`, `state/auto-sync-errors.jsonl`, project resolution, and `auto_sync` config before running a manual backfill.
+- If a session was started below the project root, treat its absence from the parent ledger as expected exact-root isolation. Start the task at the intended root or explicitly use `bind-session --migrate`; do not weaken the boundary to parent-directory containment.
 - If a task has multiple roots or its `cwd` points to the wrong project, verify the native session ID and transcript `session_meta`, inspect `list-bindings`, then use `bind-session --migrate` rather than copying or deleting ledger files by hand.
 - If historical counts look inflated, check native event IDs, Claude branch copies, subagent folders, injected context, and imported Codex mirrors.
 - If a secret or attachment body survives sanitation, stop publishing or exporting, improve the sanitizer, backfill into a fresh retained test project, and rerun `doctor`.

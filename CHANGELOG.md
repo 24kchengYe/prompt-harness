@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 - 2026-07-15
+
+- Require an exact normalized match between a Claude/Codex session launch directory and the project root for automatic live capture, Stop recovery, full discovery, and incremental reconciliation.
+- Keep append-only session bindings authoritative so explicitly routed cross-root sessions remain supported while parent projects no longer absorb unbound descendant sessions.
+- Append dynamic exclusions for legacy descendant events without deleting canonical JSONL; binding the session back to the project re-enables those events.
+- Replace full-scan cursor sets authoritatively and prune stale out-of-scope transcript cursors from incremental checks.
+- Add regression coverage for Claude and Codex backfill, live hooks, Stop recovery, legacy repair, and cursor pruning across root/child boundaries.
+
 ## 0.7.0 - 2026-07-15
 
 - Add a version-resilient plugin hook launcher that resolves the newest available Prompt Harness cache at invocation time, so long-lived Codex CLI and Desktop tasks survive plugin upgrades that remove their originally loaded version directory.
