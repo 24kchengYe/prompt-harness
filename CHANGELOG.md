@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 - 2026-07-15
+
+- Add an append-only user-level session binding ledger so a Claude or Codex conversation can be explicitly assigned to one project even when a task exposes multiple workspace roots or stale `cwd` metadata.
+- Make live capture, Codex Stop recovery, full discovery, and incremental reconciliation honor the latest explicit session binding.
+- Prefer an explicitly supplied Codex transcript's native `session_meta` over stale Stop payload identity and working-directory fields.
+- Add `bind-session --migrate` to backfill one exact native session into its destination project, copy retained user images, and append exclusions in any previously assigned project store without deleting canonical event rows.
+- Keep rebinding auditable: every switch appends a new `session_project_binding` record and the latest record wins.
+- Force CLI stdout/stderr to UTF-8 so prompt search and migration JSON remain printable on Windows systems whose inherited console encoding is GBK.
+
 ## 0.5.0 - 2026-07-14
 
 - Replace five-minute throttled full scans with one first-use discovery followed by cursor-based JSONL tail reconciliation after every prompt.

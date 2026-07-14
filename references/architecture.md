@@ -4,6 +4,9 @@
 flowchart LR
   H["UserPromptSubmit hook"] --> N["Normalize and sanitize"]
   T["Stop recovery for legacy threads"] --> N
+  P["Append-only session binding"] --> H
+  P --> T
+  P --> B
   H --> D["Detached auto-sync scheduler"]
   T --> D
   D --> B["First-use discovery"]
@@ -62,12 +65,17 @@ If an older version captured a Codex AGENTS/environment envelope as a human prom
 Resolution order is:
 
 1. explicit `--project` or `PROMPT_HARNESS_PROJECT_ROOT`;
-2. nearest existing `.prompt-harness/config.json`;
-3. nearest Git root;
-4. nearest `AGENTS.md`, `CLAUDE.md`, or common language project marker;
-5. current working directory.
+2. latest append-only binding for `(platform, native session ID)`;
+3. nearest existing `.prompt-harness/config.json`;
+4. nearest Git root;
+5. nearest `AGENTS.md`, `CLAUDE.md`, or common language project marker;
+6. current working directory.
 
 This keeps each project isolated without requiring every prompt to name the project.
+
+Bindings live in `~/.prompt-harness/session-bindings.jsonl`. Rebinding appends a new record whose `replaces_binding_id` points to the previous active record; the latest valid record wins. A binding may retain the native transcript path so full discovery can include that exact source even when its historical `cwd` points elsewhere.
+
+For Codex Stop recovery, an explicitly supplied transcript is opened first and its native `session_meta.id` and `session_meta.cwd` outrank stale payload values. An operator-triggered session migration reconciles that exact transcript into the bound destination, copies any retained user-image facts that are missing there, and appends exclusions to matching active rows in other registered stores. Canonical event lines are never deleted.
 
 The user's home directory and filesystem roots are explicitly rejected as project roots. They are too broad to represent one project and would otherwise match unrelated transcript working directories.
 

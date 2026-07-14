@@ -41,6 +41,17 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class PromptHarnessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._prior_harness_home = os.environ.get("PROMPT_HARNESS_HOME")
+        home = retained_workspace("harness-home")
+        os.environ["PROMPT_HARNESS_HOME"] = str(home)
+
+    def tearDown(self) -> None:
+        if self._prior_harness_home is None:
+            os.environ.pop("PROMPT_HARNESS_HOME", None)
+        else:
+            os.environ["PROMPT_HARNESS_HOME"] = self._prior_harness_home
+
     def test_backfill_matches_legacy_image_prompt_by_native_identity(self) -> None:
         base = retained_workspace("legacy-image-identity")
         project = base / "project"
@@ -919,6 +930,31 @@ Recent Codex tasks in this project:
         self.assertEqual(events[0]["prompt"]["text"], "old thread human prompt")
         self.assertTrue(ph.doctor_store(project / ".prompt-harness", project)["ok"])
 
+    def test_stop_recovery_missing_session_does_not_select_latest_unrelated_rollout(self) -> None:
+        base = retained_workspace("stop-recovery-missing-session")
+        project = base / "project"
+        project.mkdir()
+        codex_home = base / ".codex"
+        rollout = codex_home / "sessions" / "2026" / "07" / "rollout-unrelated.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": "unrelated", "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-15T04:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "must not be captured"}],
+                    },
+                },
+            ],
+        )
+        result = ph.recover_codex_stop({"cwd": str(project)}, codex_home=codex_home)
+        self.assertEqual(result["reason"], "missing_session_id")
+        self.assertEqual(len(list(ph.iter_events(project / ".prompt-harness"))), 0)
+
     def test_stop_recovery_attaches_image_to_existing_hook_event(self) -> None:
         base = retained_workspace("stop-recovery-image")
         project = base / "project"
@@ -1016,6 +1052,265 @@ Recent Codex tasks in this project:
         events = list(ph.iter_events(project / ".prompt-harness"))
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["prompt"]["text"], "utf8 stop recovery")
+
+    def test_bound_codex_session_routes_stop_recovery_and_full_backfill_to_destination(self) -> None:
+        base = retained_workspace("bound-session-route")
+        original = base / "original"
+        destination = base / "destination"
+        original.mkdir()
+        destination.mkdir()
+        (original / "AGENTS.md").write_text("original", encoding="utf-8")
+        (destination / "AGENTS.md").write_text("destination", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "bound-codex-session"
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(original)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-15T01:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "route me to destination"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "bound-turn"},
+                    },
+                },
+            ],
+        )
+        binding, appended = ph.append_session_binding(
+            platform="codex",
+            session_id=session_id,
+            project_root=destination,
+            source_path=rollout,
+        )
+        self.assertTrue(appended)
+        self.assertEqual(ph.bound_project_root("codex", session_id), destination.resolve())
+        result = ph.recover_codex_stop(
+            {"session_id": session_id, "cwd": str(original)},
+            codex_home=codex_home,
+        )
+        self.assertTrue(result["captured"])
+        self.assertEqual(Path(result["project"]), destination.resolve())
+        self.assertFalse((original / ".prompt-harness").exists())
+        self.assertEqual(len(list(ph.iter_events(destination / ".prompt-harness"))), 1)
+
+        backfill = ph.backfill_project(destination, platform="codex", codex_home=codex_home)
+        self.assertEqual(backfill["added"], 0)
+        self.assertEqual(backfill["sources_scanned"], 1)
+        self.assertEqual(binding["source_path"], str(rollout.resolve()))
+
+    def test_rebinding_is_append_only_and_latest_project_wins(self) -> None:
+        base = retained_workspace("session-rebinding")
+        first = base / "first"
+        second = base / "second"
+        first.mkdir()
+        second.mkdir()
+        one, one_added = ph.append_session_binding(
+            platform="codex",
+            session_id="switch-session",
+            project_root=first,
+        )
+        two, two_added = ph.append_session_binding(
+            platform="codex",
+            session_id="switch-session",
+            project_root=second,
+        )
+        repeated, repeated_added = ph.append_session_binding(
+            platform="codex",
+            session_id="switch-session",
+            project_root=second,
+        )
+        self.assertTrue(one_added)
+        self.assertTrue(two_added)
+        self.assertFalse(repeated_added)
+        self.assertEqual(two["replaces_binding_id"], one["binding_id"])
+        self.assertEqual(repeated["binding_id"], two["binding_id"])
+        self.assertEqual(len(list(ph.iter_session_bindings())), 2)
+        self.assertEqual(ph.bound_project_root("codex", "switch-session"), second.resolve())
+
+    def test_session_migration_copies_images_and_excludes_source_without_deleting_raw_events(self) -> None:
+        base = retained_workspace("session-migration")
+        source_root = base / "source"
+        destination = base / "destination"
+        source_root.mkdir()
+        destination.mkdir()
+        (source_root / "AGENTS.md").write_text("source", encoding="utf-8")
+        (destination / "AGENTS.md").write_text("destination", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "migrate-session"
+        turn_id = "migrate-turn"
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(source_root)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-15T02:00:00Z",
+                    "payload": {
+                        "id": "native-migrate-message",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "move prompt and archived image"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                    },
+                },
+            ],
+        )
+        source_store, _ = ph.init_store(source_root)
+        source_event = ph.build_event(
+            root=source_root,
+            platform="codex",
+            source_mode="hook",
+            prompt_text="move prompt and archived image",
+            session_id=session_id,
+            occurred_at="2026-07-15T02:00:00.000Z",
+            turn_id=turn_id,
+        )
+        self.assertTrue(ph.append_event(source_store, source_event))
+        image_path = base / "sent.png"
+        image_path.write_bytes(ONE_PIXEL_PNG)
+        self.assertEqual(
+            ph.persist_prompt_images(
+                source_store,
+                source_event["event_id"],
+                [{"kind": "local_path", "value": str(image_path)}],
+            )["saved"],
+            1,
+        )
+        ph.rebuild_index_for_store(source_store)
+        ph.append_session_binding(
+            platform="codex",
+            session_id=session_id,
+            project_root=destination,
+            source_path=rollout,
+        )
+        result = ph.migrate_bound_session(
+            platform="codex",
+            session_id=session_id,
+            project_root=destination,
+            source_path=rollout,
+            claude_home=base / ".claude",
+            codex_home=codex_home,
+        )
+        destination_store = destination / ".prompt-harness"
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(result["source_exclusions_added"], 1)
+        self.assertEqual(result["source_images_copied"], 1)
+        self.assertEqual(len(list(ph.iter_events(source_store))), 1)
+        self.assertEqual(len(list(ph.iter_active_events(source_store))), 0)
+        self.assertEqual(len(list(ph.iter_active_events(destination_store))), 1)
+        self.assertEqual(len(list(ph.iter_prompt_images(destination_store))), 1)
+        self.assertTrue(ph.doctor_store(source_store, source_root)["ok"])
+        self.assertTrue(ph.doctor_store(destination_store, destination)["ok"])
+
+        repeated = ph.migrate_bound_session(
+            platform="codex",
+            session_id=session_id,
+            project_root=destination,
+            source_path=rollout,
+            claude_home=base / ".claude",
+            codex_home=codex_home,
+        )
+        self.assertEqual(repeated["added"], 0)
+        self.assertEqual(repeated["source_exclusions_added"], 0)
+        self.assertEqual(len(list(ph.iter_prompt_images(destination_store))), 1)
+
+        ph.append_session_binding(
+            platform="codex",
+            session_id=session_id,
+            project_root=source_root,
+            source_path=rollout,
+        )
+        switched_back = ph.migrate_bound_session(
+            platform="codex",
+            session_id=session_id,
+            project_root=source_root,
+            source_path=rollout,
+            claude_home=base / ".claude",
+            codex_home=codex_home,
+        )
+        self.assertEqual(switched_back["added"], 0)
+        self.assertEqual(switched_back["source_exclusions_added"], 1)
+        self.assertEqual(len(list(ph.iter_active_events(source_store))), 1)
+        self.assertEqual(len(list(ph.iter_active_events(destination_store))), 0)
+        self.assertTrue(ph.doctor_store(source_store, source_root)["ok"])
+        self.assertTrue(ph.doctor_store(destination_store, destination)["ok"])
+
+    def test_stop_recovery_prefers_explicit_transcript_metadata_over_stale_payload(self) -> None:
+        base = retained_workspace("stop-transcript-identity")
+        project = base / "real-project"
+        stale = base / "stale-project"
+        project.mkdir()
+        stale.mkdir()
+        (project / "AGENTS.md").write_text("real", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "real-session"
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-15T03:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "trust transcript identity"}],
+                    },
+                },
+            ],
+        )
+        result = ph.recover_codex_stop(
+            {
+                "session_id": "stale-session",
+                "cwd": str(stale),
+                "transcript_path": str(rollout),
+            },
+            codex_home=codex_home,
+        )
+        self.assertTrue(result["captured"])
+        self.assertEqual(result["session_id"], session_id)
+        self.assertEqual(Path(result["project"]), project.resolve())
+        self.assertFalse((stale / ".prompt-harness").exists())
+
+    def test_cli_json_output_is_utf8_when_windows_stdio_requests_gbk(self) -> None:
+        base = retained_workspace("utf8-cli-output")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        event = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="编码检查 ⚠",
+            session_id="utf8-cli-session",
+        )
+        self.assertTrue(ph.append_event(store, event))
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp936"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "search",
+                "编码检查",
+                "--project",
+                str(project),
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        payload = json.loads(completed.stdout.decode("utf-8"))
+        self.assertEqual(payload[0]["prompt"]["text"], "编码检查 ⚠")
 
 
 if __name__ == "__main__":

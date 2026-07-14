@@ -34,6 +34,7 @@ STORE_NAME = ".prompt-harness"
 RECORD_TYPE = "user_prompt"
 IMAGE_RECORD_TYPE = "prompt_image"
 EXCLUSION_RECORD_TYPE = "event_exclusion"
+SESSION_BINDING_RECORD_TYPE = "session_project_binding"
 MAX_IMAGES_PER_EVENT = 20
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
@@ -451,10 +452,136 @@ def index_is_dirty(store: Path) -> bool:
     return bool(state.get("dirty")) or not (store / "index" / "catalog.json").exists()
 
 
-def registry_path() -> Path:
+def harness_home() -> Path:
     harness_home = os.environ.get("PROMPT_HARNESS_HOME")
-    base = Path(harness_home).expanduser() if harness_home else Path.home() / ".prompt-harness"
-    return base / "projects.json"
+    return Path(harness_home).expanduser() if harness_home else Path.home() / ".prompt-harness"
+
+
+def registry_path() -> Path:
+    return harness_home() / "projects.json"
+
+
+def session_binding_file() -> Path:
+    return harness_home() / "session-bindings.jsonl"
+
+
+def session_binding_key(platform: str, session_id: str) -> str:
+    return f"{platform.strip().lower()}:{session_id.strip()}"
+
+
+def iter_session_bindings() -> Iterator[dict[str, Any]]:
+    path = session_binding_file()
+    if not path.exists():
+        return
+    for _, value in read_jsonl(path):
+        if value.get("record_type") == SESSION_BINDING_RECORD_TYPE:
+            yield value
+
+
+def active_session_bindings() -> dict[str, dict[str, Any]]:
+    active: dict[str, dict[str, Any]] = {}
+    for record in iter_session_bindings():
+        platform = str(record.get("platform") or "").lower()
+        session_id = str(record.get("session_id") or "")
+        if platform and session_id and record.get("project_root"):
+            active[session_binding_key(platform, session_id)] = record
+    return active
+
+
+def session_binding(platform: str, session_id: str) -> dict[str, Any] | None:
+    if not platform or not session_id or session_id == "unknown":
+        return None
+    return active_session_bindings().get(session_binding_key(platform, session_id))
+
+
+def bound_project_root(platform: str, session_id: str) -> Path | None:
+    binding = session_binding(platform, session_id)
+    if not binding:
+        return None
+    try:
+        root = Path(str(binding["project_root"])).expanduser().resolve()
+    except (KeyError, OSError, RuntimeError):
+        return None
+    return None if is_unsafe_broad_project_root(root) else root
+
+
+def bound_source_paths(platform: str, root: Path) -> list[Path]:
+    target = normalize_path(root)
+    paths: list[Path] = []
+    for binding in active_session_bindings().values():
+        if str(binding.get("platform") or "").lower() != platform:
+            continue
+        if normalize_path(binding.get("project_root")) != target or not binding.get("source_path"):
+            continue
+        path = Path(str(binding["source_path"])).expanduser()
+        if path.is_file():
+            paths.append(path)
+    return paths
+
+
+def append_session_binding(
+    *,
+    platform: str,
+    session_id: str,
+    project_root: Path,
+    source_path: Path | None = None,
+    reason: str = "explicit",
+) -> tuple[dict[str, Any], bool]:
+    platform = platform.strip().lower()
+    session_id = session_id.strip()
+    root = project_root.expanduser().resolve()
+    if platform not in {"claude", "codex"}:
+        raise ValueError(f"Unsupported platform: {platform}")
+    if not session_id or session_id == "unknown":
+        raise ValueError("A native session ID is required")
+    if is_unsafe_broad_project_root(root):
+        raise ValueError(f"Refusing broad project root: {root}")
+    path = session_binding_file()
+    lock = path.with_suffix(".lock")
+    with file_lock(lock):
+        prior = session_binding(platform, session_id)
+        normalized_source = str(source_path.expanduser().resolve()) if source_path else None
+        if (
+            prior
+            and normalize_path(prior.get("project_root")) == normalize_path(root)
+            and normalize_path(prior.get("source_path")) == normalize_path(normalized_source)
+        ):
+            return prior, False
+        recorded_at = iso_z()
+        material = "|".join(
+            (platform, session_id, normalize_path(root), normalize_path(normalized_source), recorded_at)
+        )
+        record = {
+            "schema_version": "1.0.0",
+            "record_type": SESSION_BINDING_RECORD_TYPE,
+            "binding_id": "phb_" + sha256_text(material)[:32],
+            "platform": platform,
+            "session_id": session_id,
+            "project_id": project_id(root),
+            "project_root": str(root),
+            "source_path": normalized_source,
+            "reason": reason,
+            "replaces_binding_id": prior.get("binding_id") if prior else None,
+            "recorded_at": recorded_at,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return record, True
+
+
+def resolve_project_root(
+    cwd: Path,
+    *,
+    explicit: Path | None,
+    platform: str,
+    session_id: str,
+) -> Path:
+    if explicit or os.environ.get("PROMPT_HARNESS_PROJECT_ROOT"):
+        return find_project_root(cwd, explicit)
+    return bound_project_root(platform, session_id) or find_project_root(cwd)
 
 
 def register_project(root: Path, store: Path) -> None:
@@ -623,7 +750,27 @@ def iter_event_exclusions(store: Path) -> Iterator[dict[str, Any]]:
 
 
 def excluded_event_ids(store: Path) -> set[str]:
-    return {str(item.get("event_id") or "") for item in iter_event_exclusions(store)}
+    events_by_id: dict[str, dict[str, Any]] | None = None
+    excluded: set[str] = set()
+    for item in iter_event_exclusions(store):
+        event_id = str(item.get("event_id") or "")
+        reason = str(item.get("reason") or "")
+        reassignment = re.fullmatch(r"session_reassigned_to_(prj_[0-9a-f]+)", reason)
+        if reassignment:
+            if events_by_id is None:
+                events_by_id = {str(event.get("event_id") or ""): event for event in iter_events(store)}
+            event = events_by_id.get(event_id)
+            if not event:
+                excluded.add(event_id)
+                continue
+            platform = str(event.get("source", {}).get("platform") or "")
+            session_id = str(event.get("session", {}).get("id") or "")
+            binding = session_binding(platform, session_id)
+            if binding and str(binding.get("project_id") or "") == reassignment.group(1):
+                excluded.add(event_id)
+            continue
+        excluded.add(event_id)
+    return excluded
 
 
 def iter_active_events(store: Path) -> Iterator[dict[str, Any]]:
@@ -1402,6 +1549,8 @@ def find_codex_rollout(codex_home: Path, session_id: str, transcript_path: Any =
         hinted = Path(str(transcript_path))
         if hinted.exists():
             return hinted
+    if not session_id.strip():
+        return None
     candidates: list[Path] = []
     for folder_name in ("sessions", "archived_sessions"):
         folder = codex_home / folder_name
@@ -1496,19 +1645,26 @@ def recover_codex_stop(
     project: Path | None = None,
     codex_home: Path | None = None,
 ) -> dict[str, Any]:
-    session_id = str(payload.get("session_id") or payload.get("conversation_id") or "").strip()
-    cwd = Path(str(payload.get("cwd") or os.getcwd()))
-    root = find_project_root(cwd, project)
+    payload_session_id = str(payload.get("session_id") or payload.get("conversation_id") or "").strip()
+    rollout = find_codex_rollout(
+        codex_home or (Path.home() / ".codex"),
+        payload_session_id,
+        payload.get("transcript_path"),
+    )
+    meta = codex_meta_from_path(rollout) if rollout else None
+    session_id = str((meta or {}).get("id") or (meta or {}).get("session_id") or payload_session_id).strip()
+    cwd = Path(str((meta or {}).get("cwd") or payload.get("cwd") or os.getcwd()))
+    root = resolve_project_root(
+        cwd,
+        explicit=project,
+        platform="codex",
+        session_id=session_id,
+    )
     if is_unsafe_broad_project_root(root):
         return {"captured": False, "reason": "unsafe_broad_project_root", "project": str(root)}
     store, _ = init_store(root)
     if not session_id:
         return {"captured": False, "reason": "missing_session_id", "project": str(root)}
-    rollout = find_codex_rollout(
-        codex_home or (Path.home() / ".codex"),
-        session_id,
-        payload.get("transcript_path"),
-    )
     if not rollout:
         return {
             "captured": False,
@@ -1657,15 +1813,29 @@ def capture_hook(args: argparse.Namespace) -> int:
     platform = args.platform
     if platform == "auto":
         platform = "codex" if payload.get("turn_id") or payload.get("model") else "claude"
-    cwd = Path(str(payload.get("cwd") or os.getcwd()))
-    root = find_project_root(cwd, args.project)
+    transcript_path = payload.get("transcript_path")
+    session_id = str(payload.get("session_id") or "unknown")
+    transcript_meta = None
+    if platform == "codex" and transcript_path and Path(str(transcript_path)).is_file():
+        transcript_meta = codex_meta_from_path(Path(str(transcript_path)))
+        session_id = str(
+            (transcript_meta or {}).get("id")
+            or (transcript_meta or {}).get("session_id")
+            or session_id
+        )
+    cwd = Path(str((transcript_meta or {}).get("cwd") or payload.get("cwd") or os.getcwd()))
+    root = resolve_project_root(
+        cwd,
+        explicit=args.project,
+        platform=platform,
+        session_id=session_id,
+    )
     if is_unsafe_broad_project_root(root):
         return 0
     store, _ = init_store(root)
     prompt = prompt_from_hook_payload(payload)
     prompt = append_file_path_notes(prompt, file_path_notes_from_hook_payload(payload))
     images = image_candidates_from_hook_payload(payload)
-    transcript_path = payload.get("transcript_path")
     source_line = None
     if not prompt.strip() and not images and transcript_path and Path(str(transcript_path)).exists():
         latest = latest_user_record_from_transcript(Path(str(transcript_path)), platform)
@@ -1679,7 +1849,7 @@ def capture_hook(args: argparse.Namespace) -> int:
             root,
             store,
             source_platform=platform,
-            session_id=str(payload.get("session_id") or "unknown"),
+            session_id=session_id,
             trigger="user_prompt_submit_miss",
             source_path=transcript_path,
         )
@@ -1687,7 +1857,6 @@ def capture_hook(args: argparse.Namespace) -> int:
     prompt, sanitation = sanitize_prompt(prompt)
     if (not prompt and not images) or (prompt and is_automatic_prompt(prompt) and not images):
         return 0
-    session_id = str(payload.get("session_id") or "unknown")
     occurred_at = str(payload.get("timestamp") or iso_z())
     event = build_event(
         root=root,
@@ -1845,20 +2014,44 @@ def codex_meta_from_path(
     )
 
 
+def codex_meta_belongs_to_root(
+    meta: dict[str, Any],
+    root: Path,
+    *,
+    force_session_ids: set[str] | None = None,
+    bindings: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    session_id = str(meta.get("id") or meta.get("session_id") or "")
+    if session_id and force_session_ids and session_id in force_session_ids:
+        return True
+    if is_within(meta.get("cwd"), root):
+        return True
+    binding_map = bindings if bindings is not None else active_session_bindings()
+    binding = binding_map.get(session_binding_key("codex", session_id))
+    return bool(binding and normalize_path(binding.get("project_root")) == normalize_path(root))
+
+
 def collect_codex_candidates_from_paths(
     paths: Iterable[Path],
     root: Path,
     *,
     rows_by_path: dict[str, list[tuple[int, dict[str, Any]]]] | None = None,
+    force_session_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     raw: list[dict[str, Any]] = []
     seen_goal_objectives: set[tuple[str, str]] = set()
+    bindings = active_session_bindings()
     for path in sorted(set(paths)):
         if "subagents" in path.parts or not path.is_file():
             continue
         rows = (rows_by_path or {}).get(normalize_path(path))
         meta = codex_meta_from_path(path, rows)
-        if not meta or not is_within(meta.get("cwd"), root):
+        if not meta or not codex_meta_belongs_to_root(
+            meta,
+            root,
+            force_session_ids=force_session_ids,
+            bindings=bindings,
+        ):
             continue
         if meta.get("thread_source") == "subagent" or isinstance(meta.get("source"), dict):
             continue
@@ -1911,7 +2104,8 @@ def collect_codex_candidates_from_paths(
 
 
 def codex_project_paths(codex_home: Path, root: Path) -> list[Path]:
-    paths: list[Path] = []
+    paths: set[Path] = set(bound_source_paths("codex", root))
+    bindings = active_session_bindings()
     for folder_name in ("sessions", "archived_sessions"):
         folder = codex_home / folder_name
         if not folder.exists():
@@ -1920,12 +2114,12 @@ def codex_project_paths(codex_home: Path, root: Path) -> list[Path]:
             if "subagents" in path.parts:
                 continue
             meta = codex_meta_from_path(path)
-            if not meta or not is_within(meta.get("cwd"), root):
+            if not meta or not codex_meta_belongs_to_root(meta, root, bindings=bindings):
                 continue
             if meta.get("thread_source") == "subagent" or isinstance(meta.get("source"), dict):
                 continue
-            paths.append(path)
-    return paths
+            paths.add(path)
+    return sorted(paths)
 
 
 def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any]]:
@@ -2460,7 +2654,9 @@ def backfill_project(
     codex_paths: list[Path] = []
     if platform in {"all", "claude"}:
         folder = claude_project_dir(claude_base, root)
-        claude_paths = list(folder.glob("*.jsonl")) if folder else []
+        claude_paths = sorted(
+            set((list(folder.glob("*.jsonl")) if folder else []) + bound_source_paths("claude", root))
+        )
         for path in claude_paths:
             sources[normalize_path(path)] = (path, "claude", path.stem)
     if platform in {"all", "codex"}:
@@ -2505,6 +2701,286 @@ def backfill(args: argparse.Namespace) -> int:
         rebuild_index=args.rebuild_index,
     )
     print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def find_claude_transcript(claude_home: Path, session_id: str, hinted: Path | None = None) -> Path | None:
+    if hinted and hinted.is_file():
+        return hinted
+    projects = claude_home / "projects"
+    if not projects.exists():
+        return None
+    candidates = list(projects.glob(f"*/{session_id}.jsonl"))
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def resolve_session_source(
+    *,
+    platform: str,
+    session_id: str,
+    source_path: Path | None,
+    claude_home: Path,
+    codex_home: Path,
+) -> Path | None:
+    hinted = source_path.expanduser() if source_path else None
+    if platform == "codex":
+        return find_codex_rollout(codex_home, session_id, hinted)
+    return find_claude_transcript(claude_home, session_id, hinted)
+
+
+def event_match_indexes(events: Iterable[dict[str, Any]]) -> dict[str, dict[Any, dict[str, Any]]]:
+    indexes: dict[str, dict[Any, dict[str, Any]]] = {
+        "event": {},
+        "native": {},
+        "source": {},
+        "turn": {},
+        "time": {},
+    }
+    for event in events:
+        event_id = str(event.get("event_id") or "")
+        source = event.get("source") if isinstance(event.get("source"), dict) else {}
+        session = event.get("session") if isinstance(event.get("session"), dict) else {}
+        platform = str(source.get("platform") or "")
+        session_id = str(session.get("id") or "")
+        prompt_hash = str(event.get("prompt", {}).get("sha256") or "")
+        native = str(source.get("native_event_id") or "")
+        source_path = str(source.get("path") or "")
+        source_line = source.get("line")
+        turn_id = str(session.get("turn_id") or "")
+        occurred_at = str(event.get("occurred_at") or "")
+        if event_id:
+            indexes["event"].setdefault(event_id, event)
+        if native:
+            indexes["native"].setdefault((platform, native), event)
+        if source_path and source_line:
+            indexes["source"].setdefault((platform, normalize_path(source_path), int(source_line)), event)
+        if turn_id and prompt_hash:
+            indexes["turn"].setdefault((platform, session_id, turn_id, prompt_hash), event)
+        if occurred_at and prompt_hash:
+            indexes["time"].setdefault((platform, session_id, occurred_at, prompt_hash), event)
+    return indexes
+
+
+def matching_event(
+    event: dict[str, Any],
+    indexes: dict[str, dict[Any, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    session = event.get("session") if isinstance(event.get("session"), dict) else {}
+    platform = str(source.get("platform") or "")
+    session_id = str(session.get("id") or "")
+    prompt_hash = str(event.get("prompt", {}).get("sha256") or "")
+    native = str(source.get("native_event_id") or "")
+    source_path = str(source.get("path") or "")
+    source_line = source.get("line")
+    turn_id = str(session.get("turn_id") or "")
+    occurred_at = str(event.get("occurred_at") or "")
+    probes = [indexes["event"].get(str(event.get("event_id") or ""))]
+    if native:
+        probes.append(indexes["native"].get((platform, native)))
+    if source_path and source_line:
+        probes.append(indexes["source"].get((platform, normalize_path(source_path), int(source_line))))
+    if turn_id and prompt_hash:
+        probes.append(indexes["turn"].get((platform, session_id, turn_id, prompt_hash)))
+    if occurred_at and prompt_hash:
+        probes.append(indexes["time"].get((platform, session_id, occurred_at, prompt_hash)))
+    return next((candidate for candidate in probes if candidate), None)
+
+
+def registered_project_stores() -> list[tuple[Path, Path]]:
+    data = read_json_object(registry_path())
+    projects = data.get("projects") if isinstance(data.get("projects"), dict) else {}
+    stores: list[tuple[Path, Path]] = []
+    for item in projects.values():
+        if not isinstance(item, dict) or not item.get("root") or not item.get("store"):
+            continue
+        root = Path(str(item["root"])).expanduser()
+        store = Path(str(item["store"])).expanduser()
+        if store.is_dir():
+            stores.append((root, store))
+    return stores
+
+
+def reassign_session_events(
+    *,
+    platform: str,
+    session_id: str,
+    destination_root: Path,
+    destination_store: Path,
+) -> dict[str, int]:
+    destination_events = [
+        event
+        for event in iter_active_events(destination_store)
+        if str(event.get("source", {}).get("platform") or "") == platform
+        and str(event.get("session", {}).get("id") or "") == session_id
+    ]
+    indexes = event_match_indexes(destination_events)
+    images_copied = exclusions_added = stores_changed = 0
+    reason = f"session_reassigned_to_{project_id(destination_root)}"
+    for source_root, source_store in registered_project_stores():
+        if normalize_path(source_root) == normalize_path(destination_root):
+            continue
+        source_images: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+        for image in iter_prompt_images(source_store):
+            source_images[str(image.get("event_id") or "")].append(image)
+        changed = False
+        for source_event in list(iter_active_events(source_store)):
+            if str(source_event.get("source", {}).get("platform") or "") != platform:
+                continue
+            if str(source_event.get("session", {}).get("id") or "") != session_id:
+                continue
+            destination_event = matching_event(source_event, indexes)
+            if not destination_event:
+                continue
+            for image in source_images.get(str(source_event.get("event_id") or ""), []):
+                asset_path = source_store / str(image.get("asset", {}).get("path") or "")
+                if not asset_path.is_file():
+                    continue
+                copied = persist_prompt_images(
+                    destination_store,
+                    str(destination_event.get("event_id") or ""),
+                    [{"kind": "local_path", "value": str(asset_path), "name": asset_path.name}],
+                    source_path=str(source_event.get("source", {}).get("path") or "") or None,
+                    source_line=source_event.get("source", {}).get("line"),
+                )
+                images_copied += copied["saved"]
+            if append_event_exclusion(
+                source_store,
+                event_id=str(source_event.get("event_id") or ""),
+                reason=reason,
+            ):
+                exclusions_added += 1
+                changed = True
+        if changed:
+            rebuild_index_for_store(source_store)
+            stores_changed += 1
+    if images_copied:
+        rebuild_index_for_store(destination_store)
+    return {
+        "source_stores_changed": stores_changed,
+        "source_exclusions_added": exclusions_added,
+        "source_images_copied": images_copied,
+    }
+
+
+def migrate_bound_session(
+    *,
+    platform: str,
+    session_id: str,
+    project_root: Path,
+    source_path: Path,
+    claude_home: Path,
+    codex_home: Path,
+) -> dict[str, Any]:
+    root = project_root.expanduser().resolve()
+    store, _ = init_store(root)
+    if platform == "codex":
+        candidates = collect_codex_candidates_from_paths(
+            [source_path],
+            root,
+            force_session_ids={session_id},
+        )
+    else:
+        candidates = collect_claude_candidates_from_paths([source_path], root)
+    candidates = [item for item in candidates if str(item.get("session_id") or "") == session_id]
+    result = reconcile_candidates(
+        root,
+        store,
+        candidates,
+        rebuild_index=True,
+        full_dataset=True,
+    )
+    snapshot = source_snapshot(source_path, platform, session_id)
+    if snapshot:
+        write_cursor_snapshots(
+            store,
+            {normalize_path(source_path): snapshot},
+            full_scan=False,
+        )
+    reassignment = reassign_session_events(
+        platform=platform,
+        session_id=session_id,
+        destination_root=root,
+        destination_store=store,
+    )
+    return {**result, **reassignment, "source_path": str(source_path)}
+
+
+def bind_session_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project), Path(args.project))
+    if is_unsafe_broad_project_root(root):
+        raise ValueError(f"Refusing broad project root: {root}")
+    claude_home = Path(args.claude_home)
+    codex_home = Path(args.codex_home)
+    source = resolve_session_source(
+        platform=args.platform,
+        session_id=args.session_id,
+        source_path=args.source_path,
+        claude_home=claude_home,
+        codex_home=codex_home,
+    )
+    binding, appended = append_session_binding(
+        platform=args.platform,
+        session_id=args.session_id,
+        project_root=root,
+        source_path=source,
+        reason=args.reason,
+    )
+    store, _ = init_store(root)
+    migration = None
+    if args.migrate:
+        if not source:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "binding": binding,
+                        "binding_appended": appended,
+                        "error": "source_transcript_not_found",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 2
+        migration = migrate_bound_session(
+            platform=args.platform,
+            session_id=args.session_id,
+            project_root=root,
+            source_path=source,
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "binding": binding,
+                "binding_appended": appended,
+                "store": str(store),
+                "migration": migration,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def list_bindings(_: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "bindings": sorted(
+                    active_session_bindings().values(),
+                    key=lambda item: (str(item.get("platform") or ""), str(item.get("session_id") or "")),
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -3520,6 +3996,20 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
             warnings.append(f"{error_count} automatic reconciliation launches failed; inspect {auto_sync_errors}")
     cursor_state = read_source_cursors(store)
     pending_state = read_json_object(auto_sync_pending_file(store))
+    project_bindings = [
+        binding
+        for binding in active_session_bindings().values()
+        if normalize_path(binding.get("project_root")) == normalize_path(root)
+    ]
+    missing_binding_sources = [
+        str(binding.get("source_path"))
+        for binding in project_bindings
+        if binding.get("source_path") and not Path(str(binding["source_path"])).is_file()
+    ]
+    if missing_binding_sources:
+        warnings.append(
+            f"{len(missing_binding_sources)} active session bindings reference missing transcripts"
+        )
     return {
         "ok": not errors,
         "event_count": count,
@@ -3529,6 +4019,7 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         "image_count": image_count,
         "active_image_count": active_image_count,
         "image_file_count": len(image_hashes),
+        "active_session_binding_count": len(project_bindings),
         "auto_sync": {
             "status": auto_sync_state.get("status") or "never_run",
             "last_completed_at": auto_sync_state.get("last_completed_at"),
@@ -3599,6 +4090,23 @@ def parser() -> argparse.ArgumentParser:
     fill.add_argument("--rebuild-index", action="store_true")
     fill.set_defaults(func=backfill)
 
+    bind = sub.add_parser(
+        "bind-session",
+        help="append an explicit session-to-project binding and optionally migrate that session",
+    )
+    bind.add_argument("--platform", choices=("claude", "codex"), required=True)
+    bind.add_argument("--session-id", required=True)
+    bind.add_argument("--project", type=Path, required=True)
+    bind.add_argument("--source-path", type=Path)
+    bind.add_argument("--reason", default="explicit")
+    bind.add_argument("--migrate", action="store_true")
+    bind.add_argument("--claude-home", type=Path, default=Path.home() / ".claude")
+    bind.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    bind.set_defaults(func=bind_session_command)
+
+    bindings = sub.add_parser("list-bindings", help="list active session-to-project bindings")
+    bindings.set_defaults(func=list_bindings)
+
     automatic = sub.add_parser(
         "auto-sync",
         help="run first-use full discovery or cursor-based incremental reconciliation",
@@ -3642,6 +4150,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(OSError):
+                reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     return int(args.func(args))
 

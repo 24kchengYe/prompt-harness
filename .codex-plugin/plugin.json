@@ -1,6 +1,6 @@
 {
   "name": "prompt-harness",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Automatically initialize and reconcile a private per-project ledger of human prompts and user-sent images from Claude Code and Codex.",
   "author": {
     "name": "24kchengYe",
@@ -20,12 +20,13 @@
   "interface": {
     "displayName": "Prompt Harness",
     "shortDescription": "Keep a private prompt ledger per project.",
-    "longDescription": "Prompt Harness captures each human prompt and user-sent image, performs one first-use history discovery, then reconciles only changed transcript tails in a detached background process.",
+    "longDescription": "Prompt Harness captures each human prompt and user-sent image, supports explicit session-to-project routing, performs one first-use history discovery, then reconciles only changed transcript tails in a detached background process.",
     "developerName": "24kchengYe",
     "category": "Productivity",
     "capabilities": [
       "UserPromptSubmit hook",
       "automatic project bootstrap and reconciliation",
+      "explicit session-to-project binding and append-only migration",
       "historical backfill",
       "user image archive",
       "offline prompt timeline",

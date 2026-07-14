@@ -7,6 +7,7 @@ Prompt histories can contain unpublished work, personal context, file paths, and
 - Prompt bodies live under `<project>/.prompt-harness/`.
 - A nested `.gitignore` excludes canonical events, generated indexes, session summaries, state, and badcase data.
 - The global project registry stores locations and timestamps only, never prompt bodies.
+- The append-only global session binding ledger stores platform, native session ID, project path, optional local transcript path, and binding timestamps only. It never copies prompt bodies or image bytes.
 - Runtime capture redacts common API-key, access-token, password, and bearer-token patterns.
 - User-sent raster images are copied into project-local, content-addressed `assets/images/` files and linked by `assets/manifest.jsonl`.
 - Ordinary file bodies and non-image attachment payloads are never copied. A parseable local attachment path is retained as prompt text.
@@ -24,3 +25,5 @@ If a human writes a path in a prompt, that path stays in the prompt text. For an
 The standalone installer creates a timestamped backup before changing Claude Code or Codex hook configuration and preserves unrelated hook entries. It does not inspect or upload authentication values.
 
 Automatic reconciliation is enabled by default and runs in a detached local process. Configure `auto_sync.enabled`, `auto_sync.platform`, or `auto_sync.background` in the project `config.json` to disable or limit it. Source cursors, pending requests, and diagnostic state remain inside the ignored `.prompt-harness/state/` directory. Home directories and drive roots are rejected as project roots to prevent accidental cross-project collection.
+
+Explicit session migration is local and append-only. It may copy already archived user images between two private project stores, then append an exclusion relation to the old store. It does not delete source event rows or upload any content.

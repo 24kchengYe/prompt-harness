@@ -20,7 +20,7 @@ The first valid interaction performs one full Claude/Codex discovery for that pr
 
 ## Core workflow
 
-1. Identify the project root. Prefer an explicit path from the user; otherwise use the nearest existing `.prompt-harness`, Git root, `AGENTS.md`, or `CLAUDE.md`.
+1. Identify the project root. Prefer an explicit path from the user, then an active native-session binding; otherwise use the nearest existing `.prompt-harness`, Git root, `AGENTS.md`, or `CLAUDE.md`.
 2. Initialize the ledger:
 
    ```powershell
@@ -44,6 +44,14 @@ The first valid interaction performs one full Claude/Codex discovery for that pr
    ```powershell
    python "$env:PLUGIN_ROOT\scripts\prompt_harness.py" search "<query>" --project "<project-root>" --limit 20
    ```
+
+6. When one conversation has multiple workspace roots, stale `cwd`, or prompts in the wrong project, bind and migrate the native session explicitly:
+
+   ```powershell
+   python "$env:PLUGIN_ROOT\scripts\prompt_harness.py" bind-session --platform codex --session-id "<session-id>" --project "<project-root>" --migrate
+   ```
+
+   Supply `--source-path` if automatic transcript lookup cannot find the exact native JSONL. Treat the binding ledger as append-only: a later project switch appends a replacement binding. Migration may append exclusions in the prior store but must not delete canonical event rows.
 
 On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.py`.
 
@@ -95,6 +103,7 @@ The installer must back up existing configuration before editing it and preserve
 - If a hook record is missing, inspect the hook payload, transcript path, project-root resolution, and hook trust state before changing the ledger.
 - If image capture is missing, inspect `state/image-misses.jsonl`, the transcript image block, file existence, raster signature, and per-event limits. Do not fetch remote URLs as a fallback.
 - If automatic history is missing, inspect `state/auto-sync.json`, `state/source-cursors.json`, `state/auto-sync-pending.json`, `state/auto-sync-errors.jsonl`, project resolution, and `auto_sync` config before running a manual backfill.
+- If a task has multiple roots or its `cwd` points to the wrong project, verify the native session ID and transcript `session_meta`, inspect `list-bindings`, then use `bind-session --migrate` rather than copying or deleting ledger files by hand.
 - If historical counts look inflated, check native event IDs, Claude branch copies, subagent folders, injected context, and imported Codex mirrors.
 - If a secret or attachment body survives sanitation, stop publishing or exporting, improve the sanitizer, backfill into a fresh retained test project, and rerun `doctor`.
 - Do not delete or rewrite canonical JSONL to repair an error without explicit user approval. Prefer a compensating event or a documented migration.

@@ -124,3 +124,25 @@ The attachment ID is deterministic for one `event_id` plus image hash, so Stop r
 ## Identity
 
 Native event identifiers are preferred for event identity. Historical rows without a native ID use exact source path/line identity before a turn identifier, so even identical text repeated inside one Codex turn remains distinct. A live turn identifier is always combined with the prompt hash, and reconciliation can use that pair to match the later source row to the live event. Historical branch recovery uses exact timestamp plus prompt hash to recognize copied history while retaining all native source IDs. A live hook lacking both source and native turn identity receives a fresh nonce so repeated identical human prompts are preserved rather than collapsed.
+
+## Session-to-project binding side ledger
+
+Project routing is not part of the prompt event envelope. Explicit routing decisions are appended to the private user-level `~/.prompt-harness/session-bindings.jsonl` ledger:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "session_project_binding",
+  "binding_id": "phb_<stable hash>",
+  "platform": "codex",
+  "session_id": "native session id",
+  "project_id": "prj_<root hash>",
+  "project_root": "D:\\path\\to\\project",
+  "source_path": "C:\\Users\\me\\.codex\\sessions\\...jsonl",
+  "reason": "explicit",
+  "replaces_binding_id": null,
+  "recorded_at": "2026-07-15T04:00:00.000Z"
+}
+```
+
+The latest valid record for `(platform, session_id)` is active. Rebinding appends; it does not rewrite prior decisions. This ledger contains routing metadata only, never prompt bodies or image bytes.

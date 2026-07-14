@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.5.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.6.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -37,6 +37,7 @@ Prompt Harness 将这些内容整理为：
 |---|---|
 | 实时捕获 | 通过 `UserPromptSubmit` Hook 在用户提交提示词时快速追加一条事件 |
 | 自动引导与对账 | 没有账本时首次全量发现；之后每条输入只检查并读取发生变化的会话文件尾部 |
+| 会话项目绑定 | 多根工作区、旧任务或错误 `cwd` 可显式绑定到一个项目；切换和迁移保持追加式审计 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
 | 模型元数据 | 优先使用 Hook 捕获值；历史记录可从 Claude assistant 行或 Codex `turn_context` 可靠推导 |
@@ -53,6 +54,7 @@ Prompt Harness 将这些内容整理为：
 ```mermaid
 flowchart LR
   U["用户新提示词"] --> H["UserPromptSubmit Hook"]
+  BIND["session → project 绑定"] --> N
   H --> D["后台自动对账调度"]
   D --> B["首次全量发现"]
   D --> J["增量 JSONL 尾部"]
@@ -211,13 +213,35 @@ python scripts/prompt_harness.py search "major revision" `
 
 需要机器可读结果时增加 `--format json`。
 
-### 4. 重建 Markdown、总结和 HTML
+### 4. 显式绑定或迁移一个会话
+
+当一个 Codex 任务打开多个工作区、原始 `cwd` 不可靠，或会话曾被写进错误项目时，用原生会话 ID 固定归属：
+
+```powershell
+python scripts/prompt_harness.py bind-session `
+  --platform codex `
+  --session-id "<native-session-id>" `
+  --project "D:\PHD\historyCMAB" `
+  --migrate
+```
+
+`--migrate` 只读取该会话的原生 transcript，把缺失提示词和图片补到目标项目；若同一事件已存在于其他已注册项目，只追加 `event-exclusion` 使旧位置不再出现在有效视图中，不删除原始 JSONL。若 transcript 不在默认 Claude/Codex 目录，可增加 `--source-path "<transcript.jsonl>"`。
+
+查看当前生效绑定：
+
+```powershell
+python scripts/prompt_harness.py list-bindings
+```
+
+再次把同一会话绑定到别的项目会追加一条新记录，最新绑定生效，旧绑定仍留作审计。
+
+### 5. 重建 Markdown、总结和 HTML
 
 ```powershell
 python scripts/prompt_harness.py rebuild-index --project "G:\path\to\project"
 ```
 
-### 5. 校验项目事实库
+### 6. 校验项目事实库
 
 ```powershell
 python scripts/prompt_harness.py doctor --project "G:\path\to\project"
@@ -243,7 +267,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 }
 ```
 
-### 6. 显式修复旧账本
+### 7. 显式修复旧账本
 
 当新版本扩展了密钥识别或自动上下文过滤规则时，可以显式修复已经生成的本地账本：
 
@@ -255,7 +279,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 
 `scrub-secrets` 只重新遮盖新识别出的敏感值；`clean-store` 会移除中断通知、重复的 Codex goal 续跑包装等非人类记录，并把附件包装压缩为“用户文字 + 引用路径”。这两个命令不会自动运行，修复时保留原有 `event_id`，随后重建派生视图。
 
-### 7. 兼容安装插件前已经存在的 Codex 任务
+### 8. 兼容安装插件前已经存在的 Codex 任务
 
 部分旧任务会保留创建时的插件 Hook 集合。若新任务的 `UserPromptSubmit` 正常、旧任务仍不触发，可安装轻量的轮末恢复 Hook：
 
@@ -415,6 +439,7 @@ HTML 读取的是重建后的事实视图，不包含助手输出。
 - 常见 API Key、access token、password 和 bearer token 会被替换；
 - 用户图片只保存在私有的 `assets/images/`；普通文件正文与非图片 base64 载荷会省略；
 - 全局注册表 `~/.prompt-harness/projects.json` 只记录项目位置，不存提示词；
+- 会话绑定表 `~/.prompt-harness/session-bindings.jsonl` 只记录平台、会话 ID、项目路径、可选 transcript 路径和绑定时间，不复制提示词；
 - 任何公开导出前都应运行 `doctor`，并人工检查或使用 secret scanner。
 
 自动遮盖只是安全网，不等于任意秘密都能被百分之百识别。详见 [PRIVACY.md](PRIVACY.md)。
@@ -428,6 +453,10 @@ HTML 读取的是重建后的事实视图，不包含助手输出。
 ### 为什么记录显示 `Source mode: backfill`？
 
 说明它来自历史 JSONL 扫描，而不是提交瞬间的 Hook。它仍然是有效事实，并保留原始文件与行号来源。
+
+### 多根工作区或错误 cwd 导致账本落错位置怎么办？
+
+运行 `bind-session --migrate`。此后该会话的 Hook、Stop 恢复和历史对账都会优先使用显式项目绑定；迁移会重建两侧派生视图，但只追加事实与排除关系，不删除原始事件。
 
 ### 为什么模型显示 `unavailable`？
 
@@ -527,7 +556,7 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 - 默认分支：`main`
 - Marketplace：`24kchengye`
 - Plugin：`prompt-harness@24kchengye`
-- 当前版本：`0.5.0`
+- 当前版本：`0.6.0`
 - 可见性：Public
 - License：[MIT](LICENSE)
 
