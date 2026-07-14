@@ -333,6 +333,52 @@ Recent Codex tasks in this project:
         self.assertEqual(events[0]["prompt"]["text"], "old thread human prompt")
         self.assertTrue(ph.doctor_store(project / ".prompt-harness", project)["ok"])
 
+    def test_stop_recovery_reads_utf8_payload_under_gbk_stdio(self) -> None:
+        base = retained_workspace("stop-recovery-utf8")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "old-session-utf8"
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T10:57:05.450Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "utf8 stop recovery"}],
+                    },
+                },
+            ],
+        )
+        payload = {"session_id": session_id, "cwd": str(project), "encoding_probe": "😀"}
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp936"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "capture-stop-recovery",
+                "--project",
+                str(project),
+                "--codex-home",
+                str(codex_home),
+            ],
+            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        events = list(ph.iter_events(project / ".prompt-harness"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["prompt"]["text"], "utf8 stop recovery")
+
 
 if __name__ == "__main__":
     unittest.main()

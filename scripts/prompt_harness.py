@@ -827,12 +827,30 @@ def recover_codex_stop(
     }
 
 
-def capture_stop_recovery(args: argparse.Namespace) -> int:
+def read_hook_payload() -> dict[str, Any] | None:
+    """Read hook JSON as UTF-8 bytes so Windows console code pages cannot corrupt it."""
     try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError):
-        return 0
-    if not isinstance(payload, dict):
+        stream = getattr(sys.stdin, "buffer", None)
+        raw = stream.read() if stream is not None else sys.stdin.read()
+    except OSError:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode(sys.stdin.encoding or "utf-8", errors="replace")
+    else:
+        text = raw
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def capture_stop_recovery(args: argparse.Namespace) -> int:
+    payload = read_hook_payload()
+    if payload is None:
         return 0
     result = recover_codex_stop(payload, project=args.project, codex_home=args.codex_home)
     print(json.dumps(result, ensure_ascii=False))
@@ -859,11 +877,8 @@ def record_hook_miss(store: Path, payload: dict[str, Any]) -> None:
 
 
 def capture_hook(args: argparse.Namespace) -> int:
-    try:
-        payload = json.load(sys.stdin)
-    except (json.JSONDecodeError, OSError):
-        return 0
-    if not isinstance(payload, dict):
+    payload = read_hook_payload()
+    if payload is None:
         return 0
     platform = args.platform
     if platform == "auto":

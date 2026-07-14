@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 - 2026-07-14
+
+- Read hook payloads from UTF-8 bytes instead of the Windows console code page.
+- Document UTF-8-safe forwarding for existing Codex Stop adapters.
+
 ## 0.1.1 - 2026-07-14
 
 - Add a private `reports/` namespace for project-specific analyses and curated prompt exports.
