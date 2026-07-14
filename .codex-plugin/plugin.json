@@ -1,7 +1,7 @@
 {
   "name": "prompt-harness",
-  "version": "0.3.0",
-  "description": "Capture human prompts and user-sent images into a private, project-local ledger and backfill Claude Code and Codex history.",
+  "version": "0.4.0",
+  "description": "Automatically initialize and reconcile a private per-project ledger of human prompts and user-sent images from Claude Code and Codex.",
   "author": {
     "name": "24kchengYe",
     "url": "https://github.com/24kchengYe"
@@ -20,11 +20,12 @@
   "interface": {
     "displayName": "Prompt Harness",
     "shortDescription": "Keep a private prompt ledger per project.",
-    "longDescription": "Prompt Harness captures each human prompt and user-sent image, imports historical Claude Code and Codex prompts, and builds a durable event layer for future badcase regression harnesses.",
+    "longDescription": "Prompt Harness captures each human prompt and user-sent image, then automatically initializes or reconciles all local Claude Code and Codex history for that project in a detached background process.",
     "developerName": "24kchengYe",
     "category": "Productivity",
     "capabilities": [
       "UserPromptSubmit hook",
+      "automatic project bootstrap and reconciliation",
       "historical backfill",
       "user image archive",
       "offline prompt timeline",

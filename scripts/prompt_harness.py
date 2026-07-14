@@ -2,9 +2,9 @@
 """Project-local prompt ledger for Codex and Claude Code.
 
 The canonical store is append-only JSONL under ``<project>/.prompt-harness``.
-Only user-authored prompt text is recorded. File bodies, tool results, assistant
-messages, subagent traffic, injected instructions, and imported mirror rows are
-not part of the ledger.
+Only user-authored prompt text and user-sent raster images are recorded. Other
+file bodies, tool results, assistant messages, subagent traffic, injected
+instructions, and imported mirror rows are not part of the ledger.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -35,6 +36,8 @@ IMAGE_RECORD_TYPE = "prompt_image"
 MAX_IMAGES_PER_EVENT = 20
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+DEFAULT_AUTO_SYNC_INTERVAL_SECONDS = 300
+MAX_AUTO_SYNC_SESSION_KEYS = 200
 IMAGE_MEDIA = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -469,6 +472,13 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
                 "git_private_by_default": True,
             },
             "future": {"badcase_schema": "reserved"},
+            "auto_sync": {
+                "enabled": True,
+                "platform": "all",
+                "background": True,
+                "min_interval_seconds": DEFAULT_AUTO_SYNC_INTERVAL_SECONDS,
+                "rebuild_index": True,
+            },
         }
         changed_config = True
     else:
@@ -476,6 +486,18 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         if "store_user_images" not in privacy:
             privacy["store_user_images"] = True
             changed_config = True
+        auto_sync = config.setdefault("auto_sync", {})
+        auto_sync_defaults = {
+            "enabled": True,
+            "platform": "all",
+            "background": True,
+            "min_interval_seconds": DEFAULT_AUTO_SYNC_INTERVAL_SECONDS,
+            "rebuild_index": True,
+        }
+        for key, value in auto_sync_defaults.items():
+            if key not in auto_sync:
+                auto_sync[key] = value
+                changed_config = True
     if changed_config:
         write_json(config_path, config)
     if not (store / "README.md").exists():
@@ -514,6 +536,121 @@ def iter_events(store: Path) -> Iterator[dict[str, Any]]:
                     continue
                 if isinstance(value, dict):
                     yield value
+
+
+def event_supersession_file(store: Path) -> Path:
+    return store / "state" / "event-supersessions.jsonl"
+
+
+def iter_event_supersessions(store: Path) -> Iterator[dict[str, Any]]:
+    path = event_supersession_file(store)
+    if path.exists():
+        for _, value in read_jsonl(path):
+            if value.get("record_type") == "event_supersession":
+                yield value
+
+
+def superseded_event_ids(store: Path) -> set[str]:
+    return {str(item.get("event_id") or "") for item in iter_event_supersessions(store)}
+
+
+def iter_active_events(store: Path) -> Iterator[dict[str, Any]]:
+    superseded = superseded_event_ids(store)
+    for event in iter_events(store):
+        if str(event.get("event_id") or "") not in superseded:
+            yield event
+
+
+def append_event_supersession(
+    store: Path,
+    *,
+    event_id: str,
+    canonical_event_id: str,
+    reason: str,
+) -> bool:
+    if not event_id or not canonical_event_id or event_id == canonical_event_id:
+        return False
+    record_id = "phs_" + sha256_text(f"{event_id}|{canonical_event_id}|{reason}")[:32]
+    path = event_supersession_file(store)
+    with file_lock(store / "state" / "supersession.lock"):
+        existing = {str(item.get("supersession_id") or "") for item in iter_event_supersessions(store)}
+        if record_id in existing:
+            return False
+        record = {
+            "schema_version": "1.0.0",
+            "record_type": "event_supersession",
+            "supersession_id": record_id,
+            "event_id": event_id,
+            "canonical_event_id": canonical_event_id,
+            "reason": reason,
+            "recorded_at": iso_z(),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return True
+
+
+LEGACY_IMAGE_OMISSION_RE = re.compile(
+    r"(?im)^\s*\[image attachment omitted(?:\s*:[^\]]*)?\]\s*(?:\r?\n)?"
+)
+
+
+def without_legacy_image_omissions(text: str) -> str:
+    return LEGACY_IMAGE_OMISSION_RE.sub("", text).strip()
+
+
+def repair_legacy_image_duplicates(store: Path) -> int:
+    events = list(iter_events(store))
+    already_superseded = superseded_event_ids(store)
+    image_event_ids = {str(item.get("event_id") or "") for item in iter_prompt_images(store)}
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = collections.defaultdict(list)
+    for event in events:
+        source = event.get("source", {})
+        native = str(source.get("native_event_id") or "")
+        if native:
+            key = ("native", source.get("platform"), native)
+        elif source.get("path") and source.get("line"):
+            key = ("source", source.get("platform"), source.get("path"), source.get("line"))
+        else:
+            continue
+        groups[key].append(event)
+    repaired = 0
+    for group in groups.values():
+        active = [event for event in group if str(event.get("event_id") or "") not in already_superseded]
+        legacy = [
+            event
+            for event in active
+            if LEGACY_IMAGE_OMISSION_RE.search(str(event.get("prompt", {}).get("text") or ""))
+        ]
+        clean = [event for event in active if event not in legacy]
+        if not legacy or not clean:
+            continue
+        canonical = max(
+            clean,
+            key=lambda event: (
+                str(event.get("event_id") or "") in image_event_ids,
+                event.get("captured_at") or "",
+            ),
+        )
+        canonical_text = str(canonical.get("prompt", {}).get("text") or "").strip()
+        canonical_id = str(canonical.get("event_id") or "")
+        for old in legacy:
+            old_text = str(old.get("prompt", {}).get("text") or "")
+            if without_legacy_image_omissions(old_text) != canonical_text:
+                continue
+            old_id = str(old.get("event_id") or "")
+            if append_event_supersession(
+                store,
+                event_id=old_id,
+                canonical_event_id=canonical_id,
+                reason="legacy_image_omission_migrated_to_image_manifest",
+            ):
+                repaired += 1
+                already_superseded.add(old_id)
+    return repaired
 
 
 def event_identity(
@@ -1169,7 +1306,7 @@ def find_equivalent_event(
     prompt_hash: str,
     occurred_at: str,
 ) -> dict[str, Any] | None:
-    for event in iter_events(store):
+    for event in iter_active_events(store):
         if event.get("source", {}).get("platform") != platform:
             continue
         if str(event.get("session", {}).get("id") or "") != session_id:
@@ -1210,21 +1347,31 @@ def recover_codex_stop(
     codex_home: Path | None = None,
 ) -> dict[str, Any]:
     session_id = str(payload.get("session_id") or payload.get("conversation_id") or "").strip()
-    if not session_id:
-        return {"captured": False, "reason": "missing_session_id"}
     cwd = Path(str(payload.get("cwd") or os.getcwd()))
     root = find_project_root(cwd, project)
+    store, _ = init_store(root)
+    if not session_id:
+        return {"captured": False, "reason": "missing_session_id", "project": str(root)}
     rollout = find_codex_rollout(
         codex_home or (Path.home() / ".codex"),
         session_id,
         payload.get("transcript_path"),
     )
     if not rollout:
-        return {"captured": False, "reason": "rollout_not_found", "session_id": session_id}
+        return {
+            "captured": False,
+            "reason": "rollout_not_found",
+            "project": str(root),
+            "session_id": session_id,
+        }
     candidate = latest_codex_prompt_event(rollout)
     if not candidate:
-        return {"captured": False, "reason": "human_prompt_not_found", "session_id": session_id}
-    store, _ = init_store(root)
+        return {
+            "captured": False,
+            "reason": "human_prompt_not_found",
+            "project": str(root),
+            "session_id": session_id,
+        }
     prompt_hash = sha256_text(candidate["text"])
     existing_event = find_equivalent_event(
         store,
@@ -1315,6 +1462,15 @@ def capture_stop_recovery(args: argparse.Namespace) -> int:
     if payload is None:
         return 0
     result = recover_codex_stop(payload, project=args.project, codex_home=args.codex_home)
+    if result.get("project"):
+        root = Path(str(result["project"]))
+        result["auto_sync"] = schedule_auto_sync(
+            root,
+            root / STORE_NAME,
+            source_platform="codex",
+            session_id=str(result.get("session_id") or payload.get("session_id") or "unknown"),
+            trigger="stop_recovery",
+        )
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -1361,6 +1517,13 @@ def capture_hook(args: argparse.Namespace) -> int:
             source_line = latest.get("line")
     if not prompt.strip() and not images:
         record_hook_miss(store, payload)
+        schedule_auto_sync(
+            root,
+            store,
+            source_platform=platform,
+            session_id=str(payload.get("session_id") or "unknown"),
+            trigger="user_prompt_submit_miss",
+        )
         return 0
     prompt, sanitation = sanitize_prompt(prompt)
     if (not prompt and not images) or (prompt and is_automatic_prompt(prompt) and not images):
@@ -1390,6 +1553,13 @@ def capture_hook(args: argparse.Namespace) -> int:
         images,
         source_path=str(transcript_path) if transcript_path else None,
         source_line=source_line,
+    )
+    schedule_auto_sync(
+        root,
+        store,
+        source_platform=platform,
+        session_id=session_id,
+        trigger="user_prompt_submit",
     )
     return 0
 
@@ -1576,10 +1746,18 @@ def merge_branch_copies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(unique.values(), key=lambda item: (item["timestamp"], item["platform"], item["session_id"]))
 
 
-def backfill(args: argparse.Namespace) -> int:
-    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+def backfill_project(
+    root: Path,
+    *,
+    platform: str = "all",
+    claude_home: Path | None = None,
+    codex_home: Path | None = None,
+    rebuild_index: bool = True,
+) -> dict[str, Any]:
+    root = root.resolve()
     store, _ = init_store(root)
-    existing = list(iter_events(store))
+    superseded = repair_legacy_image_duplicates(store)
+    existing = list(iter_active_events(store))
     existing_ids = {str(event.get("event_id")) for event in existing}
     existing_counts = collections.Counter(
         (
@@ -1602,15 +1780,56 @@ def backfill(args: argparse.Namespace) -> int:
         existing_by_key[event_key].append(event)
     for items in existing_by_key.values():
         items.sort(key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
+    existing_by_native: dict[tuple[str, str], dict[str, Any]] = {}
+    existing_by_turn: dict[tuple[str, str, str], dict[str, Any]] = {}
+    existing_by_source: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for event in existing:
+        source = event.get("source", {})
+        session = event.get("session", {})
+        platform_name = str(source.get("platform") or "")
+        native = str(source.get("native_event_id") or "")
+        turn = str(session.get("turn_id") or "")
+        source_path = str(source.get("path") or "")
+        source_line = source.get("line")
+        if native:
+            existing_by_native.setdefault((platform_name, native), event)
+        if turn:
+            existing_by_turn.setdefault((platform_name, str(session.get("id") or ""), turn), event)
+        if source_path and source_line:
+            existing_by_source.setdefault((platform_name, source_path, int(source_line)), event)
     candidates: list[dict[str, Any]] = []
-    if args.platform in {"all", "claude"}:
-        candidates.extend(collect_claude_candidates(Path(args.claude_home), root))
-    if args.platform in {"all", "codex"}:
-        candidates.extend(collect_codex_candidates(Path(args.codex_home), root))
+    if platform in {"all", "claude"}:
+        candidates.extend(collect_claude_candidates(claude_home or (Path.home() / ".claude"), root))
+    if platform in {"all", "codex"}:
+        candidates.extend(collect_codex_candidates(codex_home or (Path.home() / ".codex"), root))
     candidates.sort(key=lambda item: (item["timestamp"], item["platform"], item["session_id"]))
     source_counts: collections.Counter = collections.Counter()
     added = skipped = image_seen = image_saved = image_omitted = 0
     for item in candidates:
+        prior_identity = None
+        if item.get("native_event_id"):
+            prior_identity = existing_by_native.get((item["platform"], str(item["native_event_id"])))
+        if prior_identity is None and item.get("turn_id"):
+            prior_identity = existing_by_turn.get(
+                (item["platform"], item["session_id"], str(item["turn_id"]))
+            )
+        if prior_identity is None and item.get("path") and item.get("line"):
+            prior_identity = existing_by_source.get(
+                (item["platform"], str(item["path"]), int(item["line"]))
+            )
+        if prior_identity is not None:
+            image_result = persist_prompt_images(
+                store,
+                str(prior_identity.get("event_id") or ""),
+                item.get("images") or [],
+                source_path=item.get("path"),
+                source_line=item.get("line"),
+            )
+            image_seen += image_result["seen"]
+            image_saved += image_result["saved"]
+            image_omitted += image_result["omitted"]
+            skipped += 1
+            continue
         prompt_hash = sha256_text(item["text"])
         count_key = (item["platform"], item["session_id"], prompt_hash)
         source_counts[count_key] += 1
@@ -1649,6 +1868,12 @@ def backfill(args: argparse.Namespace) -> int:
             added += 1
             existing_counts[count_key] += 1
             existing_by_key[count_key].append(event)
+            if item.get("native_event_id"):
+                existing_by_native[(item["platform"], str(item["native_event_id"]))] = event
+            if item.get("turn_id"):
+                existing_by_turn[(item["platform"], item["session_id"], str(item["turn_id"]))] = event
+            if item.get("path") and item.get("line"):
+                existing_by_source[(item["platform"], str(item["path"]), int(item["line"]))] = event
             image_result = persist_prompt_images(
                 store,
                 event["event_id"],
@@ -1661,21 +1886,249 @@ def backfill(args: argparse.Namespace) -> int:
             image_omitted += image_result["omitted"]
         else:
             skipped += 1
-    if args.rebuild_index:
+    if rebuild_index:
         rebuild_index_for_store(store)
-    print(
-        json.dumps(
-            {
-                "project": str(root),
-                "candidates": len(candidates),
-                "added": added,
-                "skipped": skipped,
-                "images": {"seen": image_seen, "saved": image_saved, "omitted": image_omitted},
-            },
-            ensure_ascii=False,
-        )
+    return {
+        "project": str(root),
+        "candidates": len(candidates),
+        "added": added,
+        "skipped": skipped,
+        "images": {"seen": image_seen, "saved": image_saved, "omitted": image_omitted},
+        "superseded_legacy_events": superseded,
+    }
+
+
+def backfill(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    result = backfill_project(
+        root,
+        platform=args.platform,
+        claude_home=Path(args.claude_home),
+        codex_home=Path(args.codex_home),
+        rebuild_index=args.rebuild_index,
     )
+    print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def auto_sync_state_file(store: Path) -> Path:
+    return store / "state" / "auto-sync.json"
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def auto_sync_session_key(source_platform: str, session_id: str) -> str:
+    return f"{source_platform or 'unknown'}:{session_id or 'unknown'}"
+
+
+def auto_sync_is_due(
+    state: dict[str, Any],
+    *,
+    session_key: str,
+    min_interval_seconds: int,
+    force: bool = False,
+    now: dt.datetime | None = None,
+) -> tuple[bool, str]:
+    if force:
+        return True, "forced"
+    sessions = state.get("sessions") if isinstance(state.get("sessions"), dict) else {}
+    if session_key not in sessions:
+        return True, "new_session"
+    if state.get("status") in {"failed", "running"}:
+        return True, "retry_incomplete"
+    completed = parse_iso(state.get("last_completed_at"))
+    if not completed:
+        return True, "never_completed"
+    current = now or utc_now()
+    if (current - completed).total_seconds() >= max(0, min_interval_seconds):
+        return True, "interval_elapsed"
+    return False, "recently_completed"
+
+
+def trimmed_auto_sync_sessions(sessions: dict[str, Any]) -> dict[str, Any]:
+    ordered = sorted(
+        sessions.items(),
+        key=lambda pair: parse_iso(pair[1]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        reverse=True,
+    )
+    return dict(ordered[:MAX_AUTO_SYNC_SESSION_KEYS])
+
+
+def auto_sync_project(
+    root: Path,
+    *,
+    source_platform: str,
+    session_id: str,
+    trigger: str,
+    force: bool = False,
+    claude_home: Path | None = None,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
+    root = root.resolve()
+    store, config = init_store(root)
+    auto_config = config.get("auto_sync") if isinstance(config.get("auto_sync"), dict) else {}
+    if not bool(auto_config.get("enabled", True)) and not force:
+        return {"status": "skipped", "reason": "disabled", "project": str(root)}
+    platform = str(auto_config.get("platform") or "all")
+    if platform not in {"all", "claude", "codex"}:
+        platform = "all"
+    try:
+        interval = max(0, int(auto_config.get("min_interval_seconds", DEFAULT_AUTO_SYNC_INTERVAL_SECONDS)))
+    except (TypeError, ValueError):
+        interval = DEFAULT_AUTO_SYNC_INTERVAL_SECONDS
+    rebuild = bool(auto_config.get("rebuild_index", True))
+    session_key = auto_sync_session_key(source_platform, session_id)
+    state_path = auto_sync_state_file(store)
+    lock_path = store / "state" / "auto-sync.lock"
+    try:
+        with file_lock(lock_path, timeout=0.2):
+            state = read_json_object(state_path)
+            due, due_reason = auto_sync_is_due(
+                state,
+                session_key=session_key,
+                min_interval_seconds=interval,
+                force=force,
+            )
+            if not due:
+                return {
+                    "status": "skipped",
+                    "reason": due_reason,
+                    "project": str(root),
+                    "last_completed_at": state.get("last_completed_at"),
+                }
+            started_at = iso_z()
+            running = {
+                **state,
+                "schema_version": "1.0.0",
+                "status": "running",
+                "last_started_at": started_at,
+                "last_trigger": trigger,
+                "last_trigger_platform": source_platform,
+                "last_trigger_session_id": session_id,
+                "last_due_reason": due_reason,
+            }
+            write_json(state_path, running)
+            try:
+                result = backfill_project(
+                    root,
+                    platform=platform,
+                    claude_home=claude_home,
+                    codex_home=codex_home,
+                    rebuild_index=rebuild,
+                )
+            except Exception as exc:
+                failed = {
+                    **running,
+                    "status": "failed",
+                    "last_failed_at": iso_z(),
+                    "last_error": f"{type(exc).__name__}: {exc}",
+                }
+                write_json(state_path, failed)
+                return {
+                    "status": "failed",
+                    "reason": "backfill_error",
+                    "project": str(root),
+                    "error": failed["last_error"],
+                }
+            completed_at = iso_z()
+            sessions = running.get("sessions") if isinstance(running.get("sessions"), dict) else {}
+            sessions[session_key] = completed_at
+            completed = {
+                **running,
+                "status": "completed",
+                "last_completed_at": completed_at,
+                "last_error": None,
+                "sessions": trimmed_auto_sync_sessions(sessions),
+                "last_result": result,
+            }
+            write_json(state_path, completed)
+            return {"status": "completed", "reason": due_reason, **result}
+    except TimeoutError:
+        return {"status": "skipped", "reason": "sync_already_running", "project": str(root)}
+
+
+def auto_sync_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    result = auto_sync_project(
+        root,
+        source_platform=args.source_platform,
+        session_id=args.session_id,
+        trigger=args.trigger,
+        force=args.force,
+        claude_home=Path(args.claude_home),
+        codex_home=Path(args.codex_home),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+    return 1 if result.get("status") == "failed" else 0
+
+
+def schedule_auto_sync(
+    root: Path,
+    store: Path,
+    *,
+    source_platform: str,
+    session_id: str,
+    trigger: str,
+) -> dict[str, Any]:
+    disabled = str(os.environ.get("PROMPT_HARNESS_DISABLE_AUTO_SYNC") or "").lower()
+    if disabled in {"1", "true", "yes", "on"}:
+        return {"scheduled": False, "reason": "disabled_by_environment"}
+    config = read_json_object(store / "config.json")
+    auto_config = config.get("auto_sync") if isinstance(config.get("auto_sync"), dict) else {}
+    if not bool(auto_config.get("enabled", True)):
+        return {"scheduled": False, "reason": "disabled_by_config"}
+    if not bool(auto_config.get("background", True)):
+        return {"scheduled": False, "reason": "background_disabled"}
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "auto-sync",
+        "--project",
+        str(root),
+        "--source-platform",
+        source_platform,
+        "--session-id",
+        session_id or "unknown",
+        "--trigger",
+        trigger,
+    ]
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+        "env": os.environ.copy(),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **kwargs)
+    except OSError as exc:
+        failure_path = store / "state" / "auto-sync-errors.jsonl"
+        with failure_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    {"recorded_at": iso_z(), "trigger": trigger, "error": f"{type(exc).__name__}: {exc}"},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        return {"scheduled": False, "reason": "spawn_failed", "error": str(exc)}
+    return {"scheduled": True, "pid": process.pid, "reason": "background_check_started"}
 
 
 def max_backtick_run(text: str) -> int:
@@ -1847,7 +2300,11 @@ def rebuild_session_metadata_for_store(store: Path, events: list[dict[str, Any]]
 
 
 def rebuild_index_for_store(store: Path) -> dict[str, Any]:
-    events = sorted(iter_events(store), key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
+    raw_event_count = sum(1 for _ in iter_events(store))
+    events = sorted(
+        iter_active_events(store),
+        key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""),
+    )
     prompt_images = sorted(
         iter_prompt_images(store),
         key=lambda item: (str(item.get("event_id") or ""), str(item.get("attachment_id") or "")),
@@ -1867,6 +2324,8 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "generated_at": iso_z(),
         "event_count": len(events),
+        "raw_event_count": raw_event_count,
+        "superseded_event_count": raw_event_count - len(events),
         "platform_counts": dict(sorted(by_platform.items())),
         "session_counts": dict(sorted(by_session.items())),
         "secret_redactions": redactions,
@@ -2079,7 +2538,7 @@ def search(args: argparse.Namespace) -> int:
     store, _ = init_store(root)
     terms = [term.lower() for term in re.findall(r"\S+", args.query)]
     matches: list[tuple[int, dict[str, Any]]] = []
-    for event in iter_events(store):
+    for event in iter_active_events(store):
         haystack = " ".join(
             (
                 str(event.get("prompt", {}).get("text") or ""),
@@ -2128,9 +2587,33 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
             errors.append(f"obvious secret pattern remains in {event_id}")
         if not is_within(event.get("project", {}).get("root"), root):
             errors.append(f"project root mismatch in {event_id}")
+    supersession_ids: set[str] = set()
+    superseded_ids: set[str] = set()
+    canonical_ids: set[str] = set()
+    for relation in iter_event_supersessions(store):
+        relation_id = str(relation.get("supersession_id") or "")
+        event_id = str(relation.get("event_id") or "")
+        canonical_id = str(relation.get("canonical_event_id") or "")
+        if not relation_id:
+            errors.append("event supersession is missing supersession_id")
+        elif relation_id in supersession_ids:
+            errors.append(f"duplicate supersession_id {relation_id}")
+        supersession_ids.add(relation_id)
+        if event_id not in ids:
+            errors.append(f"supersession references missing event_id {event_id}")
+        if canonical_id not in ids:
+            errors.append(f"supersession references missing canonical_event_id {canonical_id}")
+        if event_id == canonical_id:
+            errors.append(f"supersession cannot point {event_id} to itself")
+        superseded_ids.add(event_id)
+        canonical_ids.add(canonical_id)
+    for canonical_id in canonical_ids & superseded_ids:
+        warnings.append(f"supersession chain includes {canonical_id}; derived views resolve one level only")
+    active_ids = ids - superseded_ids
     attachment_ids: set[str] = set()
     image_hashes: dict[Path, str] = {}
     image_count = 0
+    active_image_count = 0
     image_root = (store / "assets" / "images").resolve()
     for image in iter_prompt_images(store):
         image_count += 1
@@ -2143,6 +2626,8 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         event_id = str(image.get("event_id") or "")
         if event_id not in ids:
             errors.append(f"image {attachment_id} references missing event_id {event_id}")
+        if event_id in active_ids:
+            active_image_count += 1
         asset = image.get("asset") if isinstance(image.get("asset"), dict) else {}
         relative = Path(str(asset.get("path") or ""))
         asset_path = (store / relative).resolve()
@@ -2182,10 +2667,30 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         image_miss_count = sum(1 for _ in read_jsonl(image_misses))
         if image_miss_count:
             warnings.append(f"{image_miss_count} image attachments were omitted; inspect {image_misses}")
+    auto_sync_state = read_json_object(auto_sync_state_file(store))
+    if auto_sync_state.get("status") == "failed":
+        warnings.append(
+            "automatic history reconciliation last failed: "
+            + str(auto_sync_state.get("last_error") or "unknown error")
+        )
+    auto_sync_errors = store / "state" / "auto-sync-errors.jsonl"
+    if auto_sync_errors.exists():
+        error_count = sum(1 for _ in read_jsonl(auto_sync_errors))
+        if error_count:
+            warnings.append(f"{error_count} automatic reconciliation launches failed; inspect {auto_sync_errors}")
     return {
         "ok": not errors,
         "event_count": count,
+        "active_event_count": len(active_ids),
+        "superseded_event_count": len(superseded_ids),
         "image_count": image_count,
+        "active_image_count": active_image_count,
+        "image_file_count": len(image_hashes),
+        "auto_sync": {
+            "status": auto_sync_state.get("status") or "never_run",
+            "last_completed_at": auto_sync_state.get("last_completed_at"),
+            "last_result": auto_sync_state.get("last_result"),
+        },
         "errors": errors,
         "warnings": warnings,
     }
@@ -2243,6 +2748,19 @@ def parser() -> argparse.ArgumentParser:
     fill.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     fill.add_argument("--rebuild-index", action="store_true")
     fill.set_defaults(func=backfill)
+
+    automatic = sub.add_parser(
+        "auto-sync",
+        help="initialize and reconcile all project prompt history, with session-aware throttling",
+    )
+    automatic.add_argument("--project", type=Path)
+    automatic.add_argument("--source-platform", choices=("claude", "codex", "unknown"), default="unknown")
+    automatic.add_argument("--session-id", default="unknown")
+    automatic.add_argument("--trigger", default="manual")
+    automatic.add_argument("--force", action="store_true")
+    automatic.add_argument("--claude-home", type=Path, default=Path.home() / ".claude")
+    automatic.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    automatic.set_defaults(func=auto_sync_command)
 
     rebuild = sub.add_parser("rebuild-index", help="rebuild catalog.json and PROMPTS.md")
     rebuild.add_argument("--project", type=Path)

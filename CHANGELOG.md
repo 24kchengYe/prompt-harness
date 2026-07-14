@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 - 2026-07-14
+
+- Automatically create a project ledger on the first captured message and launch a detached full-project Claude/Codex reconciliation.
+- Reconcile on every newly observed session and after a five-minute interval for resumed sessions, with a project-level lock to prevent overlapping scans.
+- Let legacy Codex Stop recovery bootstrap and reconcile projects even when the immediate plugin hook was unavailable.
+- Persist automatic reconciliation status, trigger, session history, timing, and result under `state/auto-sync.json` for diagnosis.
+- Match historical rows by native message ID, turn ID, or source path/line before prompt hashes, preventing attachment-format upgrades from duplicating prompts.
+- Add append-only supersession relations for legacy image-omission duplicates so derived views remain clean without deleting canonical history.
+
 ## 0.3.0 - 2026-07-14
 
 - Archive user-sent PNG, JPEG, GIF, WebP, and BMP images under project-local, content-addressed `assets/images/` paths.

@@ -11,6 +11,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ spec.loader.exec_module(ph)
 ONE_PIXEL_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+os.environ["PROMPT_HARNESS_DISABLE_AUTO_SYNC"] = "1"
 
 
 def retained_workspace(name: str) -> Path:
@@ -39,6 +41,206 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class PromptHarnessTests(unittest.TestCase):
+    def test_backfill_matches_legacy_image_prompt_by_native_identity(self) -> None:
+        base = retained_workspace("legacy-image-identity")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
+        transcript = claude_home / "projects" / encoded / "legacy.jsonl"
+        image_b64 = base64.b64encode(ONE_PIXEL_PNG).decode("ascii")
+        write_jsonl(
+            transcript,
+            [
+                {
+                    "type": "user",
+                    "uuid": "same-native-id",
+                    "timestamp": "2026-07-14T00:00:00Z",
+                    "cwd": str(project),
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "legacy image prompt"},
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                            },
+                        ]
+                    },
+                }
+            ],
+        )
+        store, _ = ph.init_store(project)
+        legacy = ph.build_event(
+            root=project,
+            platform="claude",
+            source_mode="backfill",
+            prompt_text="legacy image prompt\n[image attachment omitted]",
+            session_id="legacy",
+            occurred_at="2026-07-14T00:00:00.000Z",
+            native_event_id="same-native-id",
+            source_path=str(transcript),
+            source_line=1,
+        )
+        self.assertTrue(ph.append_event(store, legacy))
+        result = ph.backfill_project(
+            project,
+            platform="all",
+            claude_home=claude_home,
+            codex_home=codex_home,
+            rebuild_index=True,
+        )
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(len(list(ph.iter_events(store))), 1)
+        self.assertEqual(len(list(ph.iter_prompt_images(store))), 1)
+        self.assertEqual(list(ph.iter_prompt_images(store))[0]["event_id"], legacy["event_id"])
+
+    def test_append_only_supersession_hides_migrated_legacy_duplicate(self) -> None:
+        base = retained_workspace("legacy-image-supersession")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        common = {
+            "root": project,
+            "platform": "claude",
+            "source_mode": "backfill",
+            "session_id": "legacy",
+            "occurred_at": "2026-07-14T00:00:00.000Z",
+            "native_event_id": "same-native-id",
+            "source_path": str(base / "legacy.jsonl"),
+            "source_line": 1,
+        }
+        old = ph.build_event(prompt_text="image prompt\n[image attachment omitted]", **common)
+        clean = ph.build_event(prompt_text="image prompt", **common)
+        self.assertTrue(ph.append_event(store, old))
+        self.assertTrue(ph.append_event(store, clean))
+        ph.persist_prompt_images(
+            store,
+            clean["event_id"],
+            [{"kind": "base64", "value": base64.b64encode(ONE_PIXEL_PNG).decode("ascii"), "media_type": "image/png"}],
+        )
+        self.assertEqual(ph.repair_legacy_image_duplicates(store), 1)
+        self.assertEqual([event["event_id"] for event in ph.iter_active_events(store)], [clean["event_id"]])
+        catalog = ph.rebuild_index_for_store(store)
+        self.assertEqual(catalog["raw_event_count"], 2)
+        self.assertEqual(catalog["event_count"], 1)
+        self.assertEqual(catalog["superseded_event_count"], 1)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["active_event_count"], 1)
+        self.assertEqual(doctor["superseded_event_count"], 1)
+
+    def test_auto_sync_initializes_backfills_and_throttles_by_session(self) -> None:
+        base = retained_workspace("auto-sync")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
+        image_b64 = base64.b64encode(ONE_PIXEL_PNG).decode("ascii")
+        write_jsonl(
+            claude_home / "projects" / encoded / "history.jsonl",
+            [
+                {
+                    "type": "user",
+                    "uuid": "auto-claude-one",
+                    "timestamp": "2026-07-14T00:00:00Z",
+                    "cwd": str(project),
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "historical Claude prompt"},
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                            },
+                        ]
+                    },
+                }
+            ],
+        )
+        first = ph.auto_sync_project(
+            project,
+            source_platform="claude",
+            session_id="opened-claude-session",
+            trigger="test",
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(first["reason"], "new_session")
+        store = project / ".prompt-harness"
+        self.assertTrue(store.is_dir())
+        self.assertEqual(len(list(ph.iter_events(store))), 1)
+        self.assertEqual(len(list(ph.iter_prompt_images(store))), 1)
+
+        repeated = ph.auto_sync_project(
+            project,
+            source_platform="claude",
+            session_id="opened-claude-session",
+            trigger="test",
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(repeated["status"], "skipped")
+        self.assertEqual(repeated["reason"], "recently_completed")
+
+        write_jsonl(
+            codex_home / "sessions" / "2026" / "rollout-new-session.jsonl",
+            [
+                {"type": "session_meta", "payload": {"id": "codex-history", "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T00:01:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "historical Codex prompt"}],
+                    },
+                },
+            ],
+        )
+        next_session = ph.auto_sync_project(
+            project,
+            source_platform="codex",
+            session_id="opened-codex-session",
+            trigger="test",
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(next_session["status"], "completed")
+        self.assertEqual(next_session["added"], 1)
+        self.assertEqual(len(list(ph.iter_events(store))), 2)
+        state = json.loads((store / "state" / "auto-sync.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "completed")
+        self.assertIn("claude:opened-claude-session", state["sessions"])
+        self.assertIn("codex:opened-codex-session", state["sessions"])
+        self.assertEqual(ph.doctor_store(store, project)["auto_sync"]["status"], "completed")
+
+    def test_hook_scheduler_launches_detached_auto_sync_command(self) -> None:
+        base = retained_workspace("auto-sync-schedule")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        fake_process = type("Process", (), {"pid": 4321})()
+        with mock.patch.dict(os.environ, {"PROMPT_HARNESS_DISABLE_AUTO_SYNC": ""}):
+            with mock.patch.object(ph.subprocess, "Popen", return_value=fake_process) as popen:
+                result = ph.schedule_auto_sync(
+                    project,
+                    store,
+                    source_platform="codex",
+                    session_id="existing-task",
+                    trigger="user_prompt_submit",
+                )
+        self.assertTrue(result["scheduled"])
+        command = popen.call_args.args[0]
+        self.assertIn("auto-sync", command)
+        self.assertIn("existing-task", command)
+        self.assertIn(str(project), command)
+
     def test_hook_archives_user_image_and_keeps_only_file_path(self) -> None:
         base = retained_workspace("hook-image")
         project = base / "project"

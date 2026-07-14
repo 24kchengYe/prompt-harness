@@ -1,13 +1,13 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.3.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.4.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
 **把散落在 Claude Code 和 Codex 会话中的人类提示词，变成每个项目私有、可追溯、可检索的事实层。**
 
-Prompt Harness 同时提供实时 `UserPromptSubmit` Hook 和历史会话回填。它只保留用户真正输入的指令与用户发送的图片，排除助手回复、工具输出、子代理、自动注入上下文和导入镜像，并生成带图片的事实 Markdown、会话索引和一个无需服务器的交互式 HTML 时间线。
+Prompt Harness 同时提供实时 `UserPromptSubmit` Hook、旧任务轮末恢复和自动历史对账。第一次在任一项目对话时，它会自动创建 `.prompt-harness`，先保存当前输入，再在独立后台进程中检查并补齐该项目全部 Claude Code 与 Codex 会话。它只保留用户真正输入的指令与用户发送的图片，排除助手回复、工具输出、子代理、自动注入上下文和导入镜像。
 
 这个事实层将作为后续 badcase 分析、可复现测试和跨模型回归的稳定输入。
 
@@ -36,6 +36,7 @@ Prompt Harness 将这些内容整理为：
 | 能力 | 说明 |
 |---|---|
 | 实时捕获 | 通过 `UserPromptSubmit` Hook 在用户提交提示词时快速追加一条事件 |
+| 自动引导与对账 | 没有账本时自动建立；新会话或恢复会话时后台补齐全项目历史，不阻塞当前回答 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
 | 模型元数据 | 优先使用 Hook 捕获值；历史记录可从 Claude assistant 行或 Codex `turn_context` 可靠推导 |
@@ -52,6 +53,8 @@ Prompt Harness 将这些内容整理为：
 ```mermaid
 flowchart LR
   U["用户新提示词"] --> H["UserPromptSubmit Hook"]
+  H --> R["后台自动对账调度"]
+  R --> B
   C["Claude Code JSONL"] --> B["历史回填"]
   X["Codex rollout JSONL"] --> B
   H --> N["清洗与项目归属"]
@@ -65,7 +68,7 @@ flowchart LR
   E -. "event_id" .-> R["未来 badcase 测试"]
 ```
 
-Hook 路径保持有界：定位项目、清洗一条提示词、加锁追加 JSONL；如有图片，再校验并复制到本地内容哈希路径。实时捕获不会做全盘扫描、网络请求或模型调用。
+Hook 前台路径保持有界：定位项目、自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程扫描本地历史，不等待扫描完成，也不联网或调用模型。新会话必查；同一会话五分钟内节流；项目级互斥锁阻止重叠扫描。
 
 ## 从公开 GitHub 安装到 Codex
 
@@ -157,6 +160,17 @@ python scripts/install_hooks.py --platform claude --remove
 
 也可以直接使用 CLI。
 
+### 自动模式
+
+安装并信任 Hook 后，无需先手动运行 `init` 或 `backfill`：
+
+1. 在一个新任务或旧任务中发送第一条提示词；
+2. Prompt Harness 自动创建项目目录并同步保存当前输入；
+3. 后台运行全项目 Claude/Codex 对账，补齐缺失提示词和图片；
+4. 结果写入 `.prompt-harness/state/auto-sync.json`，可用 `doctor` 检查。
+
+新会话首次触发一定对账。已经见过的旧会话重新活跃时，距离上次完成超过五分钟会再次对账；五分钟内仍会实时保存当前输入，但不会重复全盘扫描。
+
 ### 1. 初始化项目
 
 ```powershell
@@ -210,8 +224,15 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 ```json
 {
   "ok": true,
-  "event_count": 388,
+  "event_count": 390,
+  "active_event_count": 388,
+  "superseded_event_count": 2,
   "image_count": 12,
+  "active_image_count": 12,
+  "image_file_count": 11,
+  "auto_sync": {
+    "status": "completed"
+  },
   "errors": [],
   "warnings": []
 }
@@ -237,7 +258,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 ```
 
-它在每轮结束后根据该任务的 `session_id` 只读取对应 rollout 的最后一条人类输入，记录为 `Source mode: stop_recovery`。它可以与插件的即时 Hook 共存；相同 `turn_id` 会阻止重复写入。安装后仍需在 `/hooks` 中检查并信任新增命令。
+它在每轮结束后根据该任务的 `session_id` 只读取对应 rollout 的最后一条人类输入，记录为 `Source mode: stop_recovery`，随后触发同样的全项目后台对账。即使项目原来没有 `.prompt-harness`，也会自动建立。它可以与插件的即时 Hook 共存；相同 `turn_id` 会阻止重复写入。安装后仍需在 `/hooks` 中检查并信任新增命令。
 
 ## 每个项目会生成什么
 
@@ -261,6 +282,8 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 ├── visualizations/
 │   └── timeline.html                 # 单文件离线时间线
 ├── state/                            # 写入锁与诊断状态
+│   ├── auto-sync.json                # 最近自动对账状态与结果
+│   └── event-supersessions.jsonl     # 追加式旧事件替代关系
 └── badcases/                         # Phase 2 预留空间
 ```
 
@@ -268,7 +291,8 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 
 | 类型 | 文件 | 规则 |
 |---|---|---|
-| 权威事实 | `events/**/*.jsonl` | 日常写入 append-only；只有显式修复命令会净化旧行 |
+| 权威事实 | `events/**/*.jsonl` | 日常写入 append-only；原始事实不因迁移重复而删除 |
+| 事实补偿 | `state/event-supersessions.jsonl` | 指明旧事件由哪个规范事件替代，视图只展示有效事件 |
 | 图片事实 | `assets/images/`、`assets/manifest.jsonl` | 图片按哈希存储；关系按 `event_id` 追加 |
 | 可读事实 | `index/PROMPTS.md` | 只有最小标题、逐条元数据和完整清洗后提示词 |
 | 派生索引 | `catalog.json`、`sessions.json` | 可以重建 |
@@ -335,12 +359,14 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 Prompt Harness 不会简单地按文本去重，因为用户可能在不同时间有意重复同一句话。
 
 - Claude 分支复制：按原生事件、时间戳和提示词哈希识别历史副本，并保留全部来源引用；
+- 回填身份匹配：优先使用原生消息 ID、turn ID、源文件路径与行号，再使用平台、会话和文本出现次数；
 - Codex 导入镜像：导入时间范围内的 Claude 镜像不重复计入；
 - 旧 Codex 任务：可通过 `capture-stop-recovery` 在该轮结束后只读取本任务 rollout 的最后一条人类输入；
 - Windows 上转发 Stop payload 时固定使用 UTF-8；若复用已有 Stop adapter，应使用 `ensure_ascii=True` 序列化，并为子进程显式设置 `encoding="utf-8"` 与 `PYTHONIOENCODING=utf-8`，避免 GBK 遇到孤立 Unicode 字符后漏记；
 - Codex 真实续写：超过原 Claude 会话结束时间的新用户输入仍然保留；
 - 实时重复输入：如果用户确实提交了两次，则保留两个事件；
 - 回填与 Hook 对账：按平台、会话和提示词出现次数避免再次写入已捕获事件。
+- 旧格式迁移：不删除旧 JSONL 行，而是追加 supersession 关系，让事实视图只展示新版规范事件。
 
 ## HTML 时间线
 
@@ -412,7 +438,7 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 
 ### Hook 会拖慢每次对话吗？
 
-实时路径只做本地文本清洗、追加和有界图片复制，不扫描全部历史，不联网，也不调用模型。历史扫描只在显式运行 `backfill` 时发生。
+前台 Hook 只做本地文本清洗、追加、有界图片复制和后台进程调度。全历史扫描在独立进程运行，不阻塞当前回答，不联网，也不调用模型；新会话首次运行，恢复会话按五分钟间隔节流。
 
 ## 故障排查顺序
 
@@ -423,7 +449,8 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 3. 当前任务是否在安装或信任之后新建；
 4. Hook 负载中的 `cwd` 是否能定位到正确项目；
 5. 项目下是否生成 `.prompt-harness/state/hook-misses.jsonl`；
-6. 运行 `backfill` 和 `doctor`，判断是实时链路问题还是事实库问题。
+6. 查看 `.prompt-harness/state/auto-sync.json` 的 `status`、`last_error` 和 `last_result`；
+7. 运行 `backfill` 和 `doctor`，判断是实时链路问题还是事实库问题。
 
 不要通过直接改写 canonical JSONL 来“修复”计数。优先修复采集逻辑、追加补偿事件，或执行有来源记录的迁移。
 
@@ -432,6 +459,7 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 当前版本会做：
 
 - 提示词捕获、回填、清洗、去重、搜索、索引和可视化；
+- 首次对话自动初始化，以及新/恢复会话触发的后台全项目对账；
 - 为未来 badcase 提供稳定 `event_id` 和项目级目录结构。
 
 当前版本不会做：
@@ -486,7 +514,7 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 - 默认分支：`main`
 - Marketplace：`24kchengye`
 - Plugin：`prompt-harness@24kchengye`
-- 当前版本：`0.3.0`
+- 当前版本：`0.4.0`
 - 可见性：Public
 - License：[MIT](LICENSE)
 

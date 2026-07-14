@@ -22,7 +22,7 @@
     {
       "id": 4,
       "prompt": "In an old Codex task, test whether this prompt is captured automatically. Do not run backfill. After the assistant finishes, report event_id, source.mode, platform, model, and image count.",
-      "expected_output": "The check accounts for post-turn Stop timing, reads the next turn without mutating the ledger, and reports stop_recovery metadata or a concrete UTF-8/trust/log diagnosis.",
+      "expected_output": "The check accounts for post-turn Stop timing, reports stop_recovery metadata, and confirms that the same interaction schedules full-project automatic reconciliation without manual backfill.",
       "files": []
     },
     {
@@ -35,6 +35,18 @@
       "id": 6,
       "prompt": "Archive an image-only user turn containing a remote HTTPS image, an SVG, and a valid local PNG.",
       "expected_output": "The empty-text prompt event is retained, only the validated local PNG is stored, remote/SVG inputs are omitted with diagnostic records, no network fetch occurs, and doctor reports the omissions as warnings rather than corrupting the ledger.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "I opened an existing project in a brand-new Codex task and sent one prompt. There is no .prompt-harness yet. Make this one interaction create it and automatically recover every Claude and Codex user prompt and image for the project without delaying the assistant response.",
+      "expected_output": "The current prompt is captured synchronously, the project ledger is initialized, a detached auto-sync runs all-platform reconciliation, state/auto-sync.json records completion, and project-level locking prevents overlapping scans.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "Resume an old task in a project whose ledger already exists. Fill every missing prompt, but do not duplicate a legacy image prompt that used to contain an image-attachment-omitted marker.",
+      "expected_output": "The resumed task triggers Stop or submission capture plus session-aware auto-sync, historical identity matches precede text hashes, images attach once, and any already-created legacy duplicate is hidden by an append-only supersession relation rather than deleted.",
       "files": []
     }
   ]

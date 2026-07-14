@@ -54,6 +54,24 @@ Each line in `events/YYYY/MM/prompts-YYYY-MM-DD.jsonl` is one self-contained JSO
 - Generated indexes are never canonical and may be overwritten.
 - A future badcase record references `event_id`; it does not copy or mutate the source prompt.
 
+## Append-only supersession
+
+When a schema upgrade has already produced two rows for one native message, Prompt Harness does not delete either canonical JSONL line. It appends a compensating relation to `state/event-supersessions.jsonl`:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "event_supersession",
+  "supersession_id": "phs_<stable hash>",
+  "event_id": "phe_<legacy event>",
+  "canonical_event_id": "phe_<clean event>",
+  "reason": "legacy_image_omission_migrated_to_image_manifest",
+  "recorded_at": "2026-07-14T04:00:02.000Z"
+}
+```
+
+Raw audit tools may read every event line. Prompt indexes, search, session summaries, and future badcase selection use active events after applying supersession relations.
+
 ## Image attachment sidecar
 
 User-sent raster images do not change the prompt event envelope. Bytes are stored at `assets/images/<sha256>.<ext>` and each event relation is appended to `assets/manifest.jsonl`:
