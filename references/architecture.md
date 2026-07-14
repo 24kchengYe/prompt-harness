@@ -9,6 +9,7 @@ flowchart LR
   N --> E["Append-only prompt events"]
   E --> S["Session summaries"]
   E --> I["Markdown and catalog index"]
+  E --> V["Standalone HTML timeline"]
   E --> Q["Search"]
   E -. event_id .-> R["Future badcase runs"]
 ```
@@ -38,3 +39,9 @@ This keeps each project isolated without requiring every prompt to name the proj
 ## Concurrency and recovery
 
 Writes use a cross-platform one-byte advisory lock, append-plus-fsync for events, and atomic replacement for derived JSON/Markdown files. Canonical JSONL is not silently rewritten. A malformed line can therefore be diagnosed without losing neighboring events.
+
+## Derived views
+
+`index/PROMPTS.md` is a fact-only rendering with no project interpretation. Session titles, `reports/SESSION_SUMMARIES.md`, `index/sessions.json`, and `visualizations/timeline.html` are disposable views and may change as new prompts arrive.
+
+When a historical event lacks a model in its canonical envelope, rebuild may resolve it from the original transcript: the next Claude assistant row for a Claude user message, or the active Codex `turn_context` for a Codex user message. The view labels this as transcript-derived and never rewrites the canonical JSONL line.

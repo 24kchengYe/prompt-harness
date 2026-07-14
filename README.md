@@ -16,8 +16,11 @@ AI coding work is scattered across sessions, branches, clients, and imported arc
 ├── events/YYYY/MM/prompts-*.jsonl    # append-only canonical events
 ├── sessions/{claude,codex}/*.json    # rebuildable session summaries
 ├── index/catalog.json                # counts and coverage
-├── index/PROMPTS.md                  # readable generated export
-├── reports/*.md                      # project-specific analyses/curated reports
+├── index/PROMPTS.md                  # fact-only prompt export
+├── index/sessions.json               # derived session grouping
+├── reports/SESSION_SUMMARIES.md      # mutable prompt-derived summaries
+├── reports/*.md                      # project-specific mutable analyses
+├── visualizations/timeline.html      # standalone local timeline
 ├── state/                            # locks and ingestion state
 └── badcases/                         # reserved phase-2 namespace
 ```
@@ -57,7 +60,7 @@ python scripts/install_hooks.py --platform claude --dry-run
 # Initialize a project
 python scripts/prompt_harness.py init --project "G:\path\to\project"
 
-# Recover historical Claude Code + Codex prompts and generate Markdown
+# Recover historical Claude Code + Codex prompts and generate Markdown + HTML
 python scripts/prompt_harness.py backfill --project "G:\path\to\project" --platform all --rebuild-index
 
 # Search human prompts
@@ -89,12 +92,17 @@ Excluded:
 
 Paths explicitly typed by a human remain text. Prompt Harness never opens the referenced file just to copy its contents into the ledger.
 
+`PROMPTS.md` contains no project interpretation: each record shows time, platform, model when available, session, event ID, capture mode, and the complete sanitized human prompt. Historical model names can be derived from the source transcript during index rebuild; the export labels that provenance and never rewrites canonical events. Session titles and summaries are rebuildable, mutable views derived from human prompts only.
+
+The generated `visualizations/timeline.html` is a single offline file. It groups prompt nodes by session, distinguishes Claude and Codex, supports search/provider filters, and reveals exact prompt text on click. No server, CDN, assistant output, or raw source transcript is required.
+
 ## Design documents
 
 - [Event schema](references/event-schema.md)
 - [Architecture and deduplication](references/architecture.md)
 - [Badcase harness roadmap](references/badcase-roadmap.md)
 - [Privacy model](PRIVACY.md)
+- [Related session-history tools](references/related-work.md)
 
 ## Development
 
@@ -107,7 +115,7 @@ Prompt Harness is standard-library-only at runtime. It supports Windows, macOS, 
 
 ## Status
 
-Version `0.1.0` implements phase 1: capture, backfill, deduplicate, index, search, and validate. The badcase directory and event links are deliberately reserved for a later harness without prematurely fixing the failure taxonomy.
+Version `0.2.0` implements phase 1: capture, backfill, deduplicate, fact-only Markdown, mutable session summaries, an offline prompt timeline, search, and validation. The badcase directory and event links are deliberately reserved for a later harness without prematurely fixing the failure taxonomy.
 
 ## License
 

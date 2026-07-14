@@ -152,7 +152,36 @@ class PromptHarnessTests(unittest.TestCase):
         merged = next(event for event in events if event["source"].get("native_event_id") == "native-a")
         self.assertEqual(len(merged["source"]["refs"]), 2)
         self.assertTrue((project / ".prompt-harness" / "index" / "PROMPTS.md").exists())
+        prompt_md = (project / ".prompt-harness" / "index" / "PROMPTS.md").read_text(encoding="utf-8")
+        self.assertTrue(prompt_md.startswith("# User prompts\n\n## P00001"))
+        self.assertNotIn("Canonical source", prompt_md)
+        self.assertIn("- Platform: `claude`", prompt_md)
+        self.assertTrue((project / ".prompt-harness" / "reports" / "SESSION_SUMMARIES.md").exists())
+        timeline = (project / ".prompt-harness" / "visualizations" / "timeline.html").read_text(encoding="utf-8")
+        self.assertIn("const DATA = {", timeline)
+        self.assertNotIn("__PROMPT_HARNESS_DATA__", timeline)
         self.assertTrue(ph.doctor_store(project / ".prompt-harness", project)["ok"])
+
+    def test_model_metadata_is_derived_from_source_transcripts(self) -> None:
+        base = retained_workspace("model-view")
+        claude_path = base / "claude.jsonl"
+        rows = [
+            (1, {"type": "user", "message": {"role": "user"}}),
+            (2, {"type": "assistant", "message": {"role": "assistant", "model": "claude-opus-test"}}),
+        ]
+        write_jsonl(claude_path, [row for _, row in rows])
+        self.assertEqual(ph.source_models_by_line(claude_path, "claude")[1], "claude-opus-test")
+        self.assertIsNone(ph.normalize_model("<synthetic>"))
+
+        codex_path = base / "codex.jsonl"
+        write_jsonl(
+            codex_path,
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-test"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            ],
+        )
+        self.assertEqual(ph.source_models_by_line(codex_path, "codex")[2], "gpt-test")
 
     def test_stable_turn_id_is_idempotent(self) -> None:
         base = retained_workspace("stable-turn")

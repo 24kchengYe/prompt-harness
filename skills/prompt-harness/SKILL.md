@@ -16,7 +16,7 @@ Use the bundled `scripts/prompt_harness.py` as the only writer for prompt ledger
    python "$env:PLUGIN_ROOT\scripts\prompt_harness.py" init --project "<project-root>"
    ```
 
-3. For historical recovery, backfill both platforms and rebuild the readable index:
+3. For historical recovery, backfill both platforms and rebuild the readable Markdown and HTML views:
 
    ```powershell
    python "$env:PLUGIN_ROOT\scripts\prompt_harness.py" backfill --project "<project-root>" --platform all --rebuild-index
@@ -39,8 +39,11 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 ## Data contract
 
 - Treat `events/**/*.jsonl` as the append-only source of truth.
-- Treat `index/catalog.json`, `index/PROMPTS.md`, and `sessions/**/*.json` as rebuildable views.
+- Treat `index/catalog.json`, `index/PROMPTS.md`, `index/sessions.json`, `sessions/**/*.json`, `reports/SESSION_SUMMARIES.md`, and `visualizations/timeline.html` as rebuildable views.
 - Put project-specific narrative summaries and curated Markdown exports under `reports/`, not in the project root.
+- Keep `index/PROMPTS.md` factual: one minimal title, per-event metadata, and exact sanitized human prompt text. Never put project interpretation or extraction methodology in it.
+- Keep changing conclusions in separate report files. `SESSION_SUMMARIES.md` is prompt-derived and mutable; a curated `PROJECT_SUMMARY.md` may add analysis when the user requests it.
+- Display platform on every record. Display model when captured or reliably derived from the transcript, and label transcript-derived model metadata instead of presenting it as hook-captured.
 - Store only user-authored prompt text and minimal provenance.
 - Preserve prompt paths written by the user, but never read those paths merely to copy file bodies into the ledger.
 - Omit attachment payloads and redact obvious secrets.
@@ -69,4 +72,4 @@ The installer must back up existing configuration before editing it and preserve
 
 ## Reporting
 
-Report the project root, event count by platform, session count, privacy status, doctor result, and locations of the canonical ledger and readable Markdown index. Distinguish source prompts from imported mirrors and explain any exclusions.
+Report the project root, event count by platform, session count, privacy status, doctor result, and locations of the canonical ledger, fact Markdown, mutable summary, and local HTML timeline. Distinguish source prompts from imported mirrors and explain missing or transcript-derived model metadata.

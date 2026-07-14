@@ -68,8 +68,9 @@ This directory is managed by Prompt Harness.
 
 - `events/` is the append-only source of truth for user prompt events.
 - `sessions/` contains derived per-session metadata.
-- `index/` contains rebuildable catalogs and `PROMPTS.md`.
+- `index/` contains rebuildable catalogs, `PROMPTS.md`, and session views.
 - `reports/` contains project-specific narrative analyses and curated exports.
+- `visualizations/timeline.html` is a rebuildable, local prompt timeline.
 - `state/` contains locks and ingestion state.
 - `badcases/` is reserved for the future evaluation harness.
 
@@ -84,6 +85,7 @@ events/
 sessions/
 index/
 reports/
+visualizations/
 state/
 badcases/cases/
 badcases/runs/
@@ -353,6 +355,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         "sessions/codex",
         "index",
         "reports",
+        "visualizations",
         "state",
         "badcases/cases",
         "badcases/runs",
@@ -727,7 +730,9 @@ def collect_claude_candidates(claude_home: Path, root: Path) -> list[dict[str, A
     raw: list[dict[str, Any]] = []
     for path in sorted(folder.glob("*.jsonl")):
         session_id = path.stem
-        for line_no, obj in read_jsonl(path):
+        rows = list(read_jsonl(path))
+        models = source_models_by_line(path, "claude", rows=rows)
+        for line_no, obj in rows:
             if obj.get("type") != "user" or not isinstance(obj.get("message"), dict):
                 continue
             if obj.get("isSidechain") or obj.get("isMeta"):
@@ -750,6 +755,7 @@ def collect_claude_candidates(claude_home: Path, root: Path) -> list[dict[str, A
                     "path": str(path),
                     "line": line_no,
                     "cwd": str(obj.get("cwd") or root),
+                    "model": models.get(line_no),
                 }
             )
     return merge_branch_copies(raw)
@@ -775,6 +781,7 @@ def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any
             paths.update(path for path in folder.rglob("rollout-*.jsonl") if "subagents" not in path.parts)
     for path in sorted(paths):
         rows = list(read_jsonl(path))
+        models = source_models_by_line(path, "codex", rows=rows)
         meta = next(
             (
                 obj.get("payload")
@@ -817,7 +824,7 @@ def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any
                     "path": str(path),
                     "line": line_no,
                     "cwd": str(meta.get("cwd") or root),
-                    "model": str(meta.get("model") or "") or None,
+                    "model": models.get(line_no) or str(meta.get("model") or "") or None,
                 }
             )
     return merge_branch_copies(raw)
@@ -913,8 +920,136 @@ def fenced(text: str) -> str:
     return f"{mark}text\n{text}\n{mark}"
 
 
+def source_models_by_line(
+    path: Path,
+    platform: str,
+    *,
+    rows: list[tuple[int, dict[str, Any]]] | None = None,
+) -> dict[int, str]:
+    """Resolve the serving model without changing canonical prompt events."""
+    if not path.exists():
+        return {}
+    rows = rows if rows is not None else list(read_jsonl(path))
+    resolved: dict[int, str] = {}
+    if platform == "claude":
+        next_model: str | None = None
+        for line_no, obj in reversed(rows):
+            message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            candidate = normalize_model(message.get("model"))
+            if obj.get("type") == "assistant" and candidate:
+                next_model = candidate
+            elif obj.get("type") == "user" and next_model:
+                resolved[line_no] = next_model
+        return resolved
+
+    active_model: str | None = None
+    for line_no, obj in rows:
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if obj.get("type") == "session_meta" and normalize_model(payload.get("model")):
+            active_model = normalize_model(payload.get("model"))
+        elif obj.get("type") == "turn_context" and normalize_model(payload.get("model")):
+            active_model = normalize_model(payload.get("model"))
+        if active_model:
+            resolved[line_no] = active_model
+    return resolved
+
+
+def normalize_model(value: Any) -> str | None:
+    model = str(value or "").strip()
+    if not model or model.startswith("<") or model.lower() in {"unknown", "synthetic", "none", "null"}:
+        return None
+    return model
+
+
+def title_from_prompt(text: str, limit: int = 88) -> str:
+    for raw in text.splitlines():
+        line = re.sub(r"^[#>*\-\d.\s]+", "", raw).strip()
+        if line:
+            return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+    return "Untitled session"
+
+
+def title_from_prompts(prompts: list[str]) -> str:
+    fallback = "Untitled session"
+    for index, text in enumerate(prompts):
+        title = title_from_prompt(text)
+        if index == 0:
+            fallback = title
+        if not text.lstrip().startswith("/"):
+            return title
+    return fallback
+
+
+def build_derived_views(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    source_cache: dict[tuple[str, str], dict[int, str]] = {}
+    views: list[dict[str, Any]] = []
+    grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for index, event in enumerate(events, 1):
+        source = event.get("source", {})
+        context = event.get("context", {})
+        session = event.get("session", {})
+        platform = str(source.get("platform") or "unknown").lower()
+        model = normalize_model(context.get("model")) or ""
+        model_source = ("captured" if source.get("mode") == "hook" else "derived") if model else None
+        source_path = str(source.get("path") or "")
+        source_line = source.get("line")
+        if not model and source_path and source_line:
+            cache_key = (platform, source_path)
+            if cache_key not in source_cache:
+                source_cache[cache_key] = source_models_by_line(Path(source_path), platform)
+            model = source_cache[cache_key].get(int(source_line), "")
+            model_source = "derived" if model else None
+        session_id = str(session.get("id") or "unknown")
+        session_key = f"{platform}:{session_id}"
+        view = {
+            "number": index,
+            "event_id": event.get("event_id"),
+            "occurred_at": event.get("occurred_at"),
+            "platform": platform,
+            "source_mode": source.get("mode"),
+            "session_id": session_id,
+            "session_key": session_key,
+            "turn_id": session.get("turn_id"),
+            "model": model or None,
+            "model_source": model_source,
+            "permission_mode": context.get("permission_mode"),
+            "chars": event.get("prompt", {}).get("chars"),
+            "sha256": event.get("prompt", {}).get("sha256"),
+            "prompt": str(event.get("prompt", {}).get("text") or ""),
+        }
+        views.append(view)
+        grouped[session_key].append(view)
+
+    sessions: list[dict[str, Any]] = []
+    for key, items in grouped.items():
+        models = sorted({str(item["model"]) for item in items if item.get("model")})
+        sessions.append(
+            {
+                "session_key": key,
+                "session_id": items[0]["session_id"],
+                "platform": items[0]["platform"],
+                "title": title_from_prompts([str(item["prompt"]) for item in items]),
+                "prompt_count": len(items),
+                "first_occurred_at": items[0]["occurred_at"],
+                "last_occurred_at": items[-1]["occurred_at"],
+                "models": models,
+                "event_ids": [item["event_id"] for item in items],
+            }
+        )
+    sessions.sort(key=lambda item: (item["first_occurred_at"] or "", item["session_key"]))
+    return views, sessions
+
+
+def render_timeline(store: Path, payload: dict[str, Any]) -> None:
+    template_path = Path(__file__).resolve().parents[1] / "assets" / "timeline.html"
+    template = template_path.read_text(encoding="utf-8")
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    atomic_write(store / "visualizations" / "timeline.html", template.replace("__PROMPT_HARNESS_DATA__", encoded))
+
+
 def rebuild_index_for_store(store: Path) -> dict[str, Any]:
     events = sorted(iter_events(store), key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
+    event_views, sessions = build_derived_views(events)
     by_platform = collections.Counter(event.get("source", {}).get("platform") for event in events)
     by_session = collections.Counter(
         f"{event.get('source', {}).get('platform')}:{event.get('session', {}).get('id')}" for event in events
@@ -933,32 +1068,60 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
         "last_occurred_at": events[-1].get("occurred_at") if events else None,
     }
     write_json(store / "index" / "catalog.json", catalog)
-    lines = [
-        "# Project user prompts",
-        "",
-        f"> Generated: {catalog['generated_at']}",
-        f"> Events: {len(events)}",
-        "> Canonical source: `../events/**/*.jsonl`",
-        "",
-    ]
-    for index, event in enumerate(events, 1):
-        prompt = event.get("prompt", {})
-        source = event.get("source", {})
-        session = event.get("session", {})
+    write_json(store / "index" / "sessions.json", sessions)
+    lines = ["# User prompts", ""]
+    for view in event_views:
+        model = view.get("model") or "unavailable"
+        model_note = " (derived from source transcript)" if view.get("model_source") == "derived" else ""
         lines.extend(
             [
-                f"## P{index:05d} · {event.get('occurred_at')} · {source.get('platform')}",
+                f"## P{view['number']:05d}",
                 "",
-                f"- Event: `{event.get('event_id')}`",
-                f"- Session: `{session.get('id')}`",
-                f"- Turn: `{session.get('turn_id')}`" if session.get("turn_id") else "- Turn: unavailable",
-                f"- SHA-256: `{prompt.get('sha256')}`",
+                f"- Time: `{view.get('occurred_at')}`",
+                f"- Platform: `{view.get('platform')}`",
+                f"- Model: `{model}`{model_note}",
+                f"- Session: `{view.get('session_id')}`",
+                f"- Event: `{view.get('event_id')}`",
+                f"- Source mode: `{view.get('source_mode')}`",
                 "",
-                fenced(str(prompt.get("text") or "")),
+                fenced(view["prompt"]),
                 "",
             ]
         )
     atomic_write(store / "index" / "PROMPTS.md", "\n".join(lines))
+    summary_lines = [
+        "# Session summaries",
+        "",
+        "> Mutable derived view. Titles come only from the first human prompt in each session.",
+        "",
+    ]
+    for session in sessions:
+        models = ", ".join(session["models"]) if session["models"] else "unavailable"
+        summary_lines.extend(
+            [
+                f"## {session['title']}",
+                "",
+                f"- Platform: `{session['platform']}`",
+                f"- Model: `{models}`",
+                f"- Session: `{session['session_id']}`",
+                f"- Time: `{session['first_occurred_at']}` → `{session['last_occurred_at']}`",
+                f"- Human prompts: `{session['prompt_count']}`",
+                "",
+            ]
+        )
+    atomic_write(store / "reports" / "SESSION_SUMMARIES.md", "\n".join(summary_lines))
+    config_path = store / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    render_timeline(
+        store,
+        {
+            "generated_at": catalog["generated_at"],
+            "project": {"name": config.get("project_name") or store.parent.name, "root": config.get("project_root")},
+            "catalog": catalog,
+            "sessions": sessions,
+            "events": event_views,
+        },
+    )
     return catalog
 
 
