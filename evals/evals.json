@@ -84,6 +84,12 @@
       "prompt": "This parent directory contains several projects. Capture only Claude and Codex sessions launched exactly at the selected project root; do not absorb sessions launched one directory below. Keep an intentional cross-root session possible through explicit binding, and repair old parent-ledger contamination without deleting raw events.",
       "expected_output": "Live capture, Stop recovery, full backfill, and incremental cursors all enforce exact normalized launch-root equality; unbound descendant sessions are excluded, explicit bindings remain authoritative, legacy descendant rows receive append-only dynamic exclusions, and full scans prune stale out-of-scope cursors.",
       "files": []
+    },
+    {
+      "id": 15,
+      "prompt": "I launch general Claude and Codex sessions directly from C:\\Users\\ASUS. Keep their ledger at C:\\Users\\ASUS\\.prompt-harness without absorbing sessions launched from any child project.",
+      "expected_output": "The user home is accepted as a project root, exact-home sessions are captured and backfilled in place, descendant sessions remain out of scope unless explicitly bound, user-level registry files can coexist with project fact directories, and filesystem roots remain rejected.",
+      "files": []
     }
   ]
 }

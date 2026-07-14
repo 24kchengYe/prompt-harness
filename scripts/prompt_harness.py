@@ -337,10 +337,9 @@ def find_project_root(cwd: Path, explicit: Path | None = None) -> Path:
 
 
 def is_unsafe_broad_project_root(root: Path) -> bool:
-    """Reject automatic catch-all roots that would absorb unrelated projects."""
+    """Reject filesystem roots while allowing exact-cwd user-home ledgers."""
     resolved = root.expanduser().resolve()
-    home = Path.home().resolve()
-    return resolved == home or resolved == Path(resolved.anchor)
+    return resolved == Path(resolved.anchor)
 
 
 @contextlib.contextmanager

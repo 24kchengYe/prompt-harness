@@ -493,10 +493,36 @@ class PromptHarnessTests(unittest.TestCase):
         self.assertFalse(state["pending"])
         self.assertEqual(state["request_count"], 3)
 
-    def test_home_directory_is_rejected_as_a_project_root(self) -> None:
-        self.assertTrue(ph.is_unsafe_broad_project_root(Path.home()))
+    def test_user_home_is_allowed_but_filesystem_root_is_rejected(self) -> None:
+        self.assertFalse(ph.is_unsafe_broad_project_root(Path.home()))
+        filesystem_root = Path(Path.home().anchor)
+        self.assertTrue(ph.is_unsafe_broad_project_root(filesystem_root))
         with self.assertRaisesRegex(ValueError, "broad project root"):
-            ph.init_store(Path.home())
+            ph.init_store(filesystem_root)
+
+    def test_user_home_ledger_captures_exact_home_without_absorbing_child(self) -> None:
+        base = retained_workspace("user-home-exact-root")
+        fake_home = base / "ASUS"
+        child = fake_home / "child-project"
+        child.mkdir(parents=True)
+        (child / "AGENTS.md").write_text("child project", encoding="utf-8")
+        args = type("Args", (), {"platform": "codex", "project": None})()
+
+        with mock.patch.object(ph.Path, "home", return_value=fake_home):
+            ph.init_store(fake_home)
+            ph.capture_hook_payload(
+                args,
+                {"session_id": "home-session", "cwd": str(fake_home), "prompt": "exact home prompt"},
+            )
+            ph.capture_hook_payload(
+                args,
+                {"session_id": "child-session", "cwd": str(child), "prompt": "child prompt"},
+            )
+
+        home_events = list(ph.iter_active_events(fake_home / ".prompt-harness"))
+        child_events = list(ph.iter_active_events(child / ".prompt-harness"))
+        self.assertEqual([event["prompt"]["text"] for event in home_events], ["exact home prompt"])
+        self.assertEqual([event["prompt"]["text"] for event in child_events], ["child prompt"])
 
     def test_hook_archives_user_image_and_keeps_only_file_path(self) -> None:
         base = retained_workspace("hook-image")

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1 - 2026-07-15
+
+- Allow a user's home directory to host its own Prompt Harness ledger now that automatic ownership requires exact launch-directory equality.
+- Keep descendant sessions isolated from the home ledger; they may create their own ledger or use an explicit binding.
+- Continue rejecting filesystem and drive roots, and add regression coverage for exact-home capture.
+
 ## 0.8.0 - 2026-07-15
 
 - Require an exact normalized match between a Claude/Codex session launch directory and the project root for automatic live capture, Stop recovery, full discovery, and incremental reconciliation.

@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.8.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.8.1-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -77,6 +77,8 @@ flowchart LR
 ```
 
 Hook 前台路径保持有界：先验证原生会话 `cwd` 与候选项目根目录完全相同（或存在显式绑定），再自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程，不等待对账完成，也不联网或调用模型。项目第一次启用时做一次全量发现；之后每条输入都立即对账，但只比较已知源文件的大小与修改时间，并从保存的字节游标读取新增 JSONL 行。项目锁合并同项目重叠请求，全局锁避免多个项目同时重扫磁盘。
+
+用户主目录也可以作为一个精确项目根。例如从 `C:\Users\ASUS` 直接启动的通用会话会写入 `C:\Users\ASUS\.prompt-harness`；从其任何子目录启动的未绑定会话不会进入这本账。文件系统根目录（如 `C:\`）仍被拒绝。
 
 ## 从公开 GitHub 安装到 Codex
 

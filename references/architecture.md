@@ -83,7 +83,7 @@ Bindings live in `~/.prompt-harness/session-bindings.jsonl`. Rebinding appends a
 
 For Codex Stop recovery, an explicitly supplied transcript is opened first and its native `session_meta.id` and `session_meta.cwd` outrank stale payload values. An operator-triggered session migration reconciles that exact transcript into the bound destination, copies any retained user-image facts that are missing there, and appends exclusions to matching active rows in other registered stores. Canonical event lines are never deleted.
 
-The user's home directory and filesystem roots are explicitly rejected as project roots. They are too broad to represent one project and would otherwise match unrelated transcript working directories.
+A user's home directory may itself be a project root for general sessions launched exactly there. Its project ledger may coexist with Prompt Harness's user-level registry and binding files under the same `.prompt-harness` directory because their paths do not overlap the canonical project fact directories. Descendant sessions do not inherit the home ledger. Filesystem and drive roots remain rejected.
 
 ## Concurrency and recovery
 

@@ -75,7 +75,7 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 - Omit non-image attachment payloads and redact obvious secrets.
 - Exclude assistant output, tool results, subagent traffic, injected project/system instructions, local command wrappers, and Claude-to-Codex mirror rows.
 - Preserve legitimate repeated prompts as separate events. Prefer native IDs and exact source path/line identities. Use `(turn_id, prompt hash)`, never `turn_id` alone, to match a source row to a live hook event; distinct source lines still remain distinct even when turn and text are identical. Use occurrence matching only during a complete historical scan.
-- Reject a user's home directory or drive root as a project root. These catch-all roots can absorb unrelated projects.
+- Allow a user's home directory as a project root only under the same exact launch-`cwd` ownership rule. Descendant sessions must not enter the home ledger unless explicitly bound. Reject filesystem and drive roots.
 - Never commit `.prompt-harness/events`, `assets`, `sessions`, `index`, `reports`, or future badcase run data unless the user explicitly changes the privacy policy.
 
 Read [event-schema.md](../../references/event-schema.md) when changing the event envelope. Read [architecture.md](../../references/architecture.md) when changing ingestion or deduplication. Read [badcase-roadmap.md](../../references/badcase-roadmap.md) before implementing phase 2.
