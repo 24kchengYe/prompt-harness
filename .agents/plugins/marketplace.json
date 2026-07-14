@@ -1,0 +1,20 @@
+{
+  "name": "24kchengye",
+  "interface": {
+    "displayName": "24kchengYe Plugins"
+  },
+  "plugins": [
+    {
+      "name": "prompt-harness",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
