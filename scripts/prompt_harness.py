@@ -683,6 +683,162 @@ def prompt_from_hook_payload(payload: dict[str, Any]) -> str:
     return ""
 
 
+def codex_turn_id(payload: dict[str, Any]) -> str | None:
+    value = payload.get("turn_id")
+    if value:
+        return str(value)
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if isinstance(metadata, dict) and metadata.get("turn_id"):
+        return str(metadata["turn_id"])
+    return None
+
+
+def find_codex_rollout(codex_home: Path, session_id: str, transcript_path: Any = None) -> Path | None:
+    if transcript_path:
+        hinted = Path(str(transcript_path))
+        if hinted.exists():
+            return hinted
+    candidates: list[Path] = []
+    for folder_name in ("sessions", "archived_sessions"):
+        folder = codex_home / folder_name
+        if folder.exists():
+            candidates.extend(folder.rglob(f"*{session_id}.jsonl"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def latest_codex_prompt_event(path: Path) -> dict[str, Any] | None:
+    rows = list(read_jsonl(path))
+    models = source_models_by_line(path, "codex", rows=rows)
+    for line_no, obj in reversed(rows):
+        if obj.get("type") != "response_item" or not isinstance(obj.get("payload"), dict):
+            continue
+        payload = obj["payload"]
+        if payload.get("type") != "message" or payload.get("role") != "user":
+            continue
+        raw_text, _ = text_from_blocks(payload.get("content"))
+        if is_automatic_prompt(raw_text):
+            continue
+        text, sanitation = sanitize_prompt(raw_text, backfill=True)
+        if not text or is_automatic_prompt(text):
+            continue
+        occurred = parse_iso(obj.get("timestamp"))
+        return {
+            "text": text,
+            "sanitation": sanitation,
+            "timestamp": iso_z(occurred) if occurred else iso_z(),
+            "line": line_no,
+            "model": models.get(line_no),
+            "turn_id": codex_turn_id(payload),
+            "native_event_id": str(payload.get("id") or obj.get("id") or "") or None,
+        }
+    return None
+
+
+def equivalent_event_exists(
+    store: Path,
+    *,
+    platform: str,
+    session_id: str,
+    turn_id: str | None,
+    prompt_hash: str,
+    occurred_at: str,
+) -> bool:
+    for event in iter_events(store):
+        if event.get("source", {}).get("platform") != platform:
+            continue
+        if str(event.get("session", {}).get("id") or "") != session_id:
+            continue
+        if turn_id and str(event.get("session", {}).get("turn_id") or "") == turn_id:
+            return True
+        if (
+            event.get("prompt", {}).get("sha256") == prompt_hash
+            and event.get("occurred_at") == occurred_at
+        ):
+            return True
+    return False
+
+
+def recover_codex_stop(
+    payload: dict[str, Any],
+    *,
+    project: Path | None = None,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
+    session_id = str(payload.get("session_id") or payload.get("conversation_id") or "").strip()
+    if not session_id:
+        return {"captured": False, "reason": "missing_session_id"}
+    cwd = Path(str(payload.get("cwd") or os.getcwd()))
+    root = find_project_root(cwd, project)
+    rollout = find_codex_rollout(
+        codex_home or (Path.home() / ".codex"),
+        session_id,
+        payload.get("transcript_path"),
+    )
+    if not rollout:
+        return {"captured": False, "reason": "rollout_not_found", "session_id": session_id}
+    candidate = latest_codex_prompt_event(rollout)
+    if not candidate:
+        return {"captured": False, "reason": "human_prompt_not_found", "session_id": session_id}
+    store, _ = init_store(root)
+    prompt_hash = sha256_text(candidate["text"])
+    if equivalent_event_exists(
+        store,
+        platform="codex",
+        session_id=session_id,
+        turn_id=candidate.get("turn_id"),
+        prompt_hash=prompt_hash,
+        occurred_at=candidate["timestamp"],
+    ):
+        return {
+            "captured": False,
+            "reason": "already_recorded",
+            "project": str(root),
+            "session_id": session_id,
+            "turn_id": candidate.get("turn_id"),
+        }
+    event = build_event(
+        root=root,
+        platform="codex",
+        source_mode="stop_recovery",
+        prompt_text=candidate["text"],
+        session_id=session_id,
+        occurred_at=candidate["timestamp"],
+        turn_id=candidate.get("turn_id"),
+        transcript_path=str(rollout),
+        native_event_id=candidate.get("native_event_id"),
+        source_path=str(rollout),
+        source_line=candidate.get("line"),
+        cwd=str(cwd),
+        model=candidate.get("model"),
+        permission_mode=str(payload.get("permission_mode")) if payload.get("permission_mode") else None,
+        sanitation=candidate.get("sanitation"),
+    )
+    captured = append_event(store, event)
+    return {
+        "captured": captured,
+        "reason": "captured" if captured else "duplicate_event_id",
+        "project": str(root),
+        "event_id": event["event_id"],
+        "session_id": session_id,
+        "turn_id": candidate.get("turn_id"),
+        "model": candidate.get("model"),
+    }
+
+
+def capture_stop_recovery(args: argparse.Namespace) -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    result = recover_codex_stop(payload, project=args.project, codex_home=args.codex_home)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def record_hook_miss(store: Path, payload: dict[str, Any]) -> None:
     preview: dict[str, Any] = {}
     for key, value in payload.items():
@@ -878,7 +1034,7 @@ def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any
                     "text": text,
                     "sanitation": sanitation,
                     "native_event_id": native_event_id,
-                    "turn_id": str(payload.get("turn_id") or "") or None,
+                    "turn_id": codex_turn_id(payload),
                     "path": str(path),
                     "line": line_no,
                     "cwd": str(meta.get("cwd") or root),
@@ -1444,6 +1600,14 @@ def parser() -> argparse.ArgumentParser:
     capture.add_argument("--platform", choices=("auto", "codex", "claude"), default="auto")
     capture.add_argument("--project", type=Path)
     capture.set_defaults(func=capture_hook)
+
+    stop_recovery = sub.add_parser(
+        "capture-stop-recovery",
+        help="recover the latest Codex human prompt from a Stop hook payload",
+    )
+    stop_recovery.add_argument("--project", type=Path)
+    stop_recovery.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    stop_recovery.set_defaults(func=capture_stop_recovery)
 
     fill = sub.add_parser("backfill", help="backfill historical Claude/Codex prompts for one project")
     fill.add_argument("--project", type=Path)

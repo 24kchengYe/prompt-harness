@@ -10,7 +10,7 @@ Each line in `events/YYYY/MM/prompts-YYYY-MM-DD.jsonl` is one self-contained JSO
   "captured_at": "2026-07-14T04:00:00.000Z",
   "occurred_at": "2026-07-14T03:59:59.000Z",
   "source": {
-    "mode": "hook | backfill",
+    "mode": "hook | stop_recovery | backfill",
     "platform": "claude | codex",
     "path": null,
     "line": null,

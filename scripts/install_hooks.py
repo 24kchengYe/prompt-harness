@@ -67,6 +67,10 @@ def command_for(script: Path, platform: str) -> str:
     return f'"{sys.executable}" "{script}" capture-hook --platform {platform}'
 
 
+def stop_recovery_command(script: Path) -> str:
+    return f'"{sys.executable}" "{script}" capture-stop-recovery'
+
+
 def update_file(path: Path, script: Path, platform: str, remove: bool, dry_run: bool) -> dict[str, Any]:
     data = load_json(path)
     hooks = data.setdefault("hooks", {})
@@ -103,11 +107,69 @@ def update_file(path: Path, script: Path, platform: str, remove: bool, dry_run: 
     }
 
 
+def update_stop_recovery_file(
+    path: Path,
+    script: Path,
+    remove: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    data = load_json(path)
+    hooks = data.setdefault("hooks", {})
+    entries = hooks.setdefault("Stop", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"hooks.Stop must be an array in {path}")
+    kept = []
+    for entry in entries:
+        commands = []
+        if isinstance(entry, dict):
+            commands = [
+                str(hook.get("command", ""))
+                for hook in entry.get("hooks", [])
+                if isinstance(hook, dict)
+            ]
+        if not any("capture-stop-recovery" in command for command in commands):
+            kept.append(entry)
+    if not remove:
+        kept.append(
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": stop_recovery_command(script),
+                        "timeout": 10,
+                        "statusMessage": "Recovering legacy task prompt",
+                    }
+                ]
+            }
+        )
+    changed = kept != entries
+    hooks["Stop"] = kept
+    if not changed:
+        return {"path": str(path), "changed": False, "backup": None}
+    if dry_run:
+        return {"path": str(path), "changed": True, "backup": None, "dry_run": True}
+    backup_path = backup(path)
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return {
+        "path": str(path),
+        "changed": True,
+        "backup": str(backup_path) if backup_path else None,
+        "action": "removed" if remove else "installed",
+        "hook": "Stop recovery",
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Install Prompt Harness UserPromptSubmit hooks")
     result.add_argument("--platform", choices=("all", "codex", "claude"), default="all")
     result.add_argument("--remove", action="store_true", help="remove only Prompt Harness hook entries")
     result.add_argument("--dry-run", action="store_true")
+    result.add_argument(
+        "--codex-hook",
+        choices=("prompt-submit", "stop-recovery"),
+        default="prompt-submit",
+        help="install immediate capture or a legacy-thread Stop recovery hook for Codex",
+    )
     result.add_argument("--codex-hooks", type=Path, default=Path.home() / ".codex" / "hooks.json")
     result.add_argument("--claude-settings", type=Path, default=Path.home() / ".claude" / "settings.json")
     result.add_argument("--script", type=Path, default=Path(__file__).with_name("prompt_harness.py"))
@@ -121,7 +183,17 @@ def main() -> int:
         raise FileNotFoundError(script)
     results = []
     if args.platform in {"all", "codex"}:
-        results.append(update_file(args.codex_hooks.expanduser(), script, "codex", args.remove, args.dry_run))
+        if args.codex_hook == "stop-recovery":
+            results.append(
+                update_stop_recovery_file(
+                    args.codex_hooks.expanduser(),
+                    script,
+                    args.remove,
+                    args.dry_run,
+                )
+            )
+        else:
+            results.append(update_file(args.codex_hooks.expanduser(), script, "codex", args.remove, args.dry_run))
     if args.platform in {"all", "claude"}:
         results.append(update_file(args.claude_settings.expanduser(), script, "claude", args.remove, args.dry_run))
     print(json.dumps({"ok": True, "results": results}, ensure_ascii=False, indent=2))

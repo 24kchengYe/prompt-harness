@@ -40,6 +40,42 @@ class HookInstallerTests(unittest.TestCase):
         second = installer.update_file(settings, SCRIPT, "claude", remove=False, dry_run=False)
         self.assertFalse(second["changed"])
 
+    def test_stop_recovery_preserves_existing_stop_hook(self) -> None:
+        base = ARTIFACTS / f"stop-installer-{uuid.uuid4().hex[:8]}"
+        base.mkdir(parents=True)
+        hooks_path = base / "hooks.json"
+        hooks_path.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "Stop": [
+                            {"hooks": [{"type": "command", "command": "python existing_stop.py"}]}
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        first = installer.update_stop_recovery_file(
+            hooks_path,
+            SCRIPT,
+            remove=False,
+            dry_run=False,
+        )
+        self.assertTrue(first["changed"])
+        current = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(current["hooks"]["Stop"]), 2)
+        commands = [entry["hooks"][0]["command"] for entry in current["hooks"]["Stop"]]
+        self.assertIn("python existing_stop.py", commands)
+        self.assertTrue(any("capture-stop-recovery" in command for command in commands))
+        second = installer.update_stop_recovery_file(
+            hooks_path,
+            SCRIPT,
+            remove=False,
+            dry_run=False,
+        )
+        self.assertFalse(second["changed"])
+
 
 if __name__ == "__main__":
     unittest.main()

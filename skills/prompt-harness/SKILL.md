@@ -61,6 +61,14 @@ The plugin's `UserPromptSubmit` hook performs a fast append and returns success 
 python "$env:PLUGIN_ROOT\scripts\install_hooks.py" --platform claude
 ```
 
+Codex tasks created before the plugin hook was installed may retain their original plugin-hook set. First verify that a newly created task captures normally. If only old tasks miss prompts, add the optional `Stop` recovery hook instead of adding a second global `UserPromptSubmit` hook:
+
+```powershell
+python "$env:PLUGIN_ROOT\scripts\install_hooks.py" --platform codex --codex-hook stop-recovery
+```
+
+The recovery command reads only the latest human row from the stopped task's own rollout, records `source.mode=stop_recovery`, and reconciles by turn ID so it can coexist with the plugin's immediate hook. It is post-turn recovery rather than submission-time capture; interrupted turns may still require historical backfill.
+
 The installer must back up existing configuration before editing it and preserve unrelated hooks. After installation, verify with a real one-turn prompt in a disposable project and run `doctor` there.
 
 ## Failure handling

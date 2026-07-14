@@ -294,6 +294,45 @@ Recent Codex tasks in this project:
             self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(len(list(ph.iter_events(project / ".prompt-harness"))), 1)
 
+    def test_stop_recovery_captures_old_thread_once(self) -> None:
+        base = retained_workspace("stop-recovery")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        codex_home = base / ".codex"
+        session_id = "old-session"
+        turn_id = "old-turn"
+        rollout = codex_home / "sessions" / "2026" / "07" / f"rollout-test-{session_id}.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": str(project)}},
+                {"type": "turn_context", "payload": {"model": "gpt-recovery-test"}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T09:53:30.243Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "old thread human prompt"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                    },
+                },
+            ],
+        )
+        payload = {"session_id": session_id, "cwd": str(project)}
+        first = ph.recover_codex_stop(payload, project=project, codex_home=codex_home)
+        second = ph.recover_codex_stop(payload, project=project, codex_home=codex_home)
+        self.assertTrue(first["captured"])
+        self.assertEqual(second["reason"], "already_recorded")
+        events = list(ph.iter_events(project / ".prompt-harness"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["source"]["mode"], "stop_recovery")
+        self.assertEqual(events[0]["session"]["turn_id"], turn_id)
+        self.assertEqual(events[0]["context"]["model"], "gpt-recovery-test")
+        self.assertEqual(events[0]["prompt"]["text"], "old thread human prompt")
+        self.assertTrue(ph.doctor_store(project / ".prompt-harness", project)["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

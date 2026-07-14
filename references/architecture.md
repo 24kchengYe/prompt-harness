@@ -3,6 +3,7 @@
 ```mermaid
 flowchart LR
   H["UserPromptSubmit hook"] --> N["Normalize and sanitize"]
+  T["Stop recovery for legacy threads"] --> N
   C["Claude Code JSONL"] --> B["Historical backfill"]
   X["Codex rollout JSONL"] --> B
   B --> N
@@ -17,6 +18,8 @@ flowchart LR
 ## Ingestion paths
 
 The live path is intentionally short: resolve the project, sanitize one prompt, append one JSON line under a lock, and update a small session summary. It always returns success so an archival problem does not block the user's AI turn.
+
+Codex tasks created before a plugin hook was installed may keep their original plugin-hook set. An optional `Stop` recovery path uses that task's session ID to read only the latest human row from its native rollout after the turn completes. It records `source.mode=stop_recovery`. New tasks still use `UserPromptSubmit`; matching turn IDs prevent the two paths from duplicating an event.
 
 The recovery path scans native local transcripts. Claude Code branch copies are merged when timestamp and normalized prompt hash match; native IDs and every source reference are retained for provenance. Codex subagent rollouts are excluded. If a Codex rollout was imported from Claude, rows at or before the source transcript's latest timestamp are mirror data; only genuinely new Codex continuation prompts are candidates.
 
