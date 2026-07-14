@@ -54,6 +54,10 @@ Each line in `events/YYYY/MM/prompts-YYYY-MM-DD.jsonl` is one self-contained JSO
 - Generated indexes are never canonical and may be overwritten.
 - A future badcase record references `event_id`; it does not copy or mutate the source prompt.
 
+## Derived prompt numbers
+
+`P00001`, `P00002`, and similar labels exist only in generated views. They are the one-based chronological rank of active events, ordered first by `occurred_at` and then by deterministic transcript provenance for exact timestamp ties. Backfilling an earlier event intentionally renumbers later P labels. The stable cross-rebuild identity is always `event_id`.
+
 ## Append-only supersession
 
 When a schema upgrade has already produced two rows for one native message, Prompt Harness does not delete either canonical JSONL line. It appends a compensating relation to `state/event-supersessions.jsonl`:

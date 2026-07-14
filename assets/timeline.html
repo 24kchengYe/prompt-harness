@@ -264,7 +264,7 @@
         button.type = "button";
         button.style.setProperty("--x", `${Math.max(3.5, Math.min(96.5, ratio * 100))}%`);
         button.dataset.eventId = event.event_id;
-        button.setAttribute("aria-label", `提示词 ${index + 1}，${fmt(event.occurred_at)}，${modelText(event)}`);
+        button.setAttribute("aria-label", `P${String(event.number).padStart(5, "0")}，${fmt(event.occurred_at)}，${modelText(event)}`);
         button.setAttribute("aria-pressed", "false");
         track.append(button);
       });
@@ -284,8 +284,8 @@
         const selected = eventById.get(button.dataset.eventId);
         track.querySelectorAll(".node").forEach(node => node.setAttribute("aria-pressed", String(node === button)));
         detailMeta.replaceChildren();
-        const provider = element("b", "", selected.platform);
-        detailMeta.append(provider, document.createElement("br"), document.createTextNode(fmt(selected.occurred_at)), document.createElement("br"), document.createTextNode(modelText(selected)), document.createElement("br"), document.createTextNode(`source: ${selected.source_mode || "unknown"}`), document.createElement("br"), document.createTextNode(`event: ${selected.event_id}`));
+        const provider = element("b", "", `P${String(selected.number).padStart(5, "0")} · ${selected.platform}`);
+        detailMeta.append(provider, document.createElement("br"), document.createTextNode(fmt(selected.occurred_at)), document.createElement("br"), document.createTextNode(modelText(selected)), document.createElement("br"), document.createTextNode(`source: ${selected.source_mode || "unknown"}`), document.createElement("br"), document.createTextNode(`event_id: ${selected.event_id}`));
         prompt.textContent = selected.prompt;
         detail.dataset.open = "true";
       });

@@ -561,6 +561,27 @@ def iter_active_events(store: Path) -> Iterator[dict[str, Any]]:
             yield event
 
 
+def event_order_key(event: dict[str, Any]) -> tuple[Any, ...]:
+    """Order active prompts chronologically, with deterministic transcript-aware ties."""
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    session = event.get("session") if isinstance(event.get("session"), dict) else {}
+    source_line = source.get("line")
+    try:
+        line_number = int(source_line)
+    except (TypeError, ValueError):
+        line_number = 2**63 - 1
+    source_path = str(source.get("path") or session.get("transcript_path") or "")
+    return (
+        str(event.get("occurred_at") or ""),
+        source_path.lower(),
+        line_number,
+        str(source.get("platform") or ""),
+        str(session.get("id") or ""),
+        str(source.get("native_event_id") or session.get("turn_id") or ""),
+        str(event.get("event_id") or ""),
+    )
+
+
 def append_event_supersession(
     store: Path,
     *,
@@ -1779,7 +1800,7 @@ def backfill_project(
         )
         existing_by_key[event_key].append(event)
     for items in existing_by_key.values():
-        items.sort(key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
+        items.sort(key=event_order_key)
     existing_by_native: dict[tuple[str, str], dict[str, Any]] = {}
     existing_by_turn: dict[tuple[str, str, str], dict[str, Any]] = {}
     existing_by_source: dict[tuple[str, str, int], dict[str, Any]] = {}
@@ -2279,7 +2300,7 @@ def rebuild_session_metadata_for_store(store: Path, events: list[dict[str, Any]]
         session_id = str(event.get("session", {}).get("id") or "unknown")
         grouped[(platform, session_id)].append(event)
     for (platform, session_id), items in grouped.items():
-        items.sort(key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""))
+        items.sort(key=event_order_key)
         first, last = items[0], items[-1]
         safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id)
         write_json(
@@ -2301,10 +2322,7 @@ def rebuild_session_metadata_for_store(store: Path, events: list[dict[str, Any]]
 
 def rebuild_index_for_store(store: Path) -> dict[str, Any]:
     raw_event_count = sum(1 for _ in iter_events(store))
-    events = sorted(
-        iter_active_events(store),
-        key=lambda event: (event.get("occurred_at") or "", event.get("event_id") or ""),
-    )
+    events = sorted(iter_active_events(store), key=event_order_key)
     prompt_images = sorted(
         iter_prompt_images(store),
         key=lambda item: (str(item.get("event_id") or ""), str(item.get("attachment_id") or "")),
@@ -2349,7 +2367,7 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
                 f"- Platform: `{view.get('platform')}`",
                 f"- Model: `{model}`{model_note}",
                 f"- Session: `{view.get('session_id')}`",
-                f"- Event: `{view.get('event_id')}`",
+                f"- Event ID: `{view.get('event_id')}`",
                 f"- Source mode: `{view.get('source_mode')}`",
                 f"- Images: `{len(view.get('images') or [])}`",
                 "",
@@ -2537,8 +2555,13 @@ def search(args: argparse.Namespace) -> int:
     root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
     store, _ = init_store(root)
     terms = [term.lower() for term in re.findall(r"\S+", args.query)]
+    active_events = sorted(iter_active_events(store), key=event_order_key)
+    prompt_numbers = {
+        str(event.get("event_id") or ""): number
+        for number, event in enumerate(active_events, 1)
+    }
     matches: list[tuple[int, dict[str, Any]]] = []
-    for event in iter_active_events(store):
+    for event in active_events:
         haystack = " ".join(
             (
                 str(event.get("prompt", {}).get("text") or ""),
@@ -2553,10 +2576,26 @@ def search(args: argparse.Namespace) -> int:
     matches.sort(key=lambda pair: (-pair[0], pair[1].get("occurred_at") or ""))
     selected = [event for _, event in matches[: args.limit]]
     if args.format == "json":
-        print(json.dumps(selected, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                [
+                    {
+                        "prompt_number": prompt_numbers.get(str(event.get("event_id") or "")),
+                        **event,
+                    }
+                    for event in selected
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
         for event in selected:
-            print(f"## {event.get('occurred_at')} · {event.get('source', {}).get('platform')} · {event.get('event_id')}")
+            number = prompt_numbers.get(str(event.get("event_id") or ""), 0)
+            print(
+                f"## P{number:05d} · {event.get('occurred_at')} · "
+                f"{event.get('source', {}).get('platform')} · {event.get('event_id')}"
+            )
             print()
             print(event.get("prompt", {}).get("text") or "")
             print()

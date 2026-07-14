@@ -652,6 +652,75 @@ Recent Codex tasks in this project:
             self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(len(list(ph.iter_events(project / ".prompt-harness"))), 1)
 
+    def test_prompt_numbers_reorder_when_earlier_history_is_backfilled(self) -> None:
+        base = retained_workspace("chronological-numbers")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        later = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="hook",
+            prompt_text="later prompt",
+            session_id="ordering-session",
+            occurred_at="2026-07-14T10:00:00.000Z",
+            turn_id="later-turn",
+        )
+        newest = ph.build_event(
+            root=project,
+            platform="claude",
+            source_mode="backfill",
+            prompt_text="newest prompt",
+            session_id="ordering-session-two",
+            occurred_at="2026-07-14T11:00:00.000Z",
+            native_event_id="newest-message",
+        )
+        self.assertTrue(ph.append_event(store, later))
+        self.assertTrue(ph.append_event(store, newest))
+        ph.rebuild_index_for_store(store)
+        first_markdown = (store / "index" / "PROMPTS.md").read_text(encoding="utf-8")
+        self.assertLess(first_markdown.index("## P00001"), first_markdown.index("## P00002"))
+        self.assertIn(f"- Event ID: `{later['event_id']}`", first_markdown)
+
+        earlier = ph.build_event(
+            root=project,
+            platform="claude",
+            source_mode="backfill",
+            prompt_text="earlier prompt",
+            session_id="ordering-session-three",
+            occurred_at="2026-07-14T09:00:00.000Z",
+            native_event_id="earlier-message",
+        )
+        self.assertTrue(ph.append_event(store, earlier))
+        ph.rebuild_index_for_store(store)
+        rebuilt = (store / "index" / "PROMPTS.md").read_text(encoding="utf-8")
+        self.assertLess(rebuilt.index("earlier prompt"), rebuilt.index("later prompt"))
+        self.assertLess(rebuilt.index("later prompt"), rebuilt.index("newest prompt"))
+        self.assertIn(f"## P00001\n\n- Time: `{earlier['occurred_at']}`", rebuilt)
+        self.assertIn(f"## P00002\n\n- Time: `{later['occurred_at']}`", rebuilt)
+        self.assertIn(f"- Event ID: `{later['event_id']}`", rebuilt)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "search",
+                "later prompt",
+                "--project",
+                str(project),
+                "--format",
+                "json",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        search_result = json.loads(completed.stdout)
+        self.assertEqual(search_result[0]["prompt_number"], 2)
+        self.assertEqual(search_result[0]["event_id"], later["event_id"])
+
     def test_stop_recovery_captures_old_thread_once(self) -> None:
         base = retained_workspace("stop-recovery")
         project = base / "project"

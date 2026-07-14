@@ -53,6 +53,7 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 - Apply `state/event-supersessions.jsonl` when selecting active events. It compensates for migrated duplicates without deleting raw event lines.
 - Treat `assets/manifest.jsonl` as the append-only image-to-event relation ledger and `assets/images/` as content-addressed user-image facts.
 - Treat `index/catalog.json`, `index/PROMPTS.md`, `index/sessions.json`, `sessions/**/*.json`, `reports/SESSION_SUMMARIES.md`, and `visualizations/timeline.html` as rebuildable views.
+- Treat `P00001` labels as derived chronological positions. Backfilling an earlier prompt must renumber later P labels; use the immutable `event_id` for durable links and badcase references.
 - Put project-specific narrative summaries and curated Markdown exports under `reports/`, not in the project root.
 - Keep `index/PROMPTS.md` factual: one minimal title, per-event metadata, and exact sanitized human prompt text. Never put project interpretation or extraction methodology in it.
 - Keep changing conclusions in separate report files. `SESSION_SUMMARIES.md` is prompt-derived and mutable; a curated `PROJECT_SUMMARY.md` may add analysis when the user requests it.
@@ -98,4 +99,4 @@ The installer must back up existing configuration before editing it and preserve
 
 ## Reporting
 
-Report the project root, raw/active/superseded event counts, image relation/file counts, session count, automatic reconciliation status, privacy status, doctor result, and locations of the canonical ledger, image assets/manifest, fact Markdown, mutable summary, and local HTML timeline. Distinguish source prompts from imported mirrors and explain missing or transcript-derived model metadata.
+Report the project root, raw/active/superseded event counts, image relation/file counts, session count, automatic reconciliation status, privacy status, doctor result, and locations of the canonical ledger, image assets/manifest, fact Markdown, mutable summary, and local HTML timeline. Distinguish source prompts from imported mirrors and explain missing or transcript-derived model metadata. When citing a prompt, include both its current P number and stable `event_id`; note that P numbers can change after earlier history is backfilled.

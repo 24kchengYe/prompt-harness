@@ -1,6 +1,6 @@
 {
   "name": "prompt-harness",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Automatically initialize and reconcile a private per-project ledger of human prompts and user-sent images from Claude Code and Codex.",
   "author": {
     "name": "24kchengYe",

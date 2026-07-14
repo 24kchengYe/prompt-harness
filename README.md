@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.4.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.4.1-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -301,6 +301,8 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 
 每条事件都带有稳定的 `event_id`。未来 badcase 记录只引用这个 ID，不复制或修改原始提示词。
 
+`P00001` 这类编号是当前有效提示词按 `occurred_at` 排列后的派生顺位，不是永久身份。历史回填发现更早记录时，后续 P 编号会自动重排；对应事件的 `event_id` 保持不变。时间完全相同时，系统使用来源文件、行号和原生消息标识作确定性排序。
+
 ## 一条提示词记录包含什么
 
 可读 Markdown 中的单条记录类似：
@@ -312,7 +314,7 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 - Platform: `codex`
 - Model: `gpt-5.6-sol`
 - Session: `...`
-- Event: `phe_...`
+- Event ID: `phe_...`
 - Source mode: `hook`
 - Images: `1`
 
@@ -514,7 +516,7 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 - 默认分支：`main`
 - Marketplace：`24kchengye`
 - Plugin：`prompt-harness@24kchengye`
-- 当前版本：`0.4.0`
+- 当前版本：`0.4.1`
 - 可见性：Public
 - License：[MIT](LICENSE)
 

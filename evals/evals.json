@@ -48,6 +48,12 @@
       "prompt": "Resume an old task in a project whose ledger already exists. Fill every missing prompt, but do not duplicate a legacy image prompt that used to contain an image-attachment-omitted marker.",
       "expected_output": "The resumed task triggers Stop or submission capture plus session-aware auto-sync, historical identity matches precede text hashes, images attach once, and any already-created legacy duplicate is hidden by an append-only supersession relation rather than deleted.",
       "files": []
+    },
+    {
+      "id": 9,
+      "prompt": "My archive currently labels two prompts P00001 and P00002. Backfill a genuinely older prompt and rebuild every derived view without changing any canonical event identity.",
+      "expected_output": "The older prompt becomes P00001, the prior prompts move to P00002 and P00003 in chronological order, every event_id remains unchanged, and Markdown, search output, and timeline details expose both the current P number and stable event_id.",
+      "files": []
     }
   ]
 }

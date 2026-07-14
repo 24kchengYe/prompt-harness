@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 - 2026-07-14
+
+- Define `P00001` labels as rebuildable chronological positions that intentionally renumber when earlier history is recovered.
+- Keep immutable `event_id` values visible in Markdown, search output, and timeline details for durable references.
+- Use transcript path, source line, native message identity, and event ID as deterministic tie-breakers when occurrence timestamps are equal.
+
 ## 0.4.0 - 2026-07-14
 
 - Automatically create a project ledger on the first captured message and launch a detached full-project Claude/Codex reconciliation.
