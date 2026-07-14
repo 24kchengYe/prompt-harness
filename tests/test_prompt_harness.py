@@ -62,6 +62,8 @@ class PromptHarnessTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
         events = list(ph.iter_events(project / ".prompt-harness"))
+        self.assertTrue((project / ".prompt-harness" / "reports").is_dir())
+        self.assertIn("reports/", (project / ".prompt-harness" / ".gitignore").read_text(encoding="utf-8"))
         self.assertEqual(len(events), 2)
         self.assertEqual(len({event["event_id"] for event in events}), 2)
         for event in events:

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 - 2026-07-14
+
+- Add a private `reports/` namespace for project-specific analyses and curated prompt exports.
+- Keep project roots free of duplicate prompt reports.
+
 ## 0.1.0 - 2026-07-14
 
 - Add project-local append-only prompt event ledger.

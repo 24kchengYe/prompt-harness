@@ -69,6 +69,7 @@ This directory is managed by Prompt Harness.
 - `events/` is the append-only source of truth for user prompt events.
 - `sessions/` contains derived per-session metadata.
 - `index/` contains rebuildable catalogs and `PROMPTS.md`.
+- `reports/` contains project-specific narrative analyses and curated exports.
 - `state/` contains locks and ingestion state.
 - `badcases/` is reserved for the future evaluation harness.
 
@@ -82,6 +83,7 @@ config.json
 events/
 sessions/
 index/
+reports/
 state/
 badcases/cases/
 badcases/runs/
@@ -350,6 +352,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         "sessions/claude",
         "sessions/codex",
         "index",
+        "reports",
         "state",
         "badcases/cases",
         "badcases/runs",

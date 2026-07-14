@@ -40,12 +40,13 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 
 - Treat `events/**/*.jsonl` as the append-only source of truth.
 - Treat `index/catalog.json`, `index/PROMPTS.md`, and `sessions/**/*.json` as rebuildable views.
+- Put project-specific narrative summaries and curated Markdown exports under `reports/`, not in the project root.
 - Store only user-authored prompt text and minimal provenance.
 - Preserve prompt paths written by the user, but never read those paths merely to copy file bodies into the ledger.
 - Omit attachment payloads and redact obvious secrets.
 - Exclude assistant output, tool results, subagent traffic, injected project/system instructions, local command wrappers, and Claude-to-Codex mirror rows.
 - Preserve legitimate repeated prompts as separate events. Merge only historical branch copies that share a native event identifier.
-- Never commit `.prompt-harness/events`, `sessions`, `index`, or future badcase run data unless the user explicitly changes the privacy policy.
+- Never commit `.prompt-harness/events`, `sessions`, `index`, `reports`, or future badcase run data unless the user explicitly changes the privacy policy.
 
 Read [event-schema.md](../../references/event-schema.md) when changing the event envelope. Read [architecture.md](../../references/architecture.md) when changing ingestion or deduplication. Read [badcase-roadmap.md](../../references/badcase-roadmap.md) before implementing phase 2.
 

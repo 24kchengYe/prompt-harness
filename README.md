@@ -17,11 +17,12 @@ AI coding work is scattered across sessions, branches, clients, and imported arc
 ├── sessions/{claude,codex}/*.json    # rebuildable session summaries
 ├── index/catalog.json                # counts and coverage
 ├── index/PROMPTS.md                  # readable generated export
+├── reports/*.md                      # project-specific analyses/curated reports
 ├── state/                            # locks and ingestion state
 └── badcases/                         # reserved phase-2 namespace
 ```
 
-The nested `.gitignore` excludes prompt bodies, indexes, state, and badcase data by default. The global registry at `~/.prompt-harness/projects.json` stores only project locations and contains no prompt text.
+The nested `.gitignore` excludes prompt bodies, indexes, reports, state, and badcase data by default. The global registry at `~/.prompt-harness/projects.json` stores only project locations and contains no prompt text.
 
 ## Install in Codex
 
