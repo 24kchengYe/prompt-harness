@@ -1,0 +1,40 @@
+# Architecture
+
+```mermaid
+flowchart LR
+  H["UserPromptSubmit hook"] --> N["Normalize and sanitize"]
+  C["Claude Code JSONL"] --> B["Historical backfill"]
+  X["Codex rollout JSONL"] --> B
+  B --> N
+  N --> E["Append-only prompt events"]
+  E --> S["Session summaries"]
+  E --> I["Markdown and catalog index"]
+  E --> Q["Search"]
+  E -. event_id .-> R["Future badcase runs"]
+```
+
+## Ingestion paths
+
+The live path is intentionally short: resolve the project, sanitize one prompt, append one JSON line under a lock, and update a small session summary. It always returns success so an archival problem does not block the user's AI turn.
+
+The recovery path scans native local transcripts. Claude Code branch copies are merged when timestamp and normalized prompt hash match; native IDs and every source reference are retained for provenance. Codex subagent rollouts are excluded. If a Codex rollout was imported from Claude, rows at or before the source transcript's latest timestamp are mirror data; only genuinely new Codex continuation prompts are candidates.
+
+## Reconciliation
+
+A backfill after live capture compares occurrence counts by platform, session, and prompt hash. This avoids re-adding the captured event while preserving a human who intentionally submitted the same words more than once. Event-ID checks provide a second guard.
+
+## Project resolution
+
+Resolution order is:
+
+1. explicit `--project` or `PROMPT_HARNESS_PROJECT_ROOT`;
+2. nearest existing `.prompt-harness/config.json`;
+3. nearest Git root;
+4. nearest `AGENTS.md`, `CLAUDE.md`, or common language project marker;
+5. current working directory.
+
+This keeps each project isolated without requiring every prompt to name the project.
+
+## Concurrency and recovery
+
+Writes use a cross-platform one-byte advisory lock, append-plus-fsync for events, and atomic replacement for derived JSON/Markdown files. Canonical JSONL is not silently rewritten. A malformed line can therefore be diagnosed without losing neighboring events.

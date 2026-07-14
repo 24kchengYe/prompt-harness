@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/prompt-event.schema.json",
+  "title": "Prompt Harness user prompt event",
+  "type": "object",
+  "required": ["schema_version", "record_type", "event_id", "captured_at", "occurred_at", "source", "project", "session", "prompt", "context", "links"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "user_prompt"},
+    "event_id": {"type": "string", "pattern": "^phe_[0-9a-f]{32}$"},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "source": {"type": "object"},
+    "project": {"type": "object"},
+    "session": {"type": "object"},
+    "prompt": {
+      "type": "object",
+      "required": ["text", "sha256", "chars", "secret_redactions", "attachments_omitted"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "chars": {"type": "integer", "minimum": 1},
+        "secret_redactions": {"type": "integer", "minimum": 0},
+        "attachments_omitted": {"type": "integer", "minimum": 0}
+      }
+    },
+    "context": {"type": "object"},
+    "links": {"type": "object"}
+  }
+}

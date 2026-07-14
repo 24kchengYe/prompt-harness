@@ -1,0 +1,38 @@
+{
+  "name": "prompt-harness",
+  "version": "0.1.0",
+  "description": "Capture human prompts into a private, project-local ledger and backfill Claude Code and Codex history.",
+  "author": {
+    "name": "24kchengYe",
+    "url": "https://github.com/24kchengYe"
+  },
+  "repository": "https://github.com/24kchengYe/prompt-harness",
+  "homepage": "https://github.com/24kchengYe/prompt-harness",
+  "license": "MIT",
+  "keywords": [
+    "prompts",
+    "harness",
+    "claude-code",
+    "codex",
+    "evaluation"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Prompt Harness",
+    "shortDescription": "Keep a private prompt ledger per project.",
+    "longDescription": "Prompt Harness captures each human prompt through UserPromptSubmit, imports historical Claude Code and Codex prompts, and builds a durable event layer for future badcase regression harnesses.",
+    "developerName": "24kchengYe",
+    "category": "Productivity",
+    "capabilities": [
+      "UserPromptSubmit hook",
+      "historical backfill",
+      "prompt search",
+      "ledger validation"
+    ],
+    "defaultPrompt": [
+      "Initialize Prompt Harness for this project and explain what will be stored.",
+      "Backfill this project's Claude Code and Codex user prompts, then validate the ledger.",
+      "Search this project's human prompt history for a topic."
+    ]
+  }
+}

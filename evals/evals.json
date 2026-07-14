@@ -1,0 +1,23 @@
+{
+  "skill_name": "prompt-harness",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Set up prompt capture for this project. Verify that repeated identical human prompts remain separate, API keys are redacted, and an attached image body is not stored.",
+      "expected_output": "A private .prompt-harness ledger is initialized, live hook records pass doctor, repeated submissions produce separate events, secrets are redacted, and attachment bytes are omitted.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Backfill all Claude Code and Codex prompts for this project, but do not count Claude branch copies or the Claude rows mirrored into an imported Codex task.",
+      "expected_output": "The recovery report distinguishes native Claude, native Codex continuation prompts, excluded mirrors, merged branch references, and a passing doctor result.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Find every human prompt about major revision in this project and give me the generated Markdown archive path so it can later seed a badcase analysis.",
+      "expected_output": "Search results come from canonical human-prompt events, the Markdown index is rebuilt, and stable event IDs are available for future badcase links.",
+      "files": []
+    }
+  ]
+}
