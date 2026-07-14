@@ -1,6 +1,6 @@
 {
   "name": "prompt-harness",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Capture human prompts into a private, project-local ledger and backfill Claude Code and Codex history.",
   "author": {
     "name": "24kchengYe",

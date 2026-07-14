@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.2.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.2.1-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -212,6 +212,18 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 }
 ```
 
+### 6. 显式修复旧账本
+
+当新版本扩展了密钥识别或自动上下文过滤规则时，可以显式修复已经生成的本地账本：
+
+```powershell
+python scripts/prompt_harness.py scrub-secrets --project "G:\path\to\project"
+python scripts/prompt_harness.py clean-store --project "G:\path\to\project"
+python scripts/prompt_harness.py doctor --project "G:\path\to\project"
+```
+
+`scrub-secrets` 只重新遮盖新识别出的敏感值；`clean-store` 会移除中断通知、重复的 Codex goal 续跑包装等非人类记录，并把附件包装压缩为“用户文字 + 引用路径”。这两个命令不会自动运行，修复时保留原有 `event_id`，随后重建派生视图。
+
 ## 每个项目会生成什么
 
 ```text
@@ -238,7 +250,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 
 | 类型 | 文件 | 规则 |
 |---|---|---|
-| 权威事实 | `events/**/*.jsonl` | append-only，不静默改写 |
+| 权威事实 | `events/**/*.jsonl` | 日常写入 append-only；只有显式修复命令会净化旧行 |
 | 可读事实 | `index/PROMPTS.md` | 只有最小标题、逐条元数据和完整清洗后提示词 |
 | 派生索引 | `catalog.json`、`sessions.json` | 可以重建 |
 | 可变总结 | `reports/*.md` | 允许随新会话改变结论 |
@@ -289,6 +301,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 - 工具调用、工具结果和终端输出；
 - subagent、sidechain 和自动压缩通知；
 - 注入的 `AGENTS.md`、环境、权限与续写包装；
+- Codex 的 `turn_aborted`、内部建议生成和重复 goal 续跑包装；
 - 图片、文档或 base64 附件正文；
 - Codex 中仅仅镜像 Claude 历史的导入行。
 
@@ -345,7 +358,7 @@ HTML 读取的是重建后的事实视图，不包含助手输出。
 
 ### 安装后为什么没有实时记录？
 
-先运行 `/hooks` 并信任 Hook，然后新建或重新打开 Codex 任务。插件不会热加载进已经运行的旧任务。旧任务中遗漏的输入可以通过 `backfill` 补回。
+先运行 `/hooks` 并信任 Hook，然后新建任务做基准测试。已经运行的旧任务通常不会热加载后来安装的插件；重启后重新打开能否补挂 Hook 还取决于 Desktop 版本和任务来源，Claude 导入任务尤其应实测。旧任务中遗漏的输入可以通过 `backfill` 补回。
 
 ### 为什么记录显示 `Source mode: backfill`？
 
@@ -446,7 +459,7 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 - 默认分支：`main`
 - Marketplace：`24kchengye`
 - Plugin：`prompt-harness@24kchengye`
-- 当前版本：`0.2.0`
+- 当前版本：`0.2.1`
 - 可见性：Public
 - License：[MIT](LICENSE)
 

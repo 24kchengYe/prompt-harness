@@ -183,6 +183,91 @@ class PromptHarnessTests(unittest.TestCase):
         )
         self.assertEqual(ph.source_models_by_line(codex_path, "codex")[2], "gpt-test")
 
+    def test_codex_internal_suggestion_prompt_is_excluded(self) -> None:
+        internal_prompt = """# Overview
+Generate 0 to 3 hyperpersonalized suggestions for the user.
+
+Recent Codex tasks in this project:
+- Refactor the prompt ledger.
+"""
+        self.assertTrue(ph.is_automatic_prompt(internal_prompt))
+        self.assertFalse(ph.is_automatic_prompt("帮我整理这个项目里的提示词"))
+
+    def test_codex_wrappers_are_normalized(self) -> None:
+        wrapped = """# Files mentioned by the user:
+
+## sample.png: C:/data/sample.png
+
+## My request for Codex:
+请检查更新问题。
+
+<image name=[Image #1] path="C:/data/sample.png">
+</image>
+"""
+        normalized, _ = ph.sanitize_prompt(wrapped, backfill=True)
+        self.assertEqual(normalized, "请检查更新问题。\n\nReferenced paths:\n- C:/data/sample.png")
+        self.assertTrue(ph.is_automatic_prompt("<turn_aborted>stopped</turn_aborted>"))
+        self.assertTrue(ph.is_automatic_prompt("[Request interrupted by user for tool use]"))
+
+    def test_clean_store_keeps_one_user_goal_objective(self) -> None:
+        base = retained_workspace("clean")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        goal = """<codex_internal_context source="goal">
+<objective>按照顶尖设计来优化</objective>
+</codex_internal_context>"""
+        for index, text in enumerate((goal, goal, "<turn_aborted>stopped</turn_aborted>", "真正的人类提示")):
+            ph.append_event(
+                store,
+                ph.build_event(
+                    root=project,
+                    platform="codex",
+                    source_mode="backfill",
+                    prompt_text=text,
+                    session_id="clean-session",
+                    native_event_id=f"native-{index}",
+                ),
+            )
+        result = ph.clean_store_events(store)
+        ph.rebuild_index_for_store(store)
+        self.assertEqual(result["events_dropped"], 2)
+        texts = [event["prompt"]["text"] for event in ph.iter_events(store)]
+        self.assertEqual(texts, ["按照顶尖设计来优化", "真正的人类提示"])
+        metadata = json.loads((store / "sessions" / "codex" / "clean-session.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["event_count"], 2)
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
+    def test_scrub_store_repairs_new_secret_patterns(self) -> None:
+        base = retained_workspace("scrub")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        fake_pat = "github_pat_" + "A" * 32
+        event = ph.build_event(
+            root=project,
+            platform="claude",
+            source_mode="backfill",
+            prompt_text=f"token: {fake_pat}",
+            session_id="secret-session",
+        )
+        original_id = event["event_id"]
+        self.assertTrue(ph.append_event(store, event))
+
+        result = ph.scrub_store_secrets(store)
+        ph.rebuild_index_for_store(store)
+
+        self.assertEqual(result["events_changed"], 1)
+        repaired = list(ph.iter_events(store))[0]
+        self.assertEqual(repaired["event_id"], original_id)
+        self.assertNotIn(fake_pat, repaired["prompt"]["text"])
+        self.assertEqual(repaired["prompt"]["text"], "token: [REDACTED_SECRET]")
+        self.assertEqual(repaired["prompt"]["secret_redactions"], 1)
+        self.assertNotIn(fake_pat, (store / "index" / "PROMPTS.md").read_text(encoding="utf-8"))
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
     def test_stable_turn_id_is_idempotent(self) -> None:
         base = retained_workspace("stable-turn")
         project = base / "project"
