@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/event-exclusion.schema.json",
+  "title": "Prompt Harness event exclusion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_type",
+    "exclusion_id",
+    "event_id",
+    "reason",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "event_exclusion"},
+    "exclusion_id": {"type": "string", "pattern": "^phx_[0-9a-f]{32}$"},
+    "event_id": {"type": "string", "pattern": "^phe_[0-9a-f]{32}$"},
+    "reason": {"type": "string", "minLength": 1},
+    "recorded_at": {"type": "string", "format": "date-time"}
+  }
+}

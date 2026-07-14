@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 - 2026-07-14
+
+- Replace five-minute throttled full scans with one first-use discovery followed by cursor-based JSONL tail reconciliation after every prompt.
+- Serialize disk-heavy discovery across all projects with a global lock and coalesce overlapping per-project requests in a durable pending queue.
+- Preserve multiple distinct user messages that share one Codex turn by reconciling `turn_id` together with the prompt hash.
+- Reject home-directory and drive-root catch-all projects so unrelated transcript histories cannot be absorbed into one ledger.
+- Append exclusions for previously captured automatic AGENTS/environment envelopes instead of deleting canonical event rows.
+- Track source cursors, changed-source counts, and bytes read for performance diagnosis while rebuilding prompt order after every reconciliation.
+- Cache transcript-derived model metadata and skip redundant derived-view rebuilds when neither events nor image relations changed.
+
 ## 0.4.1 - 2026-07-14
 
 - Define `P00001` labels as rebuildable chronological positions that intentionally renumber when earlier history is recovered.

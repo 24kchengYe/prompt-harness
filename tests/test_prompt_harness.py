@@ -132,7 +132,7 @@ class PromptHarnessTests(unittest.TestCase):
         self.assertEqual(doctor["active_event_count"], 1)
         self.assertEqual(doctor["superseded_event_count"], 1)
 
-    def test_auto_sync_initializes_backfills_and_throttles_by_session(self) -> None:
+    def test_auto_sync_runs_one_full_scan_then_incremental_source_tails(self) -> None:
         base = retained_workspace("auto-sync")
         project = base / "project"
         project.mkdir()
@@ -141,8 +141,9 @@ class PromptHarnessTests(unittest.TestCase):
         codex_home = base / ".codex"
         encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
         image_b64 = base64.b64encode(ONE_PIXEL_PNG).decode("ascii")
+        history = claude_home / "projects" / encoded / "history.jsonl"
         write_jsonl(
-            claude_home / "projects" / encoded / "history.jsonl",
+            history,
             [
                 {
                     "type": "user",
@@ -166,11 +167,13 @@ class PromptHarnessTests(unittest.TestCase):
             source_platform="claude",
             session_id="opened-claude-session",
             trigger="test",
+            source_path=history,
             claude_home=claude_home,
             codex_home=codex_home,
         )
         self.assertEqual(first["status"], "completed")
-        self.assertEqual(first["reason"], "new_session")
+        self.assertEqual(first["reason"], "first_full_scan")
+        self.assertEqual(first["mode"], "full")
         store = project / ".prompt-harness"
         self.assertTrue(store.is_dir())
         self.assertEqual(len(list(ph.iter_events(store))), 1)
@@ -181,43 +184,137 @@ class PromptHarnessTests(unittest.TestCase):
             source_platform="claude",
             session_id="opened-claude-session",
             trigger="test",
+            source_path=history,
             claude_home=claude_home,
             codex_home=codex_home,
         )
-        self.assertEqual(repeated["status"], "skipped")
-        self.assertEqual(repeated["reason"], "recently_completed")
+        self.assertEqual(repeated["status"], "completed")
+        self.assertEqual(repeated["reason"], "incremental")
+        self.assertEqual(repeated["mode"], "incremental")
+        self.assertEqual(repeated["sources_changed"], 0)
+        self.assertFalse(repeated["index_rebuilt"])
 
-        write_jsonl(
-            codex_home / "sessions" / "2026" / "rollout-new-session.jsonl",
-            [
-                {"type": "session_meta", "payload": {"id": "codex-history", "cwd": str(project)}},
-                {
-                    "type": "response_item",
-                    "timestamp": "2026-07-14T00:01:00Z",
-                    "payload": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "historical Codex prompt"}],
-                    },
-                },
-            ],
-        )
-        next_session = ph.auto_sync_project(
-            project,
-            source_platform="codex",
-            session_id="opened-codex-session",
-            trigger="test",
-            claude_home=claude_home,
-            codex_home=codex_home,
-        )
+        with history.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "auto-claude-two",
+                        "timestamp": "2026-07-14T00:01:00Z",
+                        "cwd": str(project),
+                        "message": {"content": "new Claude prompt"},
+                    }
+                )
+                + "\n"
+            )
+        with mock.patch.object(ph, "codex_project_paths", side_effect=AssertionError("no global scan")):
+            next_session = ph.auto_sync_project(
+                project,
+                source_platform="claude",
+                session_id="opened-claude-session",
+                trigger="test",
+                source_path=history,
+                claude_home=claude_home,
+                codex_home=codex_home,
+            )
         self.assertEqual(next_session["status"], "completed")
+        self.assertEqual(next_session["mode"], "incremental")
         self.assertEqual(next_session["added"], 1)
+        self.assertTrue(next_session["index_rebuilt"])
+        self.assertGreater(next_session["bytes_read"], 0)
         self.assertEqual(len(list(ph.iter_events(store))), 2)
         state = json.loads((store / "state" / "auto-sync.json").read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "completed")
         self.assertIn("claude:opened-claude-session", state["sessions"])
-        self.assertIn("codex:opened-codex-session", state["sessions"])
         self.assertEqual(ph.doctor_store(store, project)["auto_sync"]["status"], "completed")
+
+    def test_backfill_keeps_distinct_messages_in_the_same_codex_turn(self) -> None:
+        base = retained_workspace("same-turn")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        codex_home = base / ".codex"
+        rollout = codex_home / "sessions" / "2026" / "rollout-same-turn.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {"type": "session_meta", "payload": {"id": "same-turn-session", "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "first human message"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "shared-turn"},
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T00:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "second human message"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "shared-turn"},
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-14T00:00:02Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "first human message"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "shared-turn"},
+                    },
+                },
+            ],
+        )
+        first = ph.backfill_project(
+            project,
+            platform="codex",
+            claude_home=base / ".claude",
+            codex_home=codex_home,
+            rebuild_index=True,
+        )
+        second = ph.backfill_project(
+            project,
+            platform="codex",
+            claude_home=base / ".claude",
+            codex_home=codex_home,
+            rebuild_index=True,
+        )
+        self.assertEqual(first["added"], 3)
+        self.assertEqual(second["added"], 0)
+        self.assertEqual(
+            [event["prompt"]["text"] for event in ph.iter_active_events(project / ".prompt-harness")],
+            ["first human message", "second human message", "first human message"],
+        )
+
+    def test_automatic_project_context_is_append_only_excluded(self) -> None:
+        base = retained_workspace("automatic-context")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        automatic = "# AGENTS.md instructions for X\n<INSTRUCTIONS>rules</INSTRUCTIONS>\n<environment_context>ctx</environment_context>"
+        event = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text=automatic,
+            session_id="context-session",
+        )
+        self.assertTrue(ph.append_event(store, event))
+        self.assertEqual(ph.repair_automatic_context_events(store), 1)
+        self.assertEqual(len(list(ph.iter_events(store))), 1)
+        self.assertEqual(len(list(ph.iter_active_events(store))), 0)
+        catalog = ph.rebuild_index_for_store(store)
+        self.assertEqual(catalog["excluded_event_count"], 1)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["excluded_event_count"], 1)
 
     def test_hook_scheduler_launches_detached_auto_sync_command(self) -> None:
         base = retained_workspace("auto-sync-schedule")
@@ -240,6 +337,38 @@ class PromptHarnessTests(unittest.TestCase):
         self.assertIn("auto-sync", command)
         self.assertIn("existing-task", command)
         self.assertIn(str(project), command)
+
+    def test_pending_sync_requests_are_coalesced_without_deletion(self) -> None:
+        base = retained_workspace("pending-sync")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        first = ph.sync_request(
+            source_platform="codex",
+            session_id="same-session",
+            trigger="test",
+            source_path=base / "rollout-a.jsonl",
+        )
+        second = ph.sync_request(
+            source_platform="claude",
+            session_id="other-session",
+            trigger="test",
+            source_path=base / "claude-b.jsonl",
+        )
+        self.assertEqual(ph.mark_pending_sync(store, first), 1)
+        self.assertEqual(ph.mark_pending_sync(store, first), 1)
+        self.assertEqual(ph.mark_pending_sync(store, second), 2)
+        self.assertEqual(len(ph.pop_pending_sync(store)), 2)
+        self.assertEqual(ph.pop_pending_sync(store), [])
+        state = json.loads(ph.auto_sync_pending_file(store).read_text(encoding="utf-8"))
+        self.assertFalse(state["pending"])
+        self.assertEqual(state["request_count"], 3)
+
+    def test_home_directory_is_rejected_as_a_project_root(self) -> None:
+        self.assertTrue(ph.is_unsafe_broad_project_root(Path.home()))
+        with self.assertRaisesRegex(ValueError, "broad project root"):
+            ph.init_store(Path.home())
 
     def test_hook_archives_user_image_and_keeps_only_file_path(self) -> None:
         base = retained_workspace("hook-image")
@@ -540,6 +669,36 @@ class PromptHarnessTests(unittest.TestCase):
             ],
         )
         self.assertEqual(ph.source_models_by_line(codex_path, "codex")[2], "gpt-test")
+
+    def test_rebuild_reuses_model_cache_for_unchanged_sources(self) -> None:
+        base = retained_workspace("model-cache")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        source = base / "rollout-model-cache.jsonl"
+        write_jsonl(
+            source,
+            [
+                {"type": "turn_context", "payload": {"model": "gpt-cache-test"}},
+                {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+            ],
+        )
+        store, _ = ph.init_store(project)
+        event = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="derive cached model",
+            session_id="model-cache-session",
+            source_path=str(source),
+            source_line=2,
+        )
+        self.assertTrue(ph.append_event(store, event))
+        ph.rebuild_index_for_store(store)
+        with mock.patch.object(ph, "source_models_by_line", side_effect=AssertionError("cache miss")):
+            ph.rebuild_index_for_store(store)
+        self.assertTrue(ph.source_model_cache_file(store).is_file())
+        self.assertIn("gpt-cache-test", (store / "index" / "PROMPTS.md").read_text(encoding="utf-8"))
 
     def test_codex_internal_suggestion_prompt_is_excluded(self) -> None:
         internal_prompt = """# Overview

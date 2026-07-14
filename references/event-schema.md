@@ -76,6 +76,23 @@ When a schema upgrade has already produced two rows for one native message, Prom
 
 Raw audit tools may read every event line. Prompt indexes, search, session summaries, and future badcase selection use active events after applying supersession relations.
 
+## Append-only exclusion
+
+When an older collector stored machine-injected project/environment context as if it were human input, Prompt Harness keeps the raw event and appends an exclusion to `state/event-exclusions.jsonl`:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "event_exclusion",
+  "exclusion_id": "phx_<stable hash>",
+  "event_id": "phe_<incorrect automatic event>",
+  "reason": "automatic_context_not_human_input",
+  "recorded_at": "2026-07-14T04:00:03.000Z"
+}
+```
+
+Active events are raw prompt events minus both superseded and excluded IDs. `catalog.json` reports raw, active, superseded, excluded, and total inactive counts separately.
+
 ## Image attachment sidecar
 
 User-sent raster images do not change the prompt event envelope. Bytes are stored at `assets/images/<sha256>.<ext>` and each event relation is appended to `assets/manifest.jsonl`:
@@ -106,4 +123,4 @@ The attachment ID is deterministic for one `event_id` plus image hash, so Stop r
 
 ## Identity
 
-Native event or turn identifiers are preferred for event identity. Historical branch recovery uses exact timestamp plus prompt hash to recognize copied history while retaining all native source IDs. A live hook lacking a native turn identifier receives a fresh nonce so repeated identical human prompts are preserved rather than collapsed.
+Native event identifiers are preferred for event identity. Historical rows without a native ID use exact source path/line identity before a turn identifier, so even identical text repeated inside one Codex turn remains distinct. A live turn identifier is always combined with the prompt hash, and reconciliation can use that pair to match the later source row to the live event. Historical branch recovery uses exact timestamp plus prompt hash to recognize copied history while retaining all native source IDs. A live hook lacking both source and native turn identity receives a fresh nonce so repeated identical human prompts are preserved rather than collapsed.

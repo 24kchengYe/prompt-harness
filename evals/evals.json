@@ -40,19 +40,31 @@
     {
       "id": 7,
       "prompt": "I opened an existing project in a brand-new Codex task and sent one prompt. There is no .prompt-harness yet. Make this one interaction create it and automatically recover every Claude and Codex user prompt and image for the project without delaying the assistant response.",
-      "expected_output": "The current prompt is captured synchronously, the project ledger is initialized, a detached auto-sync runs all-platform reconciliation, state/auto-sync.json records completion, and project-level locking prevents overlapping scans.",
+      "expected_output": "The current prompt is captured synchronously, the project ledger is initialized, one detached first-use discovery recovers all project history, source cursors are initialized, and project/global locking prevents overlapping scans.",
       "files": []
     },
     {
       "id": 8,
       "prompt": "Resume an old task in a project whose ledger already exists. Fill every missing prompt, but do not duplicate a legacy image prompt that used to contain an image-attachment-omitted marker.",
-      "expected_output": "The resumed task triggers Stop or submission capture plus session-aware auto-sync, historical identity matches precede text hashes, images attach once, and any already-created legacy duplicate is hidden by an append-only supersession relation rather than deleted.",
+      "expected_output": "The resumed task triggers Stop or submission capture plus cursor-based auto-sync, only changed transcript tails are parsed, images attach once, and any already-created legacy duplicate is hidden by an append-only supersession relation rather than deleted.",
       "files": []
     },
     {
       "id": 9,
       "prompt": "My archive currently labels two prompts P00001 and P00002. Backfill a genuinely older prompt and rebuild every derived view without changing any canonical event identity.",
       "expected_output": "The older prompt becomes P00001, the prior prompts move to P00002 and P00003 in chronological order, every event_id remains unchanged, and Markdown, search output, and timeline details expose both the current P number and stable event_id.",
+      "files": []
+    },
+    {
+      "id": 10,
+      "prompt": "A Codex transcript contains two distinct human messages with the same turn_id. Backfill it twice and prove neither message is lost or duplicated.",
+      "expected_output": "Both messages become separate events because turn identity includes the prompt hash; the second full backfill adds zero events and doctor passes.",
+      "files": []
+    },
+    {
+      "id": 11,
+      "prompt": "I use Prompt Harness in many projects. Make every prompt check for missing history without globally reparsing all Claude and Codex transcripts or launching concurrent disk-heavy scans.",
+      "expected_output": "Each prompt is captured immediately; only the first project interaction performs full discovery, later checks read changed JSONL tails from byte cursors, overlapping project requests are coalesced, and one global lock serializes heavy work.",
       "files": []
     }
   ]

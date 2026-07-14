@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.4.1-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.5.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -36,7 +36,7 @@ Prompt Harness 将这些内容整理为：
 | 能力 | 说明 |
 |---|---|
 | 实时捕获 | 通过 `UserPromptSubmit` Hook 在用户提交提示词时快速追加一条事件 |
-| 自动引导与对账 | 没有账本时自动建立；新会话或恢复会话时后台补齐全项目历史，不阻塞当前回答 |
+| 自动引导与对账 | 没有账本时首次全量发现；之后每条输入只检查并读取发生变化的会话文件尾部 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
 | 模型元数据 | 优先使用 Hook 捕获值；历史记录可从 Claude assistant 行或 Codex `turn_context` 可靠推导 |
@@ -53,22 +53,26 @@ Prompt Harness 将这些内容整理为：
 ```mermaid
 flowchart LR
   U["用户新提示词"] --> H["UserPromptSubmit Hook"]
-  H --> R["后台自动对账调度"]
-  R --> B
-  C["Claude Code JSONL"] --> B["历史回填"]
+  H --> D["后台自动对账调度"]
+  D --> B["首次全量发现"]
+  D --> J["增量 JSONL 尾部"]
+  C["Claude Code JSONL"] --> B
   X["Codex rollout JSONL"] --> B
+  C --> J
+  X --> J
   H --> N["清洗与项目归属"]
   B --> N
+  J --> N
   N --> E["append-only events/*.jsonl"]
   N --> A["assets/images + manifest.jsonl"]
   E --> M["事实 PROMPTS.md"]
   A --> M
   E --> S["可变会话总结"]
   E --> V["离线 HTML 时间线"]
-  E -. "event_id" .-> R["未来 badcase 测试"]
+  E -. "event_id" .-> Q["未来 badcase 测试"]
 ```
 
-Hook 前台路径保持有界：定位项目、自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程扫描本地历史，不等待扫描完成，也不联网或调用模型。新会话必查；同一会话五分钟内节流；项目级互斥锁阻止重叠扫描。
+Hook 前台路径保持有界：定位项目、自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程，不等待对账完成，也不联网或调用模型。项目第一次启用时做一次全量发现；之后每条输入都立即对账，但只比较已知源文件的大小与修改时间，并从保存的字节游标读取新增 JSONL 行。项目锁合并同项目重叠请求，全局锁避免多个项目同时重扫磁盘。
 
 ## 从公开 GitHub 安装到 Codex
 
@@ -166,10 +170,10 @@ python scripts/install_hooks.py --platform claude --remove
 
 1. 在一个新任务或旧任务中发送第一条提示词；
 2. Prompt Harness 自动创建项目目录并同步保存当前输入；
-3. 后台运行全项目 Claude/Codex 对账，补齐缺失提示词和图片；
+3. 首次后台发现全项目 Claude/Codex 历史，之后只增量读取变化的会话文件；
 4. 结果写入 `.prompt-harness/state/auto-sync.json`，可用 `doctor` 检查。
 
-新会话首次触发一定对账。已经见过的旧会话重新活跃时，距离上次完成超过五分钟会再次对账；五分钟内仍会实时保存当前输入，但不会重复全盘扫描。
+当前输入每次都会实时保存并触发后台校验，没有五分钟节流。`.prompt-harness/state/source-cursors.json` 记录每个源文件的大小、修改时间、字节偏移和行号；未变化文件不解析。只有游标尚未建立、显式 `auto-sync --force`，或单个源文件被截断/改写时才降级为更重的读取。
 
 ### 1. 初始化项目
 
@@ -227,6 +231,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
   "event_count": 390,
   "active_event_count": 388,
   "superseded_event_count": 2,
+  "excluded_event_count": 0,
   "image_count": 12,
   "active_image_count": 12,
   "image_file_count": 11,
@@ -258,7 +263,7 @@ python scripts/prompt_harness.py doctor --project "G:\path\to\project"
 python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 ```
 
-它在每轮结束后根据该任务的 `session_id` 只读取对应 rollout 的最后一条人类输入，记录为 `Source mode: stop_recovery`，随后触发同样的全项目后台对账。即使项目原来没有 `.prompt-harness`，也会自动建立。它可以与插件的即时 Hook 共存；相同 `turn_id` 会阻止重复写入。安装后仍需在 `/hooks` 中检查并信任新增命令。
+它在每轮结束后根据该任务的 `session_id` 只读取对应 rollout 的最后一条人类输入，记录为 `Source mode: stop_recovery`，随后触发同样的首次全量/后续增量对账。即使项目原来没有 `.prompt-harness`，也会自动建立。它可以与插件的即时 Hook 共存；相同 `turn_id + prompt hash` 会阻止重复写入，同时允许一个 turn 中存在多条不同的人类消息。安装后仍需在 `/hooks` 中检查并信任新增命令。
 
 ## 每个项目会生成什么
 
@@ -283,7 +288,12 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 │   └── timeline.html                 # 单文件离线时间线
 ├── state/                            # 写入锁与诊断状态
 │   ├── auto-sync.json                # 最近自动对账状态与结果
-│   └── event-supersessions.jsonl     # 追加式旧事件替代关系
+│   ├── source-cursors.json            # 各会话源文件的增量读取游标
+│   ├── source-models.json             # 按源文件指纹缓存的模型派生结果
+│   ├── index-dirty.json               # 派生视图是否需要重建
+│   ├── auto-sync-pending.json         # 重叠触发合并队列
+│   ├── event-supersessions.jsonl      # 追加式旧事件替代关系
+│   └── event-exclusions.jsonl         # 追加式非人类事件排除关系
 └── badcases/                         # Phase 2 预留空间
 ```
 
@@ -293,6 +303,7 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 |---|---|---|
 | 权威事实 | `events/**/*.jsonl` | 日常写入 append-only；原始事实不因迁移重复而删除 |
 | 事实补偿 | `state/event-supersessions.jsonl` | 指明旧事件由哪个规范事件替代，视图只展示有效事件 |
+| 事实排除 | `state/event-exclusions.jsonl` | 标记旧版本误收的自动上下文，不删除原始行 |
 | 图片事实 | `assets/images/`、`assets/manifest.jsonl` | 图片按哈希存储；关系按 `event_id` 追加 |
 | 可读事实 | `index/PROMPTS.md` | 只有最小标题、逐条元数据和完整清洗后提示词 |
 | 派生索引 | `catalog.json`、`sessions.json` | 可以重建 |
@@ -440,7 +451,7 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 
 ### Hook 会拖慢每次对话吗？
 
-前台 Hook 只做本地文本清洗、追加、有界图片复制和后台进程调度。全历史扫描在独立进程运行，不阻塞当前回答，不联网，也不调用模型；新会话首次运行，恢复会话按五分钟间隔节流。
+前台 Hook 只做本地文本清洗、追加、有界图片复制和后台进程调度。首次历史发现或后续增量读取都在独立进程运行，不阻塞当前回答，不联网，也不调用模型。普通轮次只读取发生追加的会话 JSONL 尾部；未新增事件或图片时跳过重复视图重建，模型推导结果也按源文件指纹缓存；多个项目的重任务通过全局锁串行化。
 
 ## 故障排查顺序
 
@@ -461,7 +472,7 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 当前版本会做：
 
 - 提示词捕获、回填、清洗、去重、搜索、索引和可视化；
-- 首次对话自动初始化，以及新/恢复会话触发的后台全项目对账；
+- 首次对话自动初始化并发现全项目历史，后续每次输入执行游标式增量对账；
 - 为未来 badcase 提供稳定 `event_id` 和项目级目录结构。
 
 当前版本不会做：
@@ -516,7 +527,7 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 - 默认分支：`main`
 - Marketplace：`24kchengye`
 - Plugin：`prompt-harness@24kchengye`
-- 当前版本：`0.4.1`
+- 当前版本：`0.5.0`
 - 可见性：Public
 - License：[MIT](LICENSE)
 

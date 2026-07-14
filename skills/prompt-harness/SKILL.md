@@ -13,10 +13,10 @@ After installation and trust, the user should not need to initialize each projec
 
 1. resolves the project and creates `.prompt-harness` if absent;
 2. synchronously stores the current prompt and user images;
-3. launches a detached `auto-sync` process that reconciles every local Claude/Codex session associated with the project;
+3. launches a detached `auto-sync` process that performs first-use discovery or reads only appended transcript tails;
 4. returns without waiting for the historical scan.
 
-A new session always reconciles. A previously seen session reconciles again after `auto_sync.min_interval_seconds` (300 seconds by default); foreground prompt capture still happens on every turn. A project-level lock prevents overlapping scans, and failures retry on the next message. Inspect `state/auto-sync.json` to distinguish `completed`, `running`, `failed`, and throttled runs.
+The first valid interaction performs one full Claude/Codex discovery for that project. Every later interaction reconciles immediately from `state/source-cursors.json`: unchanged files are not parsed and changed JSONL files are read from their saved byte offsets. There is no time throttle. A project lock coalesces overlapping requests in `state/auto-sync-pending.json`, and one global lock serializes disk-heavy work across projects. Inspect `state/auto-sync.json` for `mode`, `sources_changed`, `bytes_read`, completion, and failures.
 
 ## Core workflow
 
@@ -51,6 +51,7 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 
 - Treat `events/**/*.jsonl` as the append-only source of truth.
 - Apply `state/event-supersessions.jsonl` when selecting active events. It compensates for migrated duplicates without deleting raw event lines.
+- Apply `state/event-exclusions.jsonl` when selecting active events. It compensates for automatic context that older versions incorrectly captured.
 - Treat `assets/manifest.jsonl` as the append-only image-to-event relation ledger and `assets/images/` as content-addressed user-image facts.
 - Treat `index/catalog.json`, `index/PROMPTS.md`, `index/sessions.json`, `sessions/**/*.json`, `reports/SESSION_SUMMARIES.md`, and `visualizations/timeline.html` as rebuildable views.
 - Treat `P00001` labels as derived chronological positions. Backfilling an earlier prompt must renumber later P labels; use the immutable `event_id` for durable links and badcase references.
@@ -63,14 +64,15 @@ On non-Windows systems, use `python3` and `$PLUGIN_ROOT/scripts/prompt_harness.p
 - Copy only validated PNG, JPEG, GIF, WebP, or BMP image bytes to `assets/images/`. Never download remote image URLs and never store SVG.
 - Omit non-image attachment payloads and redact obvious secrets.
 - Exclude assistant output, tool results, subagent traffic, injected project/system instructions, local command wrappers, and Claude-to-Codex mirror rows.
-- Preserve legitimate repeated prompts as separate events. Reconcile exact native message IDs, turn IDs, and source path/line identities before text hashes; merge only true historical copies.
+- Preserve legitimate repeated prompts as separate events. Prefer native IDs and exact source path/line identities. Use `(turn_id, prompt hash)`, never `turn_id` alone, to match a source row to a live hook event; distinct source lines still remain distinct even when turn and text are identical. Use occurrence matching only during a complete historical scan.
+- Reject a user's home directory or drive root as a project root. These catch-all roots can absorb unrelated projects.
 - Never commit `.prompt-harness/events`, `assets`, `sessions`, `index`, `reports`, or future badcase run data unless the user explicitly changes the privacy policy.
 
 Read [event-schema.md](../../references/event-schema.md) when changing the event envelope. Read [architecture.md](../../references/architecture.md) when changing ingestion or deduplication. Read [badcase-roadmap.md](../../references/badcase-roadmap.md) before implementing phase 2.
 
 ## Hook behavior
 
-The plugin's `UserPromptSubmit` hook performs a bounded local append/copy, schedules detached full-project reconciliation, and returns success so history scanning does not block the model. A standalone installer is available for Claude Code and global Codex hooks. Do not enable both the Codex plugin hook and the global Codex hook:
+The plugin's `UserPromptSubmit` hook performs a bounded local append/copy, queues detached reconciliation, and returns success so source checking does not block the model. Full discovery occurs only when source cursors are absent or an operator explicitly forces it; normal turns read changed tails. A standalone installer is available for Claude Code and global Codex hooks. Do not enable both the Codex plugin hook and the global Codex hook:
 
 ```powershell
 python "$env:PLUGIN_ROOT\scripts\install_hooks.py" --platform claude
@@ -82,7 +84,7 @@ Codex tasks created before the plugin hook was installed may retain their origin
 python "$env:PLUGIN_ROOT\scripts\install_hooks.py" --platform codex --codex-hook stop-recovery
 ```
 
-The recovery command initializes the ledger if needed, reads only the latest human row and its image blocks from the stopped task's own rollout, records `source.mode=stop_recovery`, and schedules the full-project reconciliation. It reconciles by turn ID so it can coexist with the plugin's immediate hook. It is post-turn recovery rather than submission-time capture: the current prompt normally appears after the assistant finishes and the Stop hook runs, so a same-turn read can be early. Interrupted or aborted turns retry through automatic reconciliation on the next interaction.
+The recovery command initializes the ledger if needed, reads only the latest human row and its image blocks from the stopped task's own rollout, records `source.mode=stop_recovery`, and queues the same reconciliation path. It reconciles by turn ID plus prompt hash so multiple messages in one turn remain distinct. It is post-turn recovery rather than submission-time capture: the current prompt normally appears after the assistant finishes and the Stop hook runs, so a same-turn read can be early. Interrupted or aborted turns retry through automatic reconciliation on the next interaction.
 
 When diagnosing an old Codex task, do not run manual backfill if the user asked to test automation. Send one test prompt, let the assistant finish, then inspect the project ledger on the following turn. Report `event_id`, `source.mode`, `platform`, `model`, and image count/path. On Windows, inspect `~/.codex/hooks/codex_turn_end.log` if recovery is missing; Stop payload forwarding must use UTF-8 (`ensure_ascii=True`, explicit subprocess `encoding="utf-8"`, and `PYTHONIOENCODING=utf-8`) rather than the console GBK code page.
 
@@ -92,11 +94,11 @@ The installer must back up existing configuration before editing it and preserve
 
 - If a hook record is missing, inspect the hook payload, transcript path, project-root resolution, and hook trust state before changing the ledger.
 - If image capture is missing, inspect `state/image-misses.jsonl`, the transcript image block, file existence, raster signature, and per-event limits. Do not fetch remote URLs as a fallback.
-- If automatic history is missing, inspect `state/auto-sync.json`, `state/auto-sync-errors.jsonl`, project resolution, session throttling, and `auto_sync` config before running a manual backfill.
+- If automatic history is missing, inspect `state/auto-sync.json`, `state/source-cursors.json`, `state/auto-sync-pending.json`, `state/auto-sync-errors.jsonl`, project resolution, and `auto_sync` config before running a manual backfill.
 - If historical counts look inflated, check native event IDs, Claude branch copies, subagent folders, injected context, and imported Codex mirrors.
 - If a secret or attachment body survives sanitation, stop publishing or exporting, improve the sanitizer, backfill into a fresh retained test project, and rerun `doctor`.
 - Do not delete or rewrite canonical JSONL to repair an error without explicit user approval. Prefer a compensating event or a documented migration.
 
 ## Reporting
 
-Report the project root, raw/active/superseded event counts, image relation/file counts, session count, automatic reconciliation status, privacy status, doctor result, and locations of the canonical ledger, image assets/manifest, fact Markdown, mutable summary, and local HTML timeline. Distinguish source prompts from imported mirrors and explain missing or transcript-derived model metadata. When citing a prompt, include both its current P number and stable `event_id`; note that P numbers can change after earlier history is backfilled.
+Report the project root, raw/active/superseded/excluded event counts, image relation/file counts, session count, automatic reconciliation mode and changed-source/byte diagnostics, privacy status, doctor result, and locations of the canonical ledger, image assets/manifest, fact Markdown, mutable summary, and local HTML timeline. Distinguish source prompts from imported mirrors and explain missing or transcript-derived model metadata. When citing a prompt, include both its current P number and stable `event_id`; note that P numbers can change after earlier history is backfilled.
