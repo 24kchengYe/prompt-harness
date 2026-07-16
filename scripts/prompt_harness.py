@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Project-local prompt ledger for Codex and Claude Code.
+"""Project-local prompt and agent-trace ledger for Codex and Claude Code.
 
 The canonical store is append-only JSONL under ``<project>/.prompt-harness``.
-Only user-authored prompt text and user-sent raster images are recorded. Other
-file bodies, tool results, assistant messages, subagent traffic, injected
-instructions, and imported mirror rows are not part of the ledger.
+User-authored prompts, user-sent raster images, and structured agent trace
+events are recorded. Trace events include assistant text, reasoning/thinking,
+tool calls/results, injected instructions, and subagent traffic.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,8 @@ from typing import Any, Iterable, Iterator
 SCHEMA_VERSION = "1.0.0"
 STORE_NAME = ".prompt-harness"
 RECORD_TYPE = "user_prompt"
+MODEL_OUTPUT_RECORD_TYPE = "agent_trace"
+LEGACY_MODEL_OUTPUT_RECORD_TYPE = "model_output"
 IMAGE_RECORD_TYPE = "prompt_image"
 EXCLUSION_RECORD_TYPE = "event_exclusion"
 SESSION_BINDING_RECORD_TYPE = "session_project_binding"
@@ -74,7 +77,7 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)(Authorization\s*:\s*Bearer\s+)[A-Za-z0-9._~+/=-]{12,}"),
     re.compile(
         r"(?i)\b(api[_ -]?key|access[_ -]?token|password|passwd|client[_ -]?secret)"
-        r"(\s*[:=]\s*)[\"']?([^\s\"']{8,})"
+        r"(\s*[:=]\s*)[\"']?(?!\[REDACTED_SECRET\])([^\s\"']{8,})"
     ),
 )
 
@@ -89,8 +92,10 @@ PROJECT_README = """# Prompt Harness project store
 This directory is managed by Prompt Harness.
 
 - `events/` is the append-only source of truth for user prompt events.
+- `model-events/` is the append-only source of truth for structured agent trace events.
 - `sessions/` contains derived per-session metadata.
-- `index/` contains rebuildable catalogs, `PROMPTS.md`, and session views.
+- `index/` contains rebuildable catalogs, `PROMPTS.md`, `MODELOUT.md`, `TRAJECTORY.md`, and session views.
+- `index/prompt/`, `index/modelout/`, and `index/trajectory/` contain matching per-session Markdown files.
 - `reports/` contains project-specific narrative analyses and curated exports.
 - `assets/images/` contains content-addressed copies of user-sent raster images.
 - `assets/manifest.jsonl` links those images to immutable prompt `event_id` values.
@@ -106,6 +111,7 @@ rebuild, backfill, or validate the store.
 PROJECT_GITIGNORE = """# Prompt bodies may contain private or sensitive context.
 config.json
 events/
+model-events/
 sessions/
 index/
 reports/
@@ -298,6 +304,11 @@ def is_automatic_prompt(text: str) -> bool:
         and "hyperpersonalized suggestions" in lowered
         and "recent codex tasks in this project:" in lowered
     )
+    codex_plugin_environment_injection = (
+        lowered.startswith("<recommended_plugins>")
+        and "</recommended_plugins>" in lowered
+        and "<environment_context>" in lowered
+    )
     return bool(
         not value
         or re.fullmatch(r"\[Request interrupted by user(?: for tool use)?\]", value, re.I)
@@ -312,7 +323,7 @@ def is_automatic_prompt(text: str) -> bool:
         )
         or lowered.startswith("<environment_context>")
         or lowered.startswith("<permissions instructions>")
-        or value.startswith("打开 Claude 导入会话归档：")
+        or codex_plugin_environment_injection
         or codex_suggestion_prompt
     )
 
@@ -481,6 +492,11 @@ def record_hook_runtime_error(payload: dict[str, Any], error: Exception) -> None
 
 def registry_path() -> Path:
     return harness_home() / "projects.json"
+
+
+def native_agent_home(environment_variable: str, default_name: str) -> Path:
+    configured = os.environ.get(environment_variable)
+    return Path(configured).expanduser() if configured else Path.home() / default_name
 
 
 def session_binding_file() -> Path:
@@ -658,6 +674,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
     store = root / STORE_NAME
     for relative in (
         "events",
+        "model-events",
         "sessions/claude",
         "sessions/codex",
         "index",
@@ -688,6 +705,8 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
             "privacy": {
                 "store_prompt_text": True,
                 "store_assistant_messages": False,
+                "store_model_outputs": True,
+                "store_agent_trace": True,
                 "store_file_bodies": False,
                 "store_user_images": True,
                 "redact_obvious_secrets": True,
@@ -706,6 +725,12 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         changed_config = True
     else:
         privacy = config.setdefault("privacy", {})
+        if "store_model_outputs" not in privacy:
+            privacy["store_model_outputs"] = True
+            changed_config = True
+        if "store_agent_trace" not in privacy:
+            privacy["store_agent_trace"] = bool(privacy.get("store_model_outputs", True))
+            changed_config = True
         if "store_user_images" not in privacy:
             privacy["store_user_images"] = True
             changed_config = True
@@ -763,6 +788,61 @@ def iter_events(store: Path) -> Iterator[dict[str, Any]]:
                     continue
                 if isinstance(value, dict):
                     yield value
+
+
+def model_output_file(store: Path, occurred_at: str) -> Path:
+    parsed = parse_iso(occurred_at) or utc_now()
+    return (
+        store
+        / "model-events"
+        / f"{parsed:%Y}"
+        / f"{parsed:%m}"
+        / f"model-outputs-{parsed:%Y-%m-%d}.jsonl"
+    )
+
+
+def iter_model_output_files(store: Path) -> Iterator[Path]:
+    root = store / "model-events"
+    if root.exists():
+        yield from sorted(root.rglob("model-outputs-*.jsonl"))
+
+
+def iter_model_outputs(store: Path) -> Iterator[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    for path in iter_model_output_files(store):
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict) and value.get("record_type") in {
+                    MODEL_OUTPUT_RECORD_TYPE,
+                    LEGACY_MODEL_OUTPUT_RECORD_TYPE,
+                }:
+                    values.append(value)
+    upgraded_sources = {
+        (
+            str(value.get("source", {}).get("platform") or ""),
+            str(value.get("session", {}).get("id") or ""),
+            normalize_path(value.get("source", {}).get("path")),
+            int(value.get("source", {}).get("line") or 0),
+        )
+        for value in values
+        if value.get("record_type") == MODEL_OUTPUT_RECORD_TYPE
+        and str(value.get("event_type") or "") == "assistant_text"
+    }
+    for value in values:
+        if value.get("record_type") == LEGACY_MODEL_OUTPUT_RECORD_TYPE:
+            source_key = (
+                str(value.get("source", {}).get("platform") or ""),
+                str(value.get("session", {}).get("id") or ""),
+                normalize_path(value.get("source", {}).get("path")),
+                int(value.get("source", {}).get("line") or 0),
+            )
+            if source_key in upgraded_sources:
+                continue
+        yield value
 
 
 def event_supersession_file(store: Path) -> Path:
@@ -861,6 +941,266 @@ def event_order_key(event: dict[str, Any]) -> tuple[Any, ...]:
         str(source.get("native_event_id") or session.get("turn_id") or ""),
         str(event.get("event_id") or ""),
     )
+
+
+def model_output_order_key(event: dict[str, Any]) -> tuple[Any, ...]:
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    session = event.get("session") if isinstance(event.get("session"), dict) else {}
+    try:
+        line_number = int(source.get("line"))
+    except (TypeError, ValueError):
+        line_number = 2**63 - 1
+    return (
+        str(event.get("occurred_at") or ""),
+        str(source.get("path") or session.get("transcript_path") or "").lower(),
+        line_number,
+        str(source.get("platform") or ""),
+        str(session.get("id") or ""),
+        int(source.get("block_index") or 0),
+        str(event.get("trace_event_id") or event.get("model_output_id") or ""),
+    )
+
+
+def trajectory_item_order_key(item: tuple[str, dict[str, Any]]) -> tuple[Any, ...]:
+    kind, event = item
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    session = event.get("session") if isinstance(event.get("session"), dict) else {}
+    try:
+        line_number = int(source.get("line"))
+    except (TypeError, ValueError):
+        line_number = 2**63 - 1
+    try:
+        block_index = int(source.get("block_index") or 0)
+    except (TypeError, ValueError):
+        block_index = 0
+    return (
+        str(event.get("occurred_at") or ""),
+        str(source.get("path") or session.get("transcript_path") or "").lower(),
+        line_number,
+        0 if kind == "prompt" else 1,
+        block_index,
+        str(event.get("event_id") or event.get("trace_event_id") or ""),
+    )
+
+
+def render_trajectory_event(
+    label: str,
+    kind: str,
+    event: dict[str, Any],
+    prompt_numbers: dict[str, int],
+    *,
+    heading_level: int = 4,
+) -> list[str]:
+    heading = "#" * max(1, min(6, heading_level))
+    source = event.get("source") if isinstance(event.get("source"), dict) else {}
+    session = event.get("session") if isinstance(event.get("session"), dict) else {}
+    context = event.get("context") if isinstance(event.get("context"), dict) else {}
+    if kind == "prompt":
+        prompt = event.get("prompt") if isinstance(event.get("prompt"), dict) else {}
+        return [
+            f"{heading} {label} · PROMPT",
+            "",
+            f"- Time: `{event.get('occurred_at')}`",
+            f"- Turn: `{session.get('turn_id') or 'none'}`",
+            f"- Prompt event ID: `{event.get('event_id')}`",
+            f"- Source: `{source.get('path') or 'hook'}:{source.get('line') or '-'}`",
+            f"- Model: `{context.get('model') or 'unavailable'}`",
+            "",
+            fenced(str(prompt.get("text") or "")),
+            "",
+        ]
+    content = event.get("content")
+    if not isinstance(content, dict):
+        content = event.get("output", {})
+    links = event.get("links") if isinstance(event.get("links"), dict) else {}
+    prompt_event_id = str(links.get("prompt_event_id") or "")
+    prompt_number = prompt_numbers.get(prompt_event_id)
+    prompt_label = f"P{prompt_number:05d}" if prompt_number else "unlinked"
+    lines = [
+        f"{heading} {label} · {str(event.get('event_type') or 'assistant_text').upper()}",
+        "",
+        f"- Time: `{event.get('occurred_at')}`",
+        f"- Actor: `{event.get('actor', {}).get('role') or 'assistant'}`",
+        f"- Turn: `{session.get('turn_id') or 'none'}`",
+        f"- Trace event ID: `{event.get('trace_event_id') or event.get('model_output_id')}`",
+        f"- Linked prompt: `{prompt_label}` (`{prompt_event_id or 'unlinked'}`)",
+        f"- Tool call ID: `{links.get('tool_call_id') or 'none'}`",
+        f"- Source: `{source.get('path') or 'unknown'}:{source.get('line') or '-'}#{source.get('block_index') or 0}`",
+        f"- Model: `{context.get('model') or 'unavailable'}`",
+        "",
+        fenced(str(content.get("text") or "")),
+        "",
+    ]
+    if content.get("structured") is not None:
+        lines.extend(
+            [
+                "```json",
+                json.dumps(content.get("structured"), ensure_ascii=False, indent=2, sort_keys=True),
+                "```",
+                "",
+            ]
+        )
+    return lines
+
+
+def render_conversation_turns(
+    items: list[tuple[str, dict[str, Any]]],
+    prompt_by_id: dict[str, dict[str, Any]],
+    prompt_numbers: dict[str, int],
+    *,
+    turn_heading_level: int,
+    event_heading_level: int,
+) -> list[str]:
+    """Render native turns with every human message before the model trace."""
+
+    local_prompt_events = [
+        event for kind, event in items if kind == "prompt" and event.get("event_id")
+    ]
+    local_turn_ids = {
+        str(event.get("session", {}).get("turn_id") or "")
+        for event in local_prompt_events
+        if event.get("session", {}).get("turn_id")
+    }
+    prompts_by_turn: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    traces_by_turn: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    external_prompt_by_turn: dict[str, dict[str, Any]] = {}
+    for event in local_prompt_events:
+        event_id = str(event.get("event_id") or "")
+        native_turn_id = str(event.get("session", {}).get("turn_id") or "")
+        key = f"native:{native_turn_id}" if native_turn_id else f"prompt:{event_id}"
+        prompts_by_turn[key].append(event)
+    unlinked_traces: list[dict[str, Any]] = []
+    for kind, event in items:
+        if kind != "trace":
+            continue
+        prompt_event_id = str(event.get("links", {}).get("prompt_event_id") or "")
+        native_turn_id = str(event.get("session", {}).get("turn_id") or "")
+        if native_turn_id and native_turn_id in local_turn_ids:
+            traces_by_turn[f"native:{native_turn_id}"].append(event)
+        elif prompt_event_id and prompt_event_id in prompt_by_id:
+            linked_prompt = prompt_by_id[prompt_event_id]
+            linked_turn_id = str(linked_prompt.get("session", {}).get("turn_id") or "")
+            if linked_turn_id and linked_turn_id in local_turn_ids:
+                traces_by_turn[f"native:{linked_turn_id}"].append(event)
+            else:
+                key = f"prompt:{prompt_event_id}"
+                traces_by_turn[key].append(event)
+                external_prompt_by_turn[key] = linked_prompt
+        else:
+            unlinked_traces.append(event)
+
+    turn_keys = set(prompts_by_turn) | set(traces_by_turn)
+
+    def turn_order_key(key: str) -> tuple[Any, ...]:
+        prompt_items = prompts_by_turn.get(key)
+        if prompt_items:
+            return event_order_key(min(prompt_items, key=event_order_key))
+        if key in external_prompt_by_turn:
+            return event_order_key(external_prompt_by_turn[key])
+        trace_items = traces_by_turn.get(key, [])
+        return model_output_order_key(min(trace_items, key=model_output_order_key))
+
+    ordered_turn_keys = sorted(
+        turn_keys,
+        key=turn_order_key,
+    )
+    turn_heading = "#" * max(1, min(6, turn_heading_level))
+    lines: list[str] = []
+    for turn_number, turn_key in enumerate(ordered_turn_keys, 1):
+        prompt_events = sorted(prompts_by_turn.get(turn_key, []), key=event_order_key)
+        if not prompt_events and turn_key in external_prompt_by_turn:
+            prompt_events = [external_prompt_by_turn[turn_key]]
+        native_turn_id = turn_key.removeprefix("native:") if turn_key.startswith("native:") else ""
+        lines.extend(
+            [
+                f"{turn_heading} Turn {turn_number:05d}",
+                "",
+                f"- Native turn ID: `{native_turn_id or 'unavailable'}`",
+                f"- Human messages: `{len(prompt_events)}`",
+                "",
+            ]
+        )
+        for message_number, prompt_event in enumerate(prompt_events, 1):
+            prompt_event_id = str(prompt_event.get("event_id") or "")
+            prompt_number = prompt_numbers.get(prompt_event_id)
+            lines.extend(
+                render_trajectory_event(
+                    (
+                        f"P{prompt_number:05d}"
+                        if prompt_number
+                        else f"P-external-{message_number:02d}"
+                    ),
+                    "prompt",
+                    prompt_event,
+                    prompt_numbers,
+                    heading_level=event_heading_level,
+                )
+            )
+        for trace_number, trace_event in enumerate(
+            sorted(traces_by_turn.get(turn_key, []), key=model_output_order_key),
+            1,
+        ):
+            lines.extend(
+                render_trajectory_event(
+                    f"R{trace_number:05d}",
+                    "trace",
+                    trace_event,
+                    prompt_numbers,
+                    heading_level=event_heading_level,
+                )
+            )
+
+    if unlinked_traces:
+        label = "Trace-only session" if not ordered_turn_keys else "Unlinked session events"
+        lines.extend([f"{turn_heading} {label}", ""])
+        for trace_number, trace_event in enumerate(
+            sorted(unlinked_traces, key=model_output_order_key),
+            1,
+        ):
+            lines.extend(
+                render_trajectory_event(
+                    f"U{trace_number:05d}",
+                    "trace",
+                    trace_event,
+                    prompt_numbers,
+                    heading_level=event_heading_level,
+                )
+            )
+    return lines
+
+
+def session_projection_fingerprint(
+    items: list[tuple[str, dict[str, Any]]],
+    prompt_numbers: dict[str, int],
+    output_numbers: dict[str, int],
+) -> str:
+    payload = []
+    for kind, event in sorted(items, key=trajectory_item_order_key):
+        if kind == "prompt":
+            event_id = str(event.get("event_id") or "")
+            payload.append(
+                (
+                    kind,
+                    event_id,
+                    prompt_numbers.get(event_id),
+                    event.get("prompt", {}).get("sha256"),
+                    event.get("occurred_at"),
+                )
+            )
+        else:
+            output_id = str(event.get("trace_event_id") or event.get("model_output_id") or "")
+            content = event.get("content") if isinstance(event.get("content"), dict) else event.get("output", {})
+            payload.append(
+                (
+                    kind,
+                    output_id,
+                    output_numbers.get(output_id),
+                    content.get("sha256"),
+                    event.get("occurred_at"),
+                    event.get("context", {}).get("phase"),
+                )
+            )
+    return sha256_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def append_event_supersession(
@@ -1183,6 +1523,237 @@ def append_event(store: Path, event: dict[str, Any], existing_ids: set[str] | No
         if existing_ids is not None:
             existing_ids.add(event["event_id"])
     return True
+
+
+def model_output_identity(
+    platform: str,
+    session_id: str,
+    event_type: str,
+    content_hash: str,
+    source_path: str,
+    source_line: int,
+    block_index: int,
+) -> str:
+    material = "|".join(
+        (
+            SCHEMA_VERSION,
+            platform,
+            session_id,
+            normalize_path(source_path),
+            str(source_line),
+            str(block_index),
+            event_type,
+            content_hash,
+        )
+    )
+    return "ate_" + sha256_text(material)[:32]
+
+
+def sanitize_trace_value(value: Any) -> tuple[Any, dict[str, int]]:
+    """Recursively sanitize a trace payload without dropping any event category."""
+
+    stats = {"secret_redactions": 0, "attachments_omitted": 0}
+    if isinstance(value, str):
+        value, omitted = omit_embedded_files(value)
+        value, redactions = redact_secrets(value)
+        stats["attachments_omitted"] += omitted
+        stats["secret_redactions"] += redactions
+        return value, stats
+    if isinstance(value, list):
+        rendered = []
+        for item in value:
+            clean, item_stats = sanitize_trace_value(item)
+            rendered.append(clean)
+            for key in stats:
+                stats[key] += item_stats[key]
+        return rendered, stats
+    if isinstance(value, dict):
+        rendered = {}
+        for key, item in value.items():
+            clean, item_stats = sanitize_trace_value(item)
+            rendered[str(key)] = clean
+            for stat_key in stats:
+                stats[stat_key] += item_stats[stat_key]
+        return rendered, stats
+    return value, stats
+
+
+def trace_value_matches_patterns(value: Any, patterns: Iterable[re.Pattern[str]]) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in patterns)
+    if isinstance(value, list):
+        return any(trace_value_matches_patterns(item, patterns) for item in value)
+    if isinstance(value, dict):
+        return any(trace_value_matches_patterns(item, patterns) for item in value.values())
+    return False
+
+
+def trace_content_hash(text: str, structured: Any) -> str:
+    return sha256_text(
+        json.dumps(
+            {"text": text, "structured": structured},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def build_model_output_event(
+    *,
+    root: Path,
+    platform: str,
+    session_id: str,
+    occurred_at: str,
+    event_type: str,
+    actor_role: str,
+    output_text: str,
+    structured: Any,
+    source_path: str,
+    source_line: int,
+    block_index: int = 0,
+    raw_type: str | None = None,
+    native_event_id: str | None = None,
+    turn_id: str | None = None,
+    cwd: str | None = None,
+    model: str | None = None,
+    phase: str | None = None,
+    prompt_event_id: str | None = None,
+    sanitation: dict[str, int] | None = None,
+    actor_name: str | None = None,
+    tool_call_id: str | None = None,
+    parent_session_id: str | None = None,
+    agent_id: str | None = None,
+    is_subagent: bool = False,
+) -> dict[str, Any]:
+    content_hash = trace_content_hash(output_text, structured)
+    trace_event_id = model_output_identity(
+        platform,
+        session_id,
+        event_type,
+        content_hash,
+        source_path,
+        source_line,
+        block_index,
+    )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": MODEL_OUTPUT_RECORD_TYPE,
+        "trace_event_id": trace_event_id,
+        "model_output_id": trace_event_id,
+        "captured_at": iso_z(),
+        "occurred_at": occurred_at,
+        "event_type": event_type,
+        "source": {
+            "mode": "backfill",
+            "platform": platform,
+            "path": source_path,
+            "line": source_line,
+            "block_index": block_index,
+            "raw_type": raw_type,
+            "native_event_id": native_event_id,
+        },
+        "project": {
+            "id": project_id(root),
+            "name": root.name,
+            "root": str(root),
+        },
+        "session": {
+            "id": session_id,
+            "turn_id": turn_id,
+            "transcript_path": source_path,
+            "parent_session_id": parent_session_id,
+            "agent_id": agent_id,
+            "is_subagent": is_subagent,
+        },
+        "actor": {
+            "role": actor_role,
+            "name": actor_name,
+        },
+        "content": {
+            "text": output_text,
+            "structured": structured,
+            "sha256": content_hash,
+            "chars": len(output_text),
+            "secret_redactions": int((sanitation or {}).get("secret_redactions", 0)),
+            "attachments_omitted": int((sanitation or {}).get("attachments_omitted", 0)),
+        },
+        "context": {
+            "cwd": cwd or str(root),
+            "model": model,
+            "phase": phase,
+        },
+        "links": {
+            "prompt_event_id": prompt_event_id,
+            "tool_call_id": tool_call_id,
+            "parent_trace_event_id": None,
+        },
+    }
+
+
+def append_model_output(
+    store: Path,
+    event: dict[str, Any],
+    existing_ids: set[str] | None = None,
+) -> bool:
+    path = model_output_file(store, str(event["occurred_at"]))
+    output_id = str(event.get("trace_event_id") or event["model_output_id"])
+    with file_lock(store / "state" / "write.lock"):
+        if existing_ids is not None and output_id in existing_ids:
+            return False
+        if path.exists():
+            for _, prior in read_jsonl(path):
+                if str(prior.get("trace_event_id") or prior.get("model_output_id") or "") == output_id:
+                    if existing_ids is not None:
+                        existing_ids.add(output_id)
+                    return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        mark_index_dirty(store, "model_output_appended")
+        if existing_ids is not None:
+            existing_ids.add(output_id)
+    return True
+
+
+def append_model_outputs_bulk(
+    store: Path,
+    events: Iterable[dict[str, Any]],
+) -> tuple[int, int]:
+    pending = list(events)
+    if not pending:
+        return 0, 0
+    added = skipped = 0
+    with file_lock(store / "state" / "write.lock"):
+        existing_ids: set[str] = set()
+        for path in iter_model_output_files(store):
+            for _, prior in read_jsonl(path):
+                output_id = str(
+                    prior.get("trace_event_id") or prior.get("model_output_id") or ""
+                )
+                if output_id:
+                    existing_ids.add(output_id)
+        grouped: dict[Path, list[dict[str, Any]]] = collections.defaultdict(list)
+        for event in pending:
+            output_id = str(event.get("trace_event_id") or event.get("model_output_id") or "")
+            if not output_id or output_id in existing_ids:
+                skipped += 1
+                continue
+            existing_ids.add(output_id)
+            grouped[model_output_file(store, str(event["occurred_at"]))].append(event)
+            added += 1
+        for path, path_events in grouped.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                for event in path_events:
+                    handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+    if added:
+        mark_index_dirty(store, "model_outputs_appended")
+    return added, skipped
 
 
 def image_manifest_file(store: Path) -> Path:
@@ -1586,6 +2157,38 @@ def read_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
                 yield line_no, value
 
 
+def read_jsonl_reverse(path: Path, *, chunk_size: int = 64 * 1024) -> Iterator[dict[str, Any]]:
+    """Read JSONL objects newest-first without parsing the entire file."""
+
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        remainder = b""
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            block = handle.read(read_size) + remainder
+            parts = block.split(b"\n")
+            remainder = parts[0]
+            for raw in reversed(parts[1:]):
+                if not raw.strip():
+                    continue
+                try:
+                    value = json.loads(raw.decode("utf-8-sig"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(value, dict):
+                    yield value
+        if remainder.strip():
+            try:
+                value = json.loads(remainder.decode("utf-8-sig"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return
+            if isinstance(value, dict):
+                yield value
+
+
 def latest_user_record_from_transcript(path: Path, platform: str) -> dict[str, Any] | None:
     latest: dict[str, Any] | None = None
     for line_no, obj in read_jsonl(path):
@@ -1658,9 +2261,20 @@ def find_codex_rollout(codex_home: Path, session_id: str, transcript_path: Any =
 
 
 def latest_codex_prompt_event(path: Path) -> dict[str, Any] | None:
-    rows = list(read_jsonl(path))
-    models = source_models_by_line(path, "codex", rows=rows)
-    for line_no, obj in reversed(rows):
+    candidate: dict[str, Any] | None = None
+    fallback_model: str | None = None
+    for obj in read_jsonl_reverse(path):
+        if candidate is not None:
+            if obj.get("type") == "turn_context" and isinstance(obj.get("payload"), dict):
+                model = normalize_model(obj["payload"].get("model"))
+                if model:
+                    candidate["model"] = model
+                    return candidate
+            if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
+                fallback_model = normalize_model(obj["payload"].get("model"))
+                candidate["model"] = fallback_model
+                return candidate
+            continue
         if obj.get("type") != "response_item" or not isinstance(obj.get("payload"), dict):
             continue
         payload = obj["payload"]
@@ -1675,17 +2289,17 @@ def latest_codex_prompt_event(path: Path) -> dict[str, Any] | None:
         if (not text and not images) or (text and is_automatic_prompt(text) and not images):
             continue
         occurred = parse_iso(obj.get("timestamp"))
-        return {
+        candidate = {
             "text": text,
             "images": images,
             "sanitation": sanitation,
             "timestamp": iso_z(occurred) if occurred else iso_z(),
-            "line": line_no,
-            "model": models.get(line_no),
+            "line": None,
+            "model": None,
             "turn_id": codex_turn_id(payload),
             "native_event_id": str(payload.get("id") or obj.get("id") or "") or None,
         }
-    return None
+    return candidate
 
 
 def find_equivalent_event(
@@ -1885,6 +2499,7 @@ def capture_stop_recovery(args: argparse.Namespace) -> int:
     result = recover_codex_stop(payload, project=args.project, codex_home=args.codex_home)
     if result.get("project") and result.get("reason") != "cwd_not_exact_project_root":
         root = Path(str(result["project"]))
+        ensure_initial_index(root / STORE_NAME)
         result["auto_sync"] = schedule_auto_sync(
             root,
             root / STORE_NAME,
@@ -1996,6 +2611,7 @@ def capture_hook_payload(args: argparse.Namespace, payload: dict[str, Any]) -> i
         source_path=str(transcript_path) if transcript_path else None,
         source_line=source_line,
     )
+    ensure_initial_index(store)
     schedule_auto_sync(
         root,
         store,
@@ -2005,6 +2621,23 @@ def capture_hook_payload(args: argparse.Namespace, payload: dict[str, Any]) -> i
         source_path=transcript_path,
     )
     return 0
+
+
+def ensure_initial_index(store: Path) -> bool:
+    """Materialize small first-use views before historical reconciliation ends."""
+
+    required = (
+        store / "index" / "PROMPTS.md",
+        store / "index" / "MODELOUT.md",
+        store / "index" / "TRAJECTORY.md",
+    )
+    if all(path.is_file() for path in required):
+        return False
+    try:
+        rebuild_index_for_store(store)
+    except Exception:
+        return False
+    return True
 
 
 def capture_hook(args: argparse.Namespace) -> int:
@@ -2103,6 +2736,7 @@ def collect_claude_candidates_from_rows(
                 "images": images,
                 "sanitation": sanitation,
                 "native_event_id": str(obj.get("uuid") or obj.get("promptId") or "") or None,
+                "turn_id": str(obj.get("promptId") or obj.get("uuid") or "") or None,
                 "path": str(path),
                 "line": line_no,
                 "cwd": str(obj.get("cwd") or root),
@@ -2239,6 +2873,7 @@ def collect_codex_candidates_from_paths(
         imported = str(meta.get("external_agent_source") or "") == "claude"
         external_path = Path(str(meta.get("external_agent_source_path"))) if meta.get("external_agent_source_path") else None
         original_max = max_jsonl_timestamp(external_path) if imported else None
+        import_bootstrap_time = parse_iso(meta.get("timestamp")) if imported else None
         for line_no, obj in rows:
             if obj.get("type") != "response_item" or not isinstance(obj.get("payload"), dict):
                 continue
@@ -2246,7 +2881,13 @@ def collect_codex_candidates_from_paths(
             if payload.get("type") != "message" or payload.get("role") != "user":
                 continue
             timestamp = parse_iso(obj.get("timestamp"))
-            if imported and original_max and timestamp and timestamp <= original_max:
+            is_import_bootstrap = bool(
+                imported
+                and timestamp
+                and import_bootstrap_time
+                and timestamp == import_bootstrap_time
+            )
+            if imported and original_max and timestamp and timestamp <= original_max and not is_import_bootstrap:
                 continue
             content = payload.get("content")
             text, _ = text_from_blocks(content)
@@ -2259,7 +2900,12 @@ def collect_codex_candidates_from_paths(
                 seen_goal_objectives.add(goal_key)
                 text = goal_objective
             text, sanitation = sanitize_prompt(text, backfill=True)
-            if (not text and not images) or (text and is_automatic_prompt(text) and not images):
+            if (not text and not images) or (
+                text
+                and is_automatic_prompt(text)
+                and not images
+                and not is_import_bootstrap
+            ):
                 continue
             native_event_id = str(payload.get("id") or obj.get("id") or "") or None
             raw.append(
@@ -2284,24 +2930,440 @@ def collect_codex_candidates_from_paths(
 def codex_project_paths(codex_home: Path, root: Path) -> list[Path]:
     paths: set[Path] = set(bound_source_paths("codex", root))
     bindings = active_session_bindings()
+    indexed_session_ids = codex_session_ids_from_state(codex_home, root)
     for folder_name in ("sessions", "archived_sessions"):
         folder = codex_home / folder_name
         if not folder.exists():
             continue
         for path in folder.rglob("rollout-*.jsonl"):
-            if "subagents" in path.parts:
+            if indexed_session_ids is not None and not any(
+                session_id in path.name for session_id in indexed_session_ids
+            ):
                 continue
             meta = codex_meta_from_path(path)
             if not meta or not codex_meta_belongs_to_root(meta, root, bindings=bindings):
-                continue
-            if meta.get("thread_source") == "subagent" or isinstance(meta.get("source"), dict):
                 continue
             paths.add(path)
     return sorted(paths)
 
 
+def codex_session_ids_from_state(codex_home: Path, root: Path) -> set[str] | None:
+    """Use the Codex desktop index to avoid opening every global rollout.
+
+    The database is an optional accelerator. Codex CLI-only installations and
+    temporarily unreadable databases fall back to transcript metadata scanning.
+    """
+
+    state_path = codex_home / "state_5.sqlite"
+    if not state_path.is_file():
+        return None
+    try:
+        uri = f"{state_path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.25) as connection:
+            rows = connection.execute(
+                "SELECT id, cwd FROM threads WHERE id IS NOT NULL AND cwd IS NOT NULL"
+            )
+            return {
+                str(session_id)
+                for session_id, cwd in rows
+                if session_id and normalize_path(cwd) == normalize_path(root)
+            }
+    except (OSError, sqlite3.Error):
+        return None
+
+
 def collect_codex_candidates(codex_home: Path, root: Path) -> list[dict[str, Any]]:
     return collect_codex_candidates_from_paths(codex_project_paths(codex_home, root), root)
+
+
+def trace_text_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(part for item in value if (part := trace_text_from_value(item)))
+    if isinstance(value, dict):
+        for key in ("text", "thinking", "output", "content", "message", "summary"):
+            if key in value and (text := trace_text_from_value(value[key])):
+                return text
+    return ""
+
+
+def trace_candidate(
+    *,
+    platform: str,
+    session_id: str,
+    timestamp: str,
+    event_type: str,
+    actor_role: str,
+    structured: Any,
+    path: Path,
+    line: int,
+    block_index: int = 0,
+    raw_type: str | None = None,
+    native_event_id: str | None = None,
+    turn_id: str | None = None,
+    cwd: str | None = None,
+    model: str | None = None,
+    phase: str | None = None,
+    actor_name: str | None = None,
+    tool_call_id: str | None = None,
+    parent_session_id: str | None = None,
+    agent_id: str | None = None,
+    is_subagent: bool = False,
+    text: str | None = None,
+) -> dict[str, Any]:
+    clean, sanitation = sanitize_trace_value(structured)
+    clean_text = trace_text_from_value(clean) if text is None else sanitize_trace_value(text)[0]
+    return {
+        "platform": platform,
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "event_type": event_type,
+        "actor_role": actor_role,
+        "actor_name": actor_name,
+        "text": str(clean_text or ""),
+        "structured": clean,
+        "sanitation": sanitation,
+        "native_event_id": native_event_id,
+        "turn_id": turn_id,
+        "path": str(path),
+        "line": line,
+        "block_index": block_index,
+        "raw_type": raw_type,
+        "cwd": cwd,
+        "model": model,
+        "phase": phase,
+        "tool_call_id": tool_call_id,
+        "parent_session_id": parent_session_id,
+        "agent_id": agent_id,
+        "is_subagent": is_subagent,
+    }
+
+
+def collect_claude_model_outputs_from_paths(
+    paths: Iterable[Path],
+    root: Path,
+    *,
+    rows_by_path: dict[str, list[tuple[int, dict[str, Any]]]] | None = None,
+) -> list[dict[str, Any]]:
+    outputs: list[dict[str, Any]] = []
+    bindings = active_session_bindings()
+    for path in sorted(set(paths)):
+        if not path.is_file() or not claude_source_belongs_to_root(path, root, bindings=bindings):
+            continue
+        rows = (rows_by_path or {}).get(normalize_path(path))
+        rows = rows if rows is not None else list(read_jsonl(path))
+        rows_by_uuid = {
+            str(obj.get("uuid")): obj
+            for _, obj in rows
+            if obj.get("uuid")
+        }
+
+        def claude_turn_anchor(obj: dict[str, Any]) -> str | None:
+            current = obj
+            seen: set[str] = set()
+            while isinstance(current, dict):
+                current_uuid = str(current.get("uuid") or "")
+                if current_uuid:
+                    if current_uuid in seen:
+                        break
+                    seen.add(current_uuid)
+                message = current.get("message") if isinstance(current.get("message"), dict) else {}
+                if current.get("type") == "user" and message.get("role") == "user":
+                    content = message.get("content")
+                    blocks = content if isinstance(content, list) else []
+                    tool_only = bool(blocks) and all(
+                        isinstance(block, dict) and block.get("type") == "tool_result"
+                        for block in blocks
+                    )
+                    if not tool_only:
+                        return str(current.get("promptId") or current.get("uuid") or "") or None
+                parent_uuid = str(current.get("parentUuid") or "")
+                if not parent_uuid:
+                    break
+                current = rows_by_uuid.get(parent_uuid, {})
+            return None
+
+        session_id = path.stem
+        path_is_subagent = path.parent.name == "subagents"
+        path_parent_session = path.parent.parent.name if path_is_subagent else None
+        for line_no, obj in rows:
+            message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            occurred = parse_iso(obj.get("timestamp"))
+            timestamp = iso_z(occurred) if occurred else iso_z()
+            native_id = str(obj.get("uuid") or message.get("id") or "") or None
+            is_subagent = bool(obj.get("isSidechain") or obj.get("agentId") or path_is_subagent)
+            agent_id = str(obj.get("agentId") or path.stem) if is_subagent else None
+            parent_session_id = path_parent_session
+            if obj.get("type") == "assistant" and message.get("role") == "assistant":
+                content = message.get("content")
+                blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                for block_index, block in enumerate(blocks):
+                    if not isinstance(block, dict):
+                        block = {"type": "text", "text": str(block)}
+                    block_type = str(block.get("type") or "assistant_content")
+                    event_type = {
+                        "thinking": "reasoning",
+                        "text": "assistant_text",
+                        "tool_use": "tool_call",
+                    }.get(block_type, "assistant_content")
+                    outputs.append(
+                        trace_candidate(
+                            platform="claude",
+                            session_id=session_id,
+                            timestamp=timestamp,
+                            event_type=event_type,
+                            actor_role="assistant",
+                            structured=block,
+                            path=path,
+                            line=line_no,
+                            block_index=block_index,
+                            raw_type=f"assistant.{block_type}",
+                            native_event_id=native_id,
+                            turn_id=claude_turn_anchor(obj),
+                            cwd=str(obj.get("cwd") or root),
+                            model=normalize_model(message.get("model")),
+                            phase="final_answer" if message.get("stop_reason") == "end_turn" else "commentary",
+                            tool_call_id=str(block.get("id") or "") or None,
+                            parent_session_id=parent_session_id,
+                            agent_id=agent_id,
+                            is_subagent=is_subagent,
+                        )
+                    )
+            elif obj.get("type") == "user" and message.get("role") == "user":
+                content = message.get("content")
+                blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                for block_index, block in enumerate(blocks):
+                    if not isinstance(block, dict):
+                        block = {"type": "text", "text": str(block)}
+                    block_type = str(block.get("type") or "user_content")
+                    if block_type == "tool_result":
+                        outputs.append(
+                            trace_candidate(
+                                platform="claude",
+                                session_id=session_id,
+                                timestamp=timestamp,
+                                event_type="tool_result",
+                                actor_role="tool",
+                                structured=block,
+                                path=path,
+                                line=line_no,
+                                block_index=block_index,
+                                raw_type="user.tool_result",
+                                native_event_id=native_id,
+                                turn_id=claude_turn_anchor(obj),
+                                cwd=str(obj.get("cwd") or root),
+                                tool_call_id=str(block.get("tool_use_id") or "") or None,
+                                parent_session_id=parent_session_id,
+                                agent_id=agent_id,
+                                is_subagent=is_subagent,
+                            )
+                        )
+                        continue
+                    text = trace_text_from_value(block)
+                    injections = [
+                        match.group(0)
+                        for pattern in DROP_BLOCK_PATTERNS
+                        for match in pattern.finditer(text)
+                    ]
+                    for injection_index, injection in enumerate(injections):
+                        outputs.append(
+                            trace_candidate(
+                                platform="claude",
+                                session_id=session_id,
+                                timestamp=timestamp,
+                                event_type="system_instruction",
+                                actor_role="system",
+                                structured={"type": "injected_instruction", "text": injection},
+                                path=path,
+                                line=line_no,
+                                block_index=block_index * 1000 + injection_index,
+                                raw_type="user.injected_instruction",
+                                native_event_id=native_id,
+                                turn_id=claude_turn_anchor(obj),
+                                cwd=str(obj.get("cwd") or root),
+                                parent_session_id=parent_session_id,
+                                agent_id=agent_id,
+                                is_subagent=is_subagent,
+                            )
+                        )
+            elif obj.get("type") == "system":
+                outputs.append(
+                    trace_candidate(
+                        platform="claude",
+                        session_id=session_id,
+                        timestamp=timestamp,
+                        event_type="system_event",
+                        actor_role="system",
+                        structured=obj,
+                        path=path,
+                        line=line_no,
+                        raw_type="system",
+                        native_event_id=native_id,
+                        turn_id=claude_turn_anchor(obj),
+                        cwd=str(obj.get("cwd") or root),
+                        parent_session_id=parent_session_id,
+                        agent_id=agent_id,
+                        is_subagent=is_subagent,
+                    )
+                )
+    return merge_model_output_copies(outputs)
+
+
+def collect_codex_model_outputs_from_paths(
+    paths: Iterable[Path],
+    root: Path,
+    *,
+    rows_by_path: dict[str, list[tuple[int, dict[str, Any]]]] | None = None,
+    force_session_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    outputs: list[dict[str, Any]] = []
+    bindings = active_session_bindings()
+    for path in sorted(set(paths)):
+        if not path.is_file():
+            continue
+        rows = (rows_by_path or {}).get(normalize_path(path))
+        meta = codex_meta_from_path(path, rows)
+        if not meta or not codex_meta_belongs_to_root(
+            meta,
+            root,
+            force_session_ids=force_session_ids,
+            bindings=bindings,
+        ):
+            continue
+        rows = rows if rows is not None else list(read_jsonl(path))
+        models = source_models_by_line(path, "codex", rows=rows)
+        session_id = str(meta.get("id") or meta.get("session_id") or path.stem)
+        imported = str(meta.get("external_agent_source") or "") == "claude"
+        external_path = Path(str(meta.get("external_agent_source_path"))) if meta.get("external_agent_source_path") else None
+        original_max = max_jsonl_timestamp(external_path) if imported else None
+        source_meta = meta.get("source") if isinstance(meta.get("source"), dict) else {}
+        spawn = (
+            source_meta.get("subagent", {}).get("thread_spawn", {})
+            if isinstance(source_meta.get("subagent"), dict)
+            else {}
+        )
+        is_subagent = bool(meta.get("thread_source") == "subagent" or source_meta)
+        parent_session_id = str(spawn.get("parent_thread_id") or "") or None
+        agent_id = str(spawn.get("agent_nickname") or session_id) if is_subagent else None
+        for line_no, obj in rows:
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            timestamp = parse_iso(obj.get("timestamp"))
+            if imported and original_max and timestamp and timestamp <= original_max:
+                continue
+            occurred_at = iso_z(timestamp) if timestamp else iso_z()
+            if obj.get("type") == "turn_context":
+                outputs.append(
+                    trace_candidate(
+                        platform="codex",
+                        session_id=session_id,
+                        timestamp=occurred_at,
+                        event_type="system_instruction",
+                        actor_role="system",
+                        structured=payload,
+                        path=path,
+                        line=line_no,
+                        raw_type="turn_context",
+                        turn_id=str(payload.get("turn_id") or "") or None,
+                        cwd=str(payload.get("cwd") or meta.get("cwd") or root),
+                        model=normalize_model(payload.get("model")),
+                        parent_session_id=parent_session_id,
+                        agent_id=agent_id,
+                        is_subagent=is_subagent,
+                    )
+                )
+                continue
+            if obj.get("type") != "response_item":
+                continue
+            payload_type = str(payload.get("type") or "response_item")
+            native_id = str(payload.get("id") or obj.get("id") or "") or None
+            common = {
+                "platform": "codex",
+                "session_id": session_id,
+                "timestamp": occurred_at,
+                "path": path,
+                "line": line_no,
+                "native_event_id": native_id,
+                "turn_id": codex_turn_id(payload),
+                "cwd": str(meta.get("cwd") or root),
+                "model": models.get(line_no) or normalize_model(meta.get("model")),
+                "phase": str(payload.get("phase") or "") or None,
+                "parent_session_id": parent_session_id,
+                "agent_id": agent_id,
+                "is_subagent": is_subagent,
+            }
+            if payload_type == "message":
+                role = str(payload.get("role") or "unknown")
+                content = payload.get("content")
+                blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+                for block_index, block in enumerate(blocks):
+                    if not isinstance(block, dict):
+                        block = {"type": "text", "text": str(block)}
+                    block_type = str(block.get("type") or "message_content")
+                    text = trace_text_from_value(block)
+                    if role == "user" and not is_automatic_prompt(text):
+                        continue
+                    event_type = {
+                        "assistant": "assistant_text",
+                        "developer": "developer_instruction",
+                        "system": "system_instruction",
+                        "user": "system_instruction",
+                    }.get(role, "message")
+                    outputs.append(
+                        trace_candidate(
+                            event_type=event_type,
+                            actor_role=role,
+                            structured=block,
+                            block_index=block_index,
+                            raw_type=f"message.{role}.{block_type}",
+                            **common,
+                        )
+                    )
+                continue
+            if payload_type == "reasoning":
+                event_type, actor_role = "reasoning", "assistant"
+            elif payload_type.endswith("_output") or payload_type in {"function_call_output"}:
+                event_type, actor_role = "tool_result", "tool"
+            elif payload_type.endswith("_call") or payload_type in {"function_call"}:
+                event_type, actor_role = "tool_call", "assistant"
+            else:
+                event_type, actor_role = "agent_event", "assistant"
+            outputs.append(
+                trace_candidate(
+                    event_type=event_type,
+                    actor_role=actor_role,
+                    structured=payload,
+                    raw_type=payload_type,
+                    tool_call_id=str(payload.get("call_id") or "") or None,
+                    actor_name=str(payload.get("name") or "") or None,
+                    **common,
+                )
+            )
+    return merge_model_output_copies(outputs)
+
+
+def merge_model_output_copies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: dict[tuple[str, ...], dict[str, Any]] = {}
+    for item in items:
+        key = (
+            str(item.get("platform") or ""),
+            str(item.get("session_id") or ""),
+            str(item.get("native_event_id") or ""),
+            str(item.get("event_type") or ""),
+            str(item.get("block_index") or 0),
+            trace_content_hash(str(item.get("text") or ""), item.get("structured")),
+        )
+        unique.setdefault(key, item)
+    return sorted(
+        unique.values(),
+        key=lambda item: (
+            str(item.get("timestamp") or ""),
+            str(item.get("platform") or ""),
+            str(item.get("session_id") or ""),
+            str(item.get("path") or ""),
+            int(item.get("line") or 0),
+        ),
+    )
 
 
 def merge_branch_copies(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2501,6 +3563,109 @@ def reconcile_candidates(
         "excluded_automatic_events": excluded,
         "excluded_out_of_scope_events": excluded_out_of_scope,
         "index_rebuilt": index_rebuilt,
+    }
+
+
+def prompt_event_for_model_output(
+    prompts: list[dict[str, Any]],
+    candidate: dict[str, Any],
+) -> str | None:
+    platform = str(candidate.get("platform") or "")
+    session_id = str(candidate.get("session_id") or "")
+    parent_session_id = str(candidate.get("parent_session_id") or "")
+    candidate_sessions = {value for value in (session_id, parent_session_id) if value}
+    turn_id = str(candidate.get("turn_id") or "")
+    source_path = normalize_path(candidate.get("path"))
+    source_line = int(candidate.get("line") or 0)
+    turn_matches: list[dict[str, Any]] = []
+    preceding: list[tuple[int, dict[str, Any]]] = []
+    temporal_preceding: list[dict[str, Any]] = []
+    for event in prompts:
+        source = event.get("source") if isinstance(event.get("source"), dict) else {}
+        session = event.get("session") if isinstance(event.get("session"), dict) else {}
+        if str(source.get("platform") or "") != platform:
+            continue
+        event_session = str(session.get("id") or "")
+        aliases = {str(value) for value in session.get("alias_ids", []) if value}
+        if not (candidate_sessions & ({event_session} | aliases)):
+            continue
+        if turn_id and str(session.get("turn_id") or "") == turn_id:
+            turn_matches.append(event)
+        references = [
+            (str(source.get("path") or ""), source.get("line")),
+            *[
+                (str(item.get("path") or ""), item.get("line"))
+                for item in source.get("refs", [])
+                if isinstance(item, dict)
+            ],
+        ]
+        for path_value, line_value in references:
+            try:
+                line_number = int(line_value)
+            except (TypeError, ValueError):
+                continue
+            if source_path and normalize_path(path_value) == source_path and line_number < source_line:
+                preceding.append((line_number, event))
+        if str(event.get("occurred_at") or "") <= str(candidate.get("timestamp") or ""):
+            temporal_preceding.append(event)
+    if turn_matches:
+        return str(max(turn_matches, key=event_order_key).get("event_id") or "") or None
+    if preceding:
+        return str(max(preceding, key=lambda item: item[0])[1].get("event_id") or "") or None
+    if temporal_preceding:
+        return str(max(temporal_preceding, key=event_order_key).get("event_id") or "") or None
+    return None
+
+
+def reconcile_model_outputs(
+    root: Path,
+    store: Path,
+    candidates: list[dict[str, Any]],
+) -> dict[str, int]:
+    config = read_json_object(store / "config.json")
+    privacy = config.get("privacy") if isinstance(config.get("privacy"), dict) else {}
+    if not bool(privacy.get("store_agent_trace", privacy.get("store_model_outputs", True))):
+        return {
+            "model_output_candidates": len(candidates),
+            "model_outputs_added": 0,
+            "model_outputs_skipped": len(candidates),
+        }
+    prompts = list(iter_active_events(store))
+    events: list[dict[str, Any]] = []
+    for candidate in candidates:
+        events.append(
+            build_model_output_event(
+                root=root,
+                platform=str(candidate["platform"]),
+                session_id=str(candidate["session_id"]),
+                occurred_at=str(candidate["timestamp"]),
+                event_type=str(candidate["event_type"]),
+                actor_role=str(candidate["actor_role"]),
+                output_text=str(candidate["text"]),
+                structured=candidate.get("structured"),
+                source_path=str(candidate["path"]),
+                source_line=int(candidate["line"]),
+                block_index=int(candidate.get("block_index") or 0),
+                raw_type=candidate.get("raw_type"),
+                native_event_id=candidate.get("native_event_id"),
+                turn_id=candidate.get("turn_id"),
+                cwd=candidate.get("cwd"),
+                model=candidate.get("model"),
+                phase=candidate.get("phase"),
+                prompt_event_id=prompt_event_for_model_output(prompts, candidate),
+                sanitation=candidate.get("sanitation"),
+                actor_name=candidate.get("actor_name"),
+                tool_call_id=candidate.get("tool_call_id"),
+                parent_session_id=candidate.get("parent_session_id"),
+                agent_id=candidate.get("agent_id"),
+                is_subagent=bool(candidate.get("is_subagent")),
+            )
+        )
+    added, skipped = append_model_outputs_bulk(store, events)
+    return {
+        "model_output_candidates": len(candidates),
+        "model_outputs_added": added,
+        "model_outputs_skipped": skipped,
     }
 
 
@@ -2773,10 +3938,26 @@ def incremental_backfill_project(
     if platform in {"all", "claude"}:
         folder = claude_project_dir(claude_home or (Path.home() / ".claude"), root)
         if folder:
-            for path in folder.glob("*.jsonl"):
+            for path in folder.rglob("*.jsonl"):
                 if not claude_source_belongs_to_root(path, root, bindings=bindings):
                     continue
                 paths[normalize_path(path)] = (path, "claude", path.stem)
+
+    # Codex stores every task in a global dated rollout tree rather than a
+    # project-specific folder. Prefer its optional desktop thread index to
+    # select exact-root session IDs before opening transcript metadata. CLI-only
+    # installations fall back to metadata scanning.
+    if platform in {"all", "codex"} and source_platform in {"codex", "unknown"}:
+        codex_base = codex_home or (Path.home() / ".codex")
+        for path in codex_project_paths(codex_base, root):
+            key = normalize_path(path)
+            if key in known or key in paths:
+                continue
+            meta = codex_meta_from_path(path)
+            if not meta:
+                continue
+            source_session_id = str(meta.get("id") or meta.get("session_id") or path.stem)
+            paths[key] = (path, "codex", source_session_id)
 
     rows_by_platform: dict[str, dict[str, list[tuple[int, dict[str, Any]]]]] = {
         "claude": {},
@@ -2813,11 +3994,19 @@ def incremental_backfill_project(
             changed_paths[key] = (path, kind, source_session_id)
 
     candidates: list[dict[str, Any]] = []
+    output_candidates: list[dict[str, Any]] = []
     claude_paths = [path for key, (path, kind, _) in changed_paths.items() if kind == "claude"]
     codex_paths = [path for key, (path, kind, _) in changed_paths.items() if kind == "codex"]
     if claude_paths:
         candidates.extend(
             collect_claude_candidates_from_paths(
+                claude_paths,
+                root,
+                rows_by_path=rows_by_platform["claude"],
+            )
+        )
+        output_candidates.extend(
+            collect_claude_model_outputs_from_paths(
                 claude_paths,
                 root,
                 rows_by_path=rows_by_platform["claude"],
@@ -2831,13 +4020,24 @@ def incremental_backfill_project(
                 rows_by_path=rows_by_platform["codex"],
             )
         )
+        output_candidates.extend(
+            collect_codex_model_outputs_from_paths(
+                codex_paths,
+                root,
+                rows_by_path=rows_by_platform["codex"],
+            )
+        )
     result = reconcile_candidates(
         root,
         store,
         candidates,
-        rebuild_index=rebuild_index,
+        rebuild_index=False,
         full_dataset=False,
     )
+    output_result = reconcile_model_outputs(root, store, output_candidates)
+    index_rebuilt = bool(rebuild_index and index_is_dirty(store))
+    if index_rebuilt:
+        rebuild_index_for_store(store)
     cursor_state.update(
         {
             "schema_version": "1.0.0",
@@ -2853,6 +4053,8 @@ def incremental_backfill_project(
         "sources_changed": len(changed_paths),
         "bytes_read": bytes_read,
         **result,
+        **output_result,
+        "index_rebuilt": index_rebuilt,
     }
 
 
@@ -2869,6 +4071,7 @@ def backfill_project(
         raise ValueError(f"Refusing broad project root: {root}")
     store, _ = init_store(root)
     candidates: list[dict[str, Any]] = []
+    output_candidates: list[dict[str, Any]] = []
     sources: dict[str, tuple[Path, str, str]] = {}
     claude_base = claude_home or (Path.home() / ".claude")
     codex_base = codex_home or (Path.home() / ".codex")
@@ -2879,7 +4082,7 @@ def backfill_project(
         bindings = active_session_bindings()
         claude_paths = sorted(
             path
-            for path in set((list(folder.glob("*.jsonl")) if folder else []) + bound_source_paths("claude", root))
+            for path in set((list(folder.rglob("*.jsonl")) if folder else []) + bound_source_paths("claude", root))
             if claude_source_belongs_to_root(path, root, bindings=bindings)
         )
         for path in claude_paths:
@@ -2903,22 +4106,34 @@ def backfill_project(
     }
     if claude_paths:
         candidates.extend(collect_claude_candidates_from_paths(claude_paths, root))
+        output_candidates.extend(collect_claude_model_outputs_from_paths(claude_paths, root))
     if codex_paths:
         candidates.extend(collect_codex_candidates_from_paths(codex_paths, root))
+        output_candidates.extend(collect_codex_model_outputs_from_paths(codex_paths, root))
     result = reconcile_candidates(
         root,
         store,
         candidates,
-        rebuild_index=rebuild_index,
+        rebuild_index=False,
         full_dataset=True,
     )
+    output_result = reconcile_model_outputs(root, store, output_candidates)
+    index_rebuilt = bool(rebuild_index)
+    if index_rebuilt:
+        rebuild_index_for_store(store)
     write_cursor_snapshots(
         store,
         snapshots,
         full_scan=True,
         scanned_platforms={"claude", "codex"} if platform == "all" else {platform},
     )
-    return {"mode": "full", "sources_scanned": len(sources), **result}
+    return {
+        "mode": "full",
+        "sources_scanned": len(sources),
+        **result,
+        **output_result,
+        "index_rebuilt": index_rebuilt,
+    }
 
 
 def backfill(args: argparse.Namespace) -> int:
@@ -3110,16 +4325,27 @@ def migrate_bound_session(
             root,
             force_session_ids={session_id},
         )
+        output_candidates = collect_codex_model_outputs_from_paths(
+            [source_path],
+            root,
+            force_session_ids={session_id},
+        )
     else:
         candidates = collect_claude_candidates_from_paths([source_path], root)
+        output_candidates = collect_claude_model_outputs_from_paths([source_path], root)
     candidates = [item for item in candidates if str(item.get("session_id") or "") == session_id]
+    output_candidates = [
+        item for item in output_candidates if str(item.get("session_id") or "") == session_id
+    ]
     result = reconcile_candidates(
         root,
         store,
         candidates,
-        rebuild_index=True,
+        rebuild_index=False,
         full_dataset=True,
     )
+    output_result = reconcile_model_outputs(root, store, output_candidates)
+    rebuild_index_for_store(store)
     snapshot = source_snapshot(source_path, platform, session_id)
     if snapshot:
         write_cursor_snapshots(
@@ -3133,7 +4359,13 @@ def migrate_bound_session(
         destination_root=root,
         destination_store=store,
     )
-    return {**result, **reassignment, "source_path": str(source_path)}
+    return {
+        **result,
+        **output_result,
+        **reassignment,
+        "index_rebuilt": True,
+        "source_path": str(source_path),
+    }
 
 
 def bind_session_command(args: argparse.Namespace) -> int:
@@ -3691,6 +4923,7 @@ def normalize_model(value: Any) -> str | None:
 def title_from_prompt(text: str, limit: int = 88) -> str:
     for raw in text.splitlines():
         line = re.sub(r"^[#>*\-\d.\s]+", "", raw).strip()
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
         if line:
             return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
     return "Untitled session"
@@ -3705,6 +4938,75 @@ def title_from_prompts(prompts: list[str]) -> str:
         if not text.lstrip().startswith("/"):
             return title
     return fallback
+
+
+def filename_component(value: Any, *, limit: int = 64, fallback: str = "unknown") -> str:
+    text = collapse_blank_lines(str(value or "")).replace("\n", " ").strip()
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[\[\](){}]", "-", text)
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", text)
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip(" .-_")
+    if not text:
+        text = fallback
+    return text[:limit].rstrip(" .-_") or fallback
+
+
+def session_markdown_filename(
+    key: tuple[str, str],
+    items: list[tuple[str, dict[str, Any]]],
+    used: set[str],
+) -> str:
+    ordered = sorted(items, key=trajectory_item_order_key)
+    first_event = ordered[0][1] if ordered else {}
+    occurred = parse_iso(first_event.get("occurred_at"))
+    timestamp = occurred.astimezone(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") if occurred else "unknown-time"
+    platform_name = filename_component(key[0], limit=24)
+    models = [
+        normalize_model(event.get("context", {}).get("model"))
+        for _, event in ordered
+        if isinstance(event.get("context"), dict)
+    ]
+    model = filename_component(next((value for value in models if value), "unknown-model"), limit=40)
+    prompt_texts = [
+        str(event.get("prompt", {}).get("text") or "")
+        for kind, event in ordered
+        if kind == "prompt"
+    ]
+    if prompt_texts:
+        topic = title_from_prompts(prompt_texts)
+    else:
+        agent_name = next(
+            (
+                str(event.get("session", {}).get("agent_id") or "")
+                for kind, event in ordered
+                if kind == "trace" and event.get("session", {}).get("agent_id")
+            ),
+            "",
+        )
+        readable = next(
+            (
+                str(
+                    (
+                        event.get("content")
+                        if isinstance(event.get("content"), dict)
+                        else event.get("output", {})
+                    ).get("text")
+                    or ""
+                )
+                for kind, event in ordered
+                if kind == "trace"
+            ),
+            "",
+        )
+        topic = f"subagent-{agent_name}" if agent_name else title_from_prompt(readable)
+    topic_part = filename_component(topic, limit=72, fallback="untitled-session")
+    stem = f"{timestamp}-{platform_name}-{model}-{topic_part}"
+    candidate = stem
+    if candidate.casefold() in used:
+        candidate = f"{stem}-{sha256_text('|'.join(key))[:8]}"
+    used.add(candidate.casefold())
+    return candidate + ".md"
 
 
 def build_derived_views(
@@ -3820,6 +5122,7 @@ def rebuild_session_metadata_for_store(store: Path, events: list[dict[str, Any]]
 def rebuild_index_for_store(store: Path) -> dict[str, Any]:
     raw_event_count = sum(1 for _ in iter_events(store))
     events = sorted(iter_active_events(store), key=event_order_key)
+    model_outputs = sorted(iter_model_outputs(store), key=model_output_order_key)
     event_ids = {str(event.get("event_id") or "") for event in iter_events(store)}
     superseded_ids = superseded_event_ids(store) & event_ids
     excluded_ids = excluded_event_ids(store) & event_ids
@@ -3833,6 +5136,9 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
     rebuild_session_metadata_for_store(store, events)
     event_views, sessions = build_derived_views(events, images_by_event, store=store)
     by_platform = collections.Counter(event.get("source", {}).get("platform") for event in events)
+    model_outputs_by_platform = collections.Counter(
+        event.get("source", {}).get("platform") for event in model_outputs
+    )
     by_session = collections.Counter(
         f"{event.get('source', {}).get('platform')}:{event.get('session', {}).get('id')}" for event in events
     )
@@ -3852,6 +5158,8 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
         "attachments_omitted": omissions,
         "image_count": len(prompt_images),
         "image_event_count": len(images_by_event),
+        "model_output_count": len(model_outputs),
+        "model_output_platform_counts": dict(sorted(model_outputs_by_platform.items())),
         "first_occurred_at": events[0].get("occurred_at") if events else None,
         "last_occurred_at": events[-1].get("occurred_at") if events else None,
     }
@@ -3887,6 +5195,435 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
                     ]
                 )
     atomic_write(store / "index" / "PROMPTS.md", "\n".join(lines))
+    prompt_numbers = {
+        str(event.get("event_id") or ""): number
+        for number, event in enumerate(events, 1)
+    }
+    prompt_by_id = {
+        str(event.get("event_id") or ""): event
+        for event in events
+        if event.get("event_id")
+    }
+    output_numbers = {
+        str(event.get("trace_event_id") or event.get("model_output_id") or ""): number
+        for number, event in enumerate(model_outputs, 1)
+    }
+    session_items: dict[tuple[str, str], list[tuple[str, dict[str, Any]]]] = (
+        collections.defaultdict(list)
+    )
+    subagent_parent: dict[tuple[str, str], tuple[str, str] | None] = {}
+    for event in events:
+        key = (
+            str(event.get("source", {}).get("platform") or "unknown"),
+            str(event.get("session", {}).get("id") or "unknown"),
+        )
+        session_items[key].append(("prompt", event))
+        subagent_parent.setdefault(key, None)
+    for event in model_outputs:
+        platform_name = str(event.get("source", {}).get("platform") or "unknown")
+        session_data = event.get("session") if isinstance(event.get("session"), dict) else {}
+        key = (platform_name, str(session_data.get("id") or "unknown"))
+        session_items[key].append(("trace", event))
+        parent_id = str(session_data.get("parent_session_id") or "")
+        subagent_parent[key] = (platform_name, parent_id) if parent_id else None
+
+    def session_turn_keys(key: tuple[str, str]) -> set[str]:
+        keys: set[str] = set()
+        items = session_items.get(key, [])
+        for kind, event in items:
+            session_data = event.get("session") if isinstance(event.get("session"), dict) else {}
+            native_turn_id = str(session_data.get("turn_id") or "")
+            if native_turn_id:
+                keys.add(f"native:{native_turn_id}")
+                continue
+            if kind == "prompt":
+                event_id = str(event.get("event_id") or "")
+                if event_id:
+                    keys.add(f"prompt:{event_id}")
+                continue
+            prompt_event_id = str(event.get("links", {}).get("prompt_event_id") or "")
+            if prompt_event_id:
+                linked_prompt = prompt_by_id.get(prompt_event_id, {})
+                linked_turn_id = str(linked_prompt.get("session", {}).get("turn_id") or "")
+                keys.add(
+                    f"native:{linked_turn_id}"
+                    if linked_turn_id
+                    else f"prompt:{prompt_event_id}"
+                )
+        return keys
+
+    def latest_turn_status(key: tuple[str, str]) -> str:
+        items = sorted(session_items.get(key, []), key=trajectory_item_order_key)
+        latest_prompt = next(
+            (event for kind, event in reversed(items) if kind == "prompt"),
+            None,
+        )
+        if not latest_prompt:
+            return "closed" if any(
+                kind == "trace"
+                and str(event.get("context", {}).get("phase") or "") == "final_answer"
+                for kind, event in items
+            ) else "open_or_interrupted"
+        latest_turn_id = str(latest_prompt.get("session", {}).get("turn_id") or "")
+        latest_prompt_id = str(latest_prompt.get("event_id") or "")
+        for kind, event in items:
+            if kind != "trace" or str(event.get("context", {}).get("phase") or "") != "final_answer":
+                continue
+            trace_turn_id = str(event.get("session", {}).get("turn_id") or "")
+            linked_prompt_id = str(event.get("links", {}).get("prompt_event_id") or "")
+            if (latest_turn_id and trace_turn_id == latest_turn_id) or (
+                latest_prompt_id and linked_prompt_id == latest_prompt_id
+            ):
+                return "closed"
+        return "open_or_interrupted"
+
+    def session_first_key(key: tuple[str, str]) -> tuple[Any, ...]:
+        items = session_items.get(key, [])
+        first = min((trajectory_item_order_key(item) for item in items), default=("",))
+        return (*first, key[0], key[1])
+
+    children: dict[tuple[str, str], list[tuple[str, str]]] = collections.defaultdict(list)
+    top_level: list[tuple[str, str]] = []
+    for key in session_items:
+        parent = subagent_parent.get(key)
+        if parent and parent in session_items and parent != key:
+            children[parent].append(key)
+        else:
+            top_level.append(key)
+    top_level.sort(key=session_first_key)
+    for values in children.values():
+        values.sort(key=session_first_key)
+
+    managed_session_dirs = {
+        "prompt": store / "index" / "prompt",
+        "modelout": store / "index" / "modelout",
+        "trajectory": store / "index" / "trajectory",
+    }
+    for folder in managed_session_dirs.values():
+        folder.mkdir(parents=True, exist_ok=True)
+    used_session_filenames: set[str] = set()
+    session_filenames: dict[tuple[str, str], str] = {}
+    for key in sorted(session_items, key=session_first_key):
+        session_filenames[key] = session_markdown_filename(
+            key,
+            session_items[key],
+            used_session_filenames,
+        )
+
+    manifest_path = store / "state" / "session-index-manifest.json"
+    prior_manifest = read_json_object(manifest_path)
+    prior_sessions = prior_manifest.get("sessions") if isinstance(prior_manifest.get("sessions"), dict) else {}
+    next_manifest: dict[str, dict[str, str]] = {}
+    expected_paths: set[Path] = set()
+    for key in sorted(session_items, key=session_first_key):
+        platform_name, session_id = key
+        items = sorted(session_items[key], key=trajectory_item_order_key)
+        prompts_for_session = [event for kind, event in items if kind == "prompt"]
+        traces_for_session = [event for kind, event in items if kind == "trace"]
+        filename = session_filenames[key]
+        session_key_text = f"{platform_name}:{session_id}"
+        fingerprint = session_projection_fingerprint(items, prompt_numbers, output_numbers)
+        next_manifest[session_key_text] = {"filename": filename, "fingerprint": fingerprint}
+        session_paths = {
+            name: folder / filename for name, folder in managed_session_dirs.items()
+        }
+        expected_paths.update(session_paths.values())
+        prior = prior_sessions.get(session_key_text) if isinstance(prior_sessions.get(session_key_text), dict) else {}
+        unchanged = (
+            prior.get("filename") == filename
+            and prior.get("fingerprint") == fingerprint
+            and all(path.is_file() for path in session_paths.values())
+        )
+        if not prior_manifest and all(path.is_file() for path in session_paths.values()):
+            unchanged = True
+        if unchanged:
+            continue
+        first_time = items[0][1].get("occurred_at") if items else None
+        last_time = items[-1][1].get("occurred_at") if items else None
+        parent_id = next(
+            (
+                str(event.get("session", {}).get("parent_session_id") or "")
+                for event in traces_for_session
+                if event.get("session", {}).get("parent_session_id")
+            ),
+            "",
+        )
+        agent_id = next(
+            (
+                str(event.get("session", {}).get("agent_id") or "")
+                for event in traces_for_session
+                if event.get("session", {}).get("agent_id")
+            ),
+            "",
+        )
+        metadata = [
+            f"- Platform: `{platform_name}`",
+            f"- Session: `{session_id}`",
+            f"- Time: `{first_time}` → `{last_time}`",
+            f"- Latest turn: `{latest_turn_status(key)}`",
+            f"- Parent session: `{parent_id or 'none'}`",
+            f"- Agent: `{agent_id or 'main'}`",
+            "",
+        ]
+
+        prompt_lines = ["# Session prompts", "", *metadata]
+        if not prompts_for_session:
+            prompt_lines.extend(["> No human prompt event was recorded for this session.", ""])
+        for event in prompts_for_session:
+            number = prompt_numbers.get(str(event.get("event_id") or ""), 0)
+            prompt_lines.extend(
+                render_trajectory_event(
+                    f"P{number:05d}" if number else "P-unlinked",
+                    "prompt",
+                    event,
+                    prompt_numbers,
+                )
+            )
+        atomic_write(session_paths["prompt"], "\n".join(prompt_lines))
+
+        modelout_lines = ["# Session model outputs and agent trace", "", *metadata]
+        if not traces_for_session:
+            modelout_lines.extend(["> No trace event was recorded for this session.", ""])
+        for event in traces_for_session:
+            trace_id = str(event.get("trace_event_id") or event.get("model_output_id") or "")
+            number = output_numbers.get(trace_id, 0)
+            modelout_lines.extend(
+                render_trajectory_event(
+                    f"O{number:05d}" if number else "O-unlinked",
+                    "trace",
+                    event,
+                    prompt_numbers,
+                )
+            )
+        atomic_write(session_paths["modelout"], "\n".join(modelout_lines))
+
+        session_trajectory_lines = [
+            "# Session trajectory",
+            "",
+            *metadata,
+            "> Conversation view: every turn starts with its human prompt, followed by all linked model and agent events.",
+            "",
+        ]
+        session_trajectory_lines.extend(
+            render_conversation_turns(
+                items,
+                prompt_by_id,
+                prompt_numbers,
+                turn_heading_level=2,
+                event_heading_level=3,
+            )
+        )
+        atomic_write(
+            session_paths["trajectory"],
+            "\n".join(session_trajectory_lines),
+        )
+    for folder in managed_session_dirs.values():
+        for stale in folder.glob("*.md"):
+            if stale not in expected_paths:
+                stale.unlink()
+    write_json(
+        manifest_path,
+        {
+            "schema_version": "1.0.0",
+            "generated_at": iso_z(),
+            "sessions": next_manifest,
+        },
+    )
+
+    total_turn_count = sum(len(session_turn_keys(key)) for key in session_items)
+    sessions_by_platform = collections.Counter(key[0] for key in session_items)
+    trajectory_lines = [
+        "# Project trajectories",
+        "",
+        f"- Project: `{events[0].get('project', {}).get('root') if events else model_outputs[0].get('project', {}).get('root') if model_outputs else store.parent}`",
+        f"- Total sessions: `{len(session_items)}`",
+        f"- Claude sessions: `{sessions_by_platform.get('claude', 0)}`",
+        f"- Codex sessions: `{sessions_by_platform.get('codex', 0)}`",
+        f"- Total turns: `{total_turn_count}`",
+        f"- Total human prompts: `{len(events)}`",
+        f"- Trace events: `{len(model_outputs)}`",
+        "",
+        "> Lightweight project-wide index. Complete content is stored in one full Markdown file per session under `trajectory/`.",
+        "",
+        "## Session index",
+        "",
+        "| Session | Platform | Session ID | Latest turn | Turns | Human prompts | Trace events | Per-session trajectory |",
+        "|---|---|---|---|---:|---:|---:|---|",
+    ]
+    ordered_session_keys = sorted(session_items, key=session_first_key)
+    for index_number, key in enumerate(ordered_session_keys, 1):
+        platform_name, session_id = key
+        items = session_items[key]
+        filename = session_filenames[key]
+        trajectory_lines.append(
+            "| "
+            f"`S{index_number:05d}` | `{platform_name}` | `{session_id}` | "
+            f"`{latest_turn_status(key)}` | "
+            f"{len(session_turn_keys(key))} | "
+            f"{sum(kind == 'prompt' for kind, _ in items)} | "
+            f"{sum(kind == 'trace' for kind, _ in items)} | "
+            f"[open](trajectory/{urllib.parse.quote(filename)}) |"
+        )
+    trajectory_lines.append("")
+    modelout_index_lines = [
+        "# Model outputs and agent trace",
+        "",
+        f"- Project: `{events[0].get('project', {}).get('root') if events else model_outputs[0].get('project', {}).get('root') if model_outputs else store.parent}`",
+        f"- Total sessions: `{len(session_items)}`",
+        f"- Trace events: `{len(model_outputs)}`",
+        "",
+        "> Lightweight project-wide index. Complete reasoning, tool traffic, injections, subagents, and assistant output remain in `modelout/<session>.md` and canonical `model-events/**/*.jsonl`.",
+        "",
+        "| Session | Platform | Session ID | Trace events | Full model output |",
+        "|---|---|---|---:|---|",
+    ]
+    for index_number, key in enumerate(ordered_session_keys, 1):
+        platform_name, session_id = key
+        items = session_items[key]
+        filename = session_filenames[key]
+        modelout_index_lines.append(
+            f"| `S{index_number:05d}` | `{platform_name}` | `{session_id}` | "
+            f"{sum(kind == 'trace' for kind, _ in items)} | "
+            f"[open](modelout/{urllib.parse.quote(filename)}) |"
+        )
+    modelout_index_lines.append("")
+    modelout_summary_lines = [
+        "## Final answers",
+        "",
+        "> Only complete final assistant answers are included. Open the linked per-session full file for reasoning, tools, injections, subagents, and structured payloads.",
+        "",
+    ]
+    trajectory_summary_lines = [
+        "## Compact conversation trajectories",
+        "",
+        "> Compact conversation view: complete human prompts plus complete final answers. Other trace categories are represented only by counts.",
+        "",
+    ]
+    for index_number, key in enumerate(ordered_session_keys, 1):
+        platform_name, session_id = key
+        items = sorted(session_items[key], key=trajectory_item_order_key)
+        filename = session_filenames[key]
+        final_answers = [
+            event
+            for kind, event in items
+            if kind == "trace"
+            and str(event.get("event_type") or "") == "assistant_text"
+            and str(event.get("context", {}).get("phase") or "") == "final_answer"
+        ]
+        if final_answers:
+            modelout_summary_lines.extend(
+                [
+                    f"### S{index_number:05d} · {platform_name} · `{session_id}`",
+                    "",
+                    f"- Full: [open](modelout/{urllib.parse.quote(filename)})",
+                    "",
+                ]
+            )
+            for answer_number, event in enumerate(final_answers, 1):
+                content = event.get("content") if isinstance(event.get("content"), dict) else event.get("output", {})
+                modelout_summary_lines.extend(
+                    [
+                        f"#### Final answer {answer_number:05d}",
+                        "",
+                        f"- Time: `{event.get('occurred_at')}`",
+                        f"- Turn: `{event.get('session', {}).get('turn_id') or 'none'}`",
+                        "",
+                        fenced(str(content.get("text") or "")),
+                        "",
+                    ]
+                )
+
+        turns: dict[str, list[tuple[str, dict[str, Any]]]] = collections.defaultdict(list)
+        local_prompt_turns = {
+            str(event.get("session", {}).get("turn_id") or "")
+            for kind, event in items
+            if kind == "prompt" and event.get("session", {}).get("turn_id")
+        }
+        for kind, event in items:
+            session_data = event.get("session") if isinstance(event.get("session"), dict) else {}
+            native_turn = str(session_data.get("turn_id") or "")
+            if kind == "prompt":
+                event_id = str(event.get("event_id") or "")
+                turn_key = f"native:{native_turn}" if native_turn else f"prompt:{event_id}"
+            else:
+                prompt_event_id = str(event.get("links", {}).get("prompt_event_id") or "")
+                linked_prompt = prompt_by_id.get(prompt_event_id, {})
+                linked_turn = str(linked_prompt.get("session", {}).get("turn_id") or "")
+                turn_key = (
+                    f"native:{native_turn}"
+                    if native_turn and native_turn in local_prompt_turns
+                    else f"native:{linked_turn}"
+                    if linked_turn
+                    else f"prompt:{prompt_event_id}"
+                    if prompt_event_id
+                    else "unlinked"
+                )
+            turns[turn_key].append((kind, event))
+        if turns:
+            trajectory_summary_lines.extend(
+                [
+                    f"### S{index_number:05d} · {platform_name} · `{session_id}`",
+                    "",
+                    f"- Full: [open](trajectory/{urllib.parse.quote(filename)})",
+                    "",
+                ]
+            )
+        ordered_turns = sorted(
+            turns.items(),
+            key=lambda pair: min(trajectory_item_order_key(item) for item in pair[1]),
+        )
+        for turn_number, (turn_key, turn_items) in enumerate(ordered_turns, 1):
+            prompts = [event for kind, event in turn_items if kind == "prompt"]
+            traces = [event for kind, event in turn_items if kind == "trace"]
+            final_turn_answers = [
+                event
+                for event in traces
+                if str(event.get("event_type") or "") == "assistant_text"
+                and str(event.get("context", {}).get("phase") or "") == "final_answer"
+            ]
+            counts = collections.Counter(str(event.get("event_type") or "unknown") for event in traces)
+            trajectory_summary_lines.extend(
+                [
+                    f"#### Turn {turn_number:05d}",
+                    "",
+                    f"- Native turn ID: `{turn_key.removeprefix('native:') if turn_key.startswith('native:') else 'unavailable'}`",
+                    f"- Trace summary: `{', '.join(f'{name}={count}' for name, count in sorted(counts.items())) or 'none'}`",
+                    "",
+                ]
+            )
+            for prompt_event in prompts:
+                trajectory_summary_lines.extend(
+                    [
+                        "##### HUMAN",
+                        "",
+                        fenced(str(prompt_event.get("prompt", {}).get("text") or "")),
+                        "",
+                    ]
+                )
+            for answer_event in final_turn_answers:
+                content = answer_event.get("content") if isinstance(answer_event.get("content"), dict) else answer_event.get("output", {})
+                trajectory_summary_lines.extend(
+                    [
+                        "##### ASSISTANT FINAL",
+                        "",
+                        fenced(str(content.get("text") or "")),
+                        "",
+                    ]
+                )
+    atomic_write(
+        store / "index" / "MODELOUT.md",
+        "\n".join([*modelout_index_lines, *modelout_summary_lines]),
+    )
+    atomic_write(
+        store / "index" / "TRAJECTORY.md",
+        "\n".join([*trajectory_lines, *trajectory_summary_lines]),
+    )
+    for obsolete in (
+        store / "index" / "MODELOUTEASY.md",
+        store / "index" / "TRAJECTORYEASY.md",
+    ):
+        with contextlib.suppress(FileNotFoundError):
+            obsolete.unlink()
     summary_lines = [
         "# Session summaries",
         "",
@@ -3969,6 +5706,44 @@ def scrub_store_secrets(store: Path) -> dict[str, int]:
         if changed:
             atomic_write(path, "\n".join(rendered) + "\n")
             files_changed += 1
+    model_events_root = store / "model-events"
+    if model_events_root.exists():
+        for path in sorted(model_events_root.rglob("*.jsonl")):
+            rendered = []
+            changed = False
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                if not raw.strip():
+                    rendered.append(raw)
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    rendered.append(raw)
+                    continue
+                content_key = "content" if isinstance(event.get("content"), dict) else "output"
+                content = event.get(content_key) if isinstance(event.get(content_key), dict) else None
+                if content is not None:
+                    clean, stats = sanitize_trace_value(content)
+                    count = int(stats.get("secret_redactions", 0))
+                    omitted = int(stats.get("attachments_omitted", 0))
+                    if count or omitted:
+                        clean["secret_redactions"] = int(content.get("secret_redactions", 0)) + count
+                        clean["attachments_omitted"] = int(content.get("attachments_omitted", 0)) + omitted
+                        text = str(clean.get("text") or "")
+                        clean["chars"] = len(text)
+                        clean["sha256"] = (
+                            trace_content_hash(text, clean.get("structured"))
+                            if event.get("record_type") == MODEL_OUTPUT_RECORD_TYPE
+                            else sha256_text(text)
+                        )
+                        event[content_key] = clean
+                        events_changed += 1
+                        redactions += count
+                        changed = True
+                rendered.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            if changed:
+                atomic_write(path, "\n".join(rendered) + "\n")
+                files_changed += 1
     return {
         "files_changed": files_changed,
         "events_changed": events_changed,
@@ -4167,7 +5942,11 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         if not reason:
             errors.append(f"exclusion {exclusion_id} is missing reason")
         excluded_ids.add(event_id)
-    active_ids = ids - superseded_ids - excluded_ids
+    active_ids = {
+        str(event.get("event_id") or "")
+        for event in iter_active_events(store)
+        if event.get("event_id")
+    }
     attachment_ids: set[str] = set()
     image_hashes: dict[Path, str] = {}
     image_count = 0
@@ -4206,6 +5985,69 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
             image_hashes[asset_path] = hashlib.sha256(asset_path.read_bytes()).hexdigest()
         if image_hashes[asset_path] != str(asset.get("sha256") or ""):
             errors.append(f"image hash mismatch for {attachment_id}")
+    model_output_ids: set[str] = set()
+    model_output_count = 0
+    linked_model_output_count = 0
+    for output_event in iter_model_outputs(store):
+        model_output_count += 1
+        output_id = str(
+            output_event.get("trace_event_id") or output_event.get("model_output_id") or ""
+        )
+        required_fields = ["schema_version", "record_type", "captured_at", "occurred_at"]
+        if output_event.get("record_type") == MODEL_OUTPUT_RECORD_TYPE:
+            required_fields.extend(["trace_event_id", "event_type", "actor", "content"])
+        else:
+            required_fields.append("model_output_id")
+        for field in required_fields:
+            if not output_event.get(field):
+                errors.append(f"missing {field} in model output #{model_output_count}")
+        if output_id in model_output_ids:
+            errors.append(f"duplicate model_output_id {output_id}")
+        model_output_ids.add(output_id)
+        content = output_event.get("content")
+        if not isinstance(content, dict):
+            content = output_event.get("output", {})
+        text = str(content.get("text") or "")
+        digest = str(content.get("sha256") or "")
+        expected_digest = (
+            trace_content_hash(text, content.get("structured"))
+            if output_event.get("record_type") == MODEL_OUTPUT_RECORD_TYPE
+            else sha256_text(text)
+        )
+        if digest != expected_digest:
+            errors.append(f"model output hash mismatch for {output_id}")
+        if trace_value_matches_patterns(content, BASE64_PATTERNS):
+            errors.append(f"embedded attachment data remains in {output_id}")
+        if trace_value_matches_patterns(content, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in {output_id}")
+        prompt_event_id = str(output_event.get("links", {}).get("prompt_event_id") or "")
+        if prompt_event_id:
+            linked_model_output_count += 1
+            if prompt_event_id not in ids:
+                errors.append(
+                    f"model output {output_id} references missing prompt_event_id {prompt_event_id}"
+                )
+        if not is_within(output_event.get("project", {}).get("root"), root):
+            errors.append(f"project root mismatch in {output_id}")
+    if not index_is_dirty(store):
+        required_indexes = (
+            "PROMPTS.md",
+            "MODELOUT.md",
+            "TRAJECTORY.md",
+        )
+        for name in required_indexes:
+            if not (store / "index" / name).is_file():
+                errors.append(f"derived index is missing: index/{name}")
+        session_view_names: dict[str, set[str]] = {}
+        for directory in ("prompt", "modelout", "trajectory"):
+            folder = store / "index" / directory
+            if not folder.is_dir():
+                errors.append(f"per-session index directory is missing: index/{directory}")
+                session_view_names[directory] = set()
+                continue
+            session_view_names[directory] = {path.name for path in folder.glob("*.md")}
+        if len({frozenset(names) for names in session_view_names.values()}) > 1:
+            errors.append("per-session prompt/modelout/trajectory filenames do not match")
     config_path = store / "config.json"
     if not config_path.exists():
         errors.append("config.json is missing")
@@ -4261,6 +6103,8 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         "image_count": image_count,
         "active_image_count": active_image_count,
         "image_file_count": len(image_hashes),
+        "model_output_count": model_output_count,
+        "linked_model_output_count": linked_model_output_count,
         "active_session_binding_count": len(project_bindings),
         "auto_sync": {
             "status": auto_sync_state.get("status") or "never_run",
@@ -4321,14 +6165,26 @@ def parser() -> argparse.ArgumentParser:
         help="recover the latest Codex human prompt from a Stop hook payload",
     )
     stop_recovery.add_argument("--project", type=Path)
-    stop_recovery.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    stop_recovery.add_argument(
+        "--codex-home",
+        type=Path,
+        default=native_agent_home("CODEX_HOME", ".codex"),
+    )
     stop_recovery.set_defaults(func=capture_stop_recovery)
 
     fill = sub.add_parser("backfill", help="backfill historical Claude/Codex prompts for one project")
     fill.add_argument("--project", type=Path)
     fill.add_argument("--platform", choices=("all", "claude", "codex"), default="all")
-    fill.add_argument("--claude-home", type=Path, default=Path.home() / ".claude")
-    fill.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    fill.add_argument(
+        "--claude-home",
+        type=Path,
+        default=native_agent_home("CLAUDE_CONFIG_DIR", ".claude"),
+    )
+    fill.add_argument(
+        "--codex-home",
+        type=Path,
+        default=native_agent_home("CODEX_HOME", ".codex"),
+    )
     fill.add_argument("--rebuild-index", action="store_true")
     fill.set_defaults(func=backfill)
 
@@ -4342,8 +6198,16 @@ def parser() -> argparse.ArgumentParser:
     bind.add_argument("--source-path", type=Path)
     bind.add_argument("--reason", default="explicit")
     bind.add_argument("--migrate", action="store_true")
-    bind.add_argument("--claude-home", type=Path, default=Path.home() / ".claude")
-    bind.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    bind.add_argument(
+        "--claude-home",
+        type=Path,
+        default=native_agent_home("CLAUDE_CONFIG_DIR", ".claude"),
+    )
+    bind.add_argument(
+        "--codex-home",
+        type=Path,
+        default=native_agent_home("CODEX_HOME", ".codex"),
+    )
     bind.set_defaults(func=bind_session_command)
 
     bindings = sub.add_parser("list-bindings", help="list active session-to-project bindings")
@@ -4359,8 +6223,16 @@ def parser() -> argparse.ArgumentParser:
     automatic.add_argument("--trigger", default="manual")
     automatic.add_argument("--source-path", type=Path)
     automatic.add_argument("--force", action="store_true")
-    automatic.add_argument("--claude-home", type=Path, default=Path.home() / ".claude")
-    automatic.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
+    automatic.add_argument(
+        "--claude-home",
+        type=Path,
+        default=native_agent_home("CLAUDE_CONFIG_DIR", ".claude"),
+    )
+    automatic.add_argument(
+        "--codex-home",
+        type=Path,
+        default=native_agent_home("CODEX_HOME", ".codex"),
+    )
     automatic.set_defaults(func=auto_sync_command)
 
     rebuild = sub.add_parser("rebuild-index", help="rebuild catalog.json and PROMPTS.md")

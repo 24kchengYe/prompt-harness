@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.10.0 - 2026-07-16
+
+- Archive Claude Code and Codex execution facts as append-only typed `agent_trace` events: assistant text, reasoning/thinking, tool calls/results, system/developer injection, runtime system events, and subagent traffic.
+- Generate `index/MODELOUT.md` with chronological `O` labels, stable `trace_event_id` values, actor/type/model/phase/subagent provenance, structured JSON payloads, and links to prompt `event_id` values.
+- Generate project-wide `index/TRAJECTORY.md`, isolating all conversations by platform/session and nesting separately identified subagent trajectories under their parent conversation.
+- Generate matching per-session Markdown files under `index/prompt/`, `index/modelout/`, and `index/trajectory/`, named from UTC time, platform, model, and the first human prompt-derived session topic.
+- Render trajectory files as native-turn conversational groups: all human messages in one `turn_id` appear before linked injections, reasoning, tool calls/results, subagent facts, and assistant answers, regardless of raw transcript write order.
+- Reconcile output-only transcript tails so a completed assistant response is added even when no new human prompt appears in that incremental chunk.
+- Add trace privacy configuration, recursive secret/binary redaction, schema validation, `doctor` coverage, and Claude/Codex/subagent regression tests.
+- Fix `doctor` falsely treating the `[REDACTED_SECRET]` placeholder as a remaining secret.
+- Add project trajectory totals for sessions, platforms, turns, prompts, trace events, and latest-turn closure.
+- Add a plugin `Stop` hook so model output and trajectory projections close each turn automatically.
+- Fix incremental Codex discovery so new sibling tasks with the same exact launch directory are added after first initialization.
+- Replace per-event model-output rescanning with locked bulk deduplication and append for large historical backfills.
+- Keep project-wide `MODELOUT.md` as final-answer aggregation and `TRAJECTORY.md` as prompt/final-answer conversation aggregation while retaining complete per-session projections.
+- Replace intermediate event bodies in project-wide trajectories with compact type counts, without truncating prompts or final answers.
+- Fingerprint per-session derived projections so routine hook rebuilds do not rewrite unchanged large Markdown files.
+- Read the latest Codex prompt from the end of the rollout for Stop handling instead of parsing the complete growing transcript in the foreground.
+- Honor `CODEX_HOME` and `CLAUDE_CONFIG_DIR` in automatic discovery, Stop recovery, backfill, and session migration so non-default Windows and cross-platform data directories remain discoverable.
+- Use Codex Desktop's read-only thread index when available to select exact-project rollout IDs before opening transcripts, avoiding a first-use metadata scan across very large unrelated global session trees.
+- Materialize the three lightweight indexes immediately on the first live capture, so a new project shows prompt/session files before detached historical trace reconciliation finishes.
+
 ## 0.8.1 - 2026-07-15
 
 - Allow a user's home directory to host its own Prompt Harness ledger now that automatic ownership requires exact launch-directory equality.

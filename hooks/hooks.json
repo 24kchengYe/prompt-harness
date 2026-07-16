@@ -12,6 +12,19 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import glob,os,runpy,sys; r=os.environ.get('PLUGIN_ROOT',''); h=os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex'); c=[os.path.join(r,'hooks','run_stop_capture.py')]+glob.glob(os.path.join(h,'plugins','cache','*','prompt-harness','*','hooks','run_stop_capture.py')); c=[p for p in c if os.path.isfile(p)]; sys.exit(0) if not c else runpy.run_path(max(c,key=os.path.getmtime),run_name='__main__')\"",
+            "commandWindows": "python -c \"import glob,os,runpy,sys; r=os.environ.get('PLUGIN_ROOT',''); h=os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex'); c=[os.path.join(r,'hooks','run_stop_capture.py')]+glob.glob(os.path.join(h,'plugins','cache','*','prompt-harness','*','hooks','run_stop_capture.py')); c=[p for p in c if os.path.isfile(p)]; sys.exit(0) if not c else runpy.run_path(max(c,key=os.path.getmtime),run_name='__main__')\"",
+            "timeout": 20,
+            "statusMessage": "Archiving complete agent turn"
+          }
+        ]
+      }
     ]
   }
 }

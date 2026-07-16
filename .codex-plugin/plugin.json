@@ -1,7 +1,7 @@
 {
   "name": "prompt-harness",
-  "version": "0.8.1",
-  "description": "Automatically initialize and reconcile a private per-project ledger of human prompts and user-sent images from Claude Code and Codex.",
+  "version": "0.10.0",
+  "description": "Automatically reconcile a private per-project ledger of human prompts, user images, and complete structured agent traces from Claude Code and Codex.",
   "author": {
     "name": "24kchengYe",
     "url": "https://github.com/24kchengYe"
@@ -19,17 +19,20 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Prompt Harness",
-    "shortDescription": "Keep a private prompt ledger per project.",
-    "longDescription": "Prompt Harness captures each human prompt and user-sent image, isolates automatic history by exact session project root, survives plugin upgrades in long-lived Codex tasks, supports explicit session-to-project routing, performs one first-use history discovery, then reconciles only changed transcript tails in a detached background process.",
+    "shortDescription": "Keep private prompt and agent-trace facts per project.",
+    "longDescription": "Prompt Harness captures human prompts and user images in real time, reconciles assistant text, reasoning, tool traffic, injected instructions, and subagent events from Claude Code and Codex transcripts, isolates history by exact session project root, and maintains private append-only facts with rebuildable Markdown views.",
     "developerName": "24kchengYe",
     "category": "Productivity",
     "capabilities": [
       "UserPromptSubmit hook",
+      "Stop hook turn closure",
       "version-resilient hook launcher",
       "exact project-root session isolation",
       "automatic project bootstrap and reconciliation",
       "explicit session-to-project binding and append-only migration",
       "historical backfill",
+      "structured agent trace archive",
+      "lightweight project indexes and per-session trajectory views",
       "user image archive",
       "offline prompt timeline",
       "prompt search",

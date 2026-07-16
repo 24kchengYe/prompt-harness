@@ -9,7 +9,7 @@ import subprocess
 import sys
 import unittest
 import uuid
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -239,6 +239,505 @@ class PromptHarnessTests(unittest.TestCase):
         self.assertIn("claude:opened-claude-session", state["sessions"])
         self.assertEqual(ph.doctor_store(store, project)["auto_sync"]["status"], "completed")
 
+    def test_backfill_archives_claude_and_codex_model_outputs(self) -> None:
+        base = retained_workspace("model-outputs")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
+        claude_path = claude_home / "projects" / encoded / "claude-session.jsonl"
+        write_jsonl(
+            claude_path,
+            [
+                {
+                    "type": "user",
+                    "uuid": "claude-user",
+                    "promptId": "claude-turn-one",
+                    "timestamp": "2026-07-16T00:00:00Z",
+                    "cwd": str(project),
+                    "message": {"role": "user", "content": "Claude prompt"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "claude-output",
+                    "parentUuid": "claude-user",
+                    "timestamp": "2026-07-16T00:00:01Z",
+                    "cwd": str(project),
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "stop_reason": "end_turn",
+                        "content": [
+                            {"type": "thinking", "thinking": "private reasoning"},
+                            {"type": "text", "text": "Claude visible answer api_key=secret-value-123"},
+                            {"type": "tool_use", "name": "Read", "input": {"file_path": "private.txt"}},
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "claude-tool-result",
+                    "parentUuid": "claude-output",
+                    "timestamp": "2026-07-16T00:00:02Z",
+                    "cwd": str(project),
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "claude-tool",
+                                "content": "tool returned password=secret-value-456",
+                                "is_error": False
+                            }
+                        ]
+                    }
+                },
+            ],
+        )
+        claude_subagent_path = (
+            claude_path.parent
+            / "claude-session"
+            / "subagents"
+            / "agent-worker.jsonl"
+        )
+        write_jsonl(
+            claude_subagent_path,
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "claude-subagent-output",
+                    "timestamp": "2026-07-16T00:00:03Z",
+                    "cwd": str(project),
+                    "isSidechain": True,
+                    "agentId": "worker",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{"type": "text", "text": "subagent answer"}]
+                    }
+                }
+            ],
+        )
+        codex_path = codex_home / "sessions" / "2026" / "rollout-codex-session.jsonl"
+        write_jsonl(
+            codex_path,
+            [
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "codex-session", "cwd": str(project), "model": "codex-test"},
+                },
+                {
+                    "type": "turn_context",
+                    "timestamp": "2026-07-16T00:00:59Z",
+                    "payload": {
+                        "turn_id": "turn-one",
+                        "cwd": str(project),
+                        "model": "codex-test",
+                        "summary": "auto"
+                    }
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:00:59Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "<recommended_plugins>plugin metadata</recommended_plugins><environment_context><cwd>project</cwd></environment_context>"
+                            }
+                        ],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"}
+                    }
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:00:59Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "developer injected instruction"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"}
+                    }
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Codex prompt"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"},
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Codex follow-up in same turn"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"},
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:00Z",
+                    "payload": {
+                        "type": "reasoning",
+                        "id": "codex-reasoning",
+                        "summary": [{"type": "summary_text", "text": "Codex reasoning"}],
+                        "encrypted_content": "opaque-reasoning",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"}
+                    }
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:00Z",
+                    "payload": {
+                        "type": "function_call",
+                        "id": "codex-call",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"pwd\"}",
+                        "call_id": "call-one",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"}
+                    }
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:00Z",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-one",
+                        "output": "tool output",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"}
+                    }
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:01Z",
+                    "payload": {
+                        "type": "message",
+                        "id": "codex-output",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "Codex visible answer"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-one"},
+                    },
+                },
+            ],
+        )
+
+        first = ph.backfill_project(
+            project,
+            platform="all",
+            claude_home=claude_home,
+            codex_home=codex_home,
+            rebuild_index=True,
+        )
+        second = ph.backfill_project(
+            project,
+            platform="all",
+            claude_home=claude_home,
+            codex_home=codex_home,
+            rebuild_index=True,
+        )
+        store = project / ".prompt-harness"
+        outputs = list(ph.iter_model_outputs(store))
+        prompts = list(ph.iter_active_events(store))
+        self.assertEqual(first["model_outputs_added"], 12)
+        self.assertEqual(second["model_outputs_added"], 0)
+        self.assertEqual(len(outputs), 12)
+        self.assertEqual(len(prompts), 3)
+        event_types = {output["event_type"] for output in outputs}
+        self.assertTrue(
+            {
+                "assistant_text",
+                "reasoning",
+                "tool_call",
+                "tool_result",
+                "developer_instruction",
+                "system_instruction",
+            }.issubset(event_types)
+        )
+        self.assertTrue(any(output["session"]["is_subagent"] for output in outputs))
+        rendered = (store / "index" / "MODELOUT.md").read_text(encoding="utf-8")
+        self.assertIn("Lightweight project-wide index", rendered)
+        trajectory = (store / "index" / "TRAJECTORY.md").read_text(encoding="utf-8")
+        self.assertIn("# Project trajectories", trajectory)
+        self.assertIn("- Total sessions: `3`", trajectory)
+        self.assertIn("- Claude sessions: `2`", trajectory)
+        self.assertIn("- Codex sessions: `1`", trajectory)
+        self.assertIn("- Total turns: `3`", trajectory)
+        self.assertIn(
+            "| `S00001` | `claude` | `claude-session` | `closed` | 1 | 1 |",
+            trajectory,
+        )
+        prompt_files = sorted((store / "index" / "prompt").glob("*.md"))
+        modelout_files = sorted((store / "index" / "modelout").glob("*.md"))
+        trajectory_files = sorted((store / "index" / "trajectory").glob("*.md"))
+        self.assertEqual(len(prompt_files), 3)
+        self.assertEqual(
+            [path.name for path in prompt_files],
+            [path.name for path in modelout_files],
+        )
+        self.assertEqual(
+            [path.name for path in prompt_files],
+            [path.name for path in trajectory_files],
+        )
+        self.assertTrue(all("claude" in path.name or "codex" in path.name for path in prompt_files))
+        full_modelout = "\n".join(path.read_text(encoding="utf-8") for path in modelout_files)
+        self.assertIn("Claude visible answer api_key=[REDACTED_SECRET]", full_modelout)
+        self.assertIn("Codex visible answer", full_modelout)
+        self.assertIn("private reasoning", full_modelout)
+        self.assertIn("private.txt", full_modelout)
+        self.assertIn("Codex reasoning", full_modelout)
+        self.assertIn("developer injected instruction", full_modelout)
+        self.assertIn("plugin metadata", full_modelout)
+        self.assertIn("subagent answer", full_modelout)
+        self.assertIn("password=[REDACTED_SECRET]", full_modelout)
+        self.assertIn("Claude visible answer api_key=[REDACTED_SECRET]", rendered)
+        self.assertIn("Codex visible answer", trajectory)
+        self.assertNotIn("private reasoning", rendered)
+        self.assertNotIn("private.txt", trajectory)
+        self.assertNotIn("[truncated;", rendered)
+        self.assertNotIn("[truncated;", trajectory)
+        self.assertLess(trajectory.index("Claude prompt"), trajectory.index("Claude visible answer"))
+        self.assertLess(trajectory.index("Codex prompt"), trajectory.index("Codex visible answer"))
+        self.assertFalse((store / "index" / "MODELOUTEASY.md").exists())
+        self.assertFalse((store / "index" / "TRAJECTORYEASY.md").exists())
+        claude_trajectory = next(path for path in trajectory_files if "Claude-prompt" in path.name)
+        self.assertIn(
+            "- Native turn ID: `claude-turn-one`",
+            claude_trajectory.read_text(encoding="utf-8"),
+        )
+        subagent_prompt = next(path for path in prompt_files if "subagent-worker" in path.name)
+        self.assertIn(
+            "No human prompt event was recorded",
+            subagent_prompt.read_text(encoding="utf-8"),
+        )
+        codex_trajectory = next(path for path in trajectory_files if "Codex-prompt" in path.name)
+        codex_text = codex_trajectory.read_text(encoding="utf-8")
+        self.assertIn("## Turn 00001", codex_text)
+        self.assertIn("- Human messages: `2`", codex_text)
+        self.assertLess(codex_text.index("Codex prompt"), codex_text.index("Codex visible answer"))
+        self.assertLess(
+            codex_text.index("Codex follow-up in same turn"),
+            codex_text.index("Codex visible answer"),
+        )
+        self.assertLess(codex_text.index("Codex prompt"), codex_text.index("developer injected instruction"))
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["model_output_count"], 12)
+
+    def test_incremental_tail_adds_assistant_output_without_new_prompt(self) -> None:
+        base = retained_workspace("model-output-tail")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        rollout = codex_home / "sessions" / "2026" / "rollout-output-tail.jsonl"
+        write_jsonl(
+            rollout,
+            [
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "output-tail", "cwd": str(project), "model": "codex-test"},
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "wait for output"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "tail-turn"},
+                    },
+                },
+            ],
+        )
+        first = ph.auto_sync_project(
+            project,
+            source_platform="codex",
+            session_id="output-tail",
+            trigger="test",
+            source_path=rollout,
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(first["model_outputs_added"], 0)
+        with rollout.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-07-16T00:00:01Z",
+                        "payload": {
+                            "type": "message",
+                            "id": "tail-output",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "tail answer"}],
+                            "internal_chat_message_metadata_passthrough": {"turn_id": "tail-turn"},
+                        },
+                    }
+                )
+                + "\n"
+            )
+        second = ph.auto_sync_project(
+            project,
+            source_platform="codex",
+            session_id="output-tail",
+            trigger="test",
+            source_path=rollout,
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        store = project / ".prompt-harness"
+        self.assertEqual(second["mode"], "incremental")
+        self.assertEqual(second["added"], 0)
+        self.assertEqual(second["model_outputs_added"], 1)
+        self.assertTrue(second["index_rebuilt"])
+        output = list(ph.iter_model_outputs(store))[0]
+        prompt = list(ph.iter_active_events(store))[0]
+        self.assertEqual(output["links"]["prompt_event_id"], prompt["event_id"])
+        self.assertIn(
+            "tail answer",
+            (store / "index" / "MODELOUT.md").read_text(encoding="utf-8"),
+        )
+
+    def test_incremental_sync_discovers_new_codex_sibling_session(self) -> None:
+        base = retained_workspace("codex-sibling-discovery")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        codex_home = base / ".codex"
+        first_rollout = codex_home / "sessions" / "2026" / "07" / "rollout-first.jsonl"
+        write_jsonl(
+            first_rollout,
+            [
+                {"type": "session_meta", "payload": {"id": "first-session", "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "first prompt"}],
+                    },
+                },
+            ],
+        )
+        first = ph.auto_sync_project(
+            project,
+            source_platform="codex",
+            session_id="first-session",
+            trigger="test",
+            source_path=first_rollout,
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(first["mode"], "full")
+
+        sibling_rollout = codex_home / "sessions" / "2026" / "07" / "rollout-sibling.jsonl"
+        write_jsonl(
+            sibling_rollout,
+            [
+                {"type": "session_meta", "payload": {"id": "sibling-session", "cwd": str(project)}},
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-16T00:01:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "sibling prompt"}],
+                    },
+                },
+            ],
+        )
+        second = ph.auto_sync_project(
+            project,
+            source_platform="codex",
+            session_id="first-session",
+            trigger="test",
+            source_path=first_rollout,
+            claude_home=claude_home,
+            codex_home=codex_home,
+        )
+        self.assertEqual(second["mode"], "incremental")
+        self.assertEqual(second["added"], 1)
+        self.assertEqual(len(list(ph.iter_active_events(project / ".prompt-harness"))), 2)
+        self.assertEqual(len(list((project / ".prompt-harness" / "index" / "trajectory").glob("*.md"))), 2)
+        trajectory = (project / ".prompt-harness" / "index" / "TRAJECTORY.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("| Session | Platform | Session ID | Latest turn |", trajectory)
+        self.assertIn("`open_or_interrupted`", trajectory)
+
+    def test_codex_desktop_index_avoids_opening_unrelated_rollouts(self) -> None:
+        base = retained_workspace("codex-state-index")
+        project = base / "project"
+        project.mkdir()
+        codex_home = base / ".codex"
+        target_id = "019f0000-0000-7000-8000-000000000001"
+        unrelated_id = "019f0000-0000-7000-8000-000000000002"
+        state = codex_home / "state_5.sqlite"
+        state.parent.mkdir(parents=True)
+        sqlite = __import__("sqlite3")
+        with sqlite.connect(state) as connection:
+            connection.execute("CREATE TABLE threads (id TEXT, cwd TEXT)")
+            connection.executemany(
+                "INSERT INTO threads (id, cwd) VALUES (?, ?)",
+                (
+                    (target_id, str(project)),
+                    (unrelated_id, str(base / "other")),
+                ),
+            )
+        target = codex_home / "sessions" / "2026" / "07" / f"rollout-{target_id}.jsonl"
+        unrelated = codex_home / "sessions" / "2026" / "07" / f"rollout-{unrelated_id}.jsonl"
+        write_jsonl(
+            target,
+            [{"type": "session_meta", "payload": {"id": target_id, "cwd": str(project)}}],
+        )
+        unrelated.parent.mkdir(parents=True, exist_ok=True)
+        unrelated.write_text("not json and must not be opened\n", encoding="utf-8")
+
+        paths = ph.codex_project_paths(codex_home, project)
+
+        self.assertEqual(paths, [target])
+
+    def test_bulk_model_output_append_deduplicates_without_rescanning_per_event(self) -> None:
+        base = retained_workspace("bulk-model-output")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        events = [
+            ph.build_model_output_event(
+                root=project,
+                platform="codex",
+                session_id="bulk-session",
+                occurred_at=f"2026-07-16T00:00:0{index}Z",
+                event_type="assistant_text",
+                actor_role="assistant",
+                output_text=f"output {index}",
+                structured=None,
+                source_path=str(base / "rollout.jsonl"),
+                source_line=index + 1,
+                block_index=0,
+            )
+            for index in range(3)
+        ]
+        first = ph.append_model_outputs_bulk(store, events)
+        second = ph.append_model_outputs_bulk(store, events)
+        self.assertEqual(first, (3, 0))
+        self.assertEqual(second, (0, 3))
+        self.assertEqual(len(list(ph.iter_model_outputs(store))), 3)
+
     def test_full_backfill_requires_exact_session_root_unless_bound(self) -> None:
         base = retained_workspace("exact-root-backfill")
         project = base / "project"
@@ -465,6 +964,62 @@ class PromptHarnessTests(unittest.TestCase):
         self.assertIn("auto-sync", command)
         self.assertIn("existing-task", command)
         self.assertIn(str(project), command)
+
+    def test_first_hook_materializes_indexes_before_background_sync(self) -> None:
+        base = retained_workspace("initial-hook-index")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        args = type("Args", (), {"platform": "codex", "project": None})()
+        payload = {
+            "session_id": "initial-index-session",
+            "turn_id": "turn-one",
+            "cwd": str(project),
+            "prompt": "首次对话应立即出现索引",
+            "timestamp": "2026-07-16T12:30:00.000Z",
+        }
+
+        with mock.patch.dict(os.environ, {"PROMPT_HARNESS_DISABLE_AUTO_SYNC": "1"}):
+            self.assertEqual(ph.capture_hook_payload(args, payload), 0)
+
+        store = project / ".prompt-harness"
+        self.assertTrue((store / "index" / "PROMPTS.md").is_file())
+        self.assertTrue((store / "index" / "MODELOUT.md").is_file())
+        trajectory = (store / "index" / "TRAJECTORY.md").read_text(encoding="utf-8")
+        self.assertIn("首次对话应立即出现索引", trajectory)
+
+    def test_hook_scheduler_uses_windows_detached_process_flags(self) -> None:
+        base = retained_workspace("auto-sync-windows-schedule")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        fake_process = type("Process", (), {"pid": 4321})()
+        fake_os = mock.Mock(wraps=os)
+        fake_os.name = "nt"
+        with mock.patch.dict(os.environ, {"PROMPT_HARNESS_DISABLE_AUTO_SYNC": ""}):
+            with mock.patch.object(ph, "os", fake_os):
+                with mock.patch.object(ph, "file_lock", side_effect=lambda *args, **kwargs: nullcontext()):
+                    with mock.patch.object(ph.subprocess, "Popen", return_value=fake_process) as popen:
+                        result = ph.schedule_auto_sync(
+                            project,
+                            store,
+                            source_platform="codex",
+                            session_id="windows-task",
+                            trigger="user_prompt_submit",
+                        )
+        self.assertTrue(result["scheduled"])
+        kwargs = popen.call_args.kwargs
+        expected = getattr(ph.subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
+            ph.subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0x00000200,
+        )
+        self.assertEqual(kwargs["creationflags"], expected)
+        self.assertNotIn("start_new_session", kwargs)
+        self.assertIs(kwargs["stdin"], ph.subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], ph.subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], ph.subprocess.DEVNULL)
 
     def test_pending_sync_requests_are_coalesced_without_deletion(self) -> None:
         base = retained_workspace("pending-sync")
@@ -754,9 +1309,24 @@ class PromptHarnessTests(unittest.TestCase):
                     "timestamp": "2026-01-01T00:00:00Z",
                     "payload": {
                         "id": "codex-imported",
+                        "timestamp": "2026-01-01T00:00:00Z",
                         "cwd": str(project),
                         "external_agent_source": "claude",
                         "external_agent_source_path": str(claude_project / "branch-one.jsonl"),
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "打开 Claude 导入会话归档：Imported task",
+                            }
+                        ],
                     },
                 },
                 {
@@ -786,9 +1356,13 @@ class PromptHarnessTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ph.backfill(args), 0)
         events = list(ph.iter_events(project / ".prompt-harness"))
-        self.assertEqual(len(events), 3)
+        self.assertEqual(len(events), 4)
         self.assertEqual(sum(event["prompt"]["text"] == "first human prompt" for event in events), 2)
         self.assertNotIn("mirrored prompt", {event["prompt"]["text"] for event in events})
+        self.assertIn(
+            "打开 Claude 导入会话归档：Imported task",
+            {event["prompt"]["text"] for event in events},
+        )
         self.assertIn("native codex continuation", {event["prompt"]["text"] for event in events})
         merged = next(event for event in events if event["source"].get("native_event_id") == "native-a")
         self.assertEqual(len(merged["source"]["refs"]), 2)
@@ -939,6 +1513,63 @@ Recent Codex tasks in this project:
         self.assertNotIn(fake_pat, (store / "index" / "PROMPTS.md").read_text(encoding="utf-8"))
         self.assertTrue(ph.doctor_store(store, project)["ok"])
 
+    def test_scrub_store_repairs_structured_agent_trace_secrets(self) -> None:
+        base = retained_workspace("scrub-trace-secrets")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        event = ph.build_model_output_event(
+            root=project,
+            platform="codex",
+            session_id="trace-secret-session",
+            occurred_at="2026-07-16T00:00:00Z",
+            event_type="tool_result",
+            actor_role="tool",
+            output_text="safe summary",
+            structured={"output": "api_key = previously-unrecognized-secret-value"},
+            source_path=str(base / "rollout.jsonl"),
+            source_line=1,
+            block_index=0,
+        )
+        event["content"]["structured"]["output"] = "api_key = newly-recognized-secret-value"
+        event["content"]["sha256"] = ph.trace_content_hash(
+            event["content"]["text"],
+            event["content"]["structured"],
+        )
+        self.assertTrue(ph.append_model_output(store, event))
+        result = ph.scrub_store_secrets(store)
+        self.assertEqual(result["events_changed"], 1)
+        repaired = list(ph.iter_model_outputs(store))[0]
+        self.assertIn(
+            "[REDACTED_SECRET]",
+            repaired["content"]["structured"]["output"],
+        )
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
+    def test_doctor_does_not_match_trace_secrets_across_json_escaped_newlines(self) -> None:
+        base = retained_workspace("doctor-trace-newlines")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        event = ph.build_model_output_event(
+            root=project,
+            platform="codex",
+            session_id="trace-newline-session",
+            occurred_at="2026-07-16T00:00:00Z",
+            event_type="tool_result",
+            actor_role="tool",
+            output_text="api_key =\nfrom client.model_config import get_api_key_for_model",
+            structured={
+                "output": "api_key =\nfrom client.model_config import get_api_key_for_model"
+            },
+            source_path=str(base / "rollout.jsonl"),
+            source_line=1,
+            block_index=0,
+        )
+        self.assertTrue(ph.append_model_output(store, event))
+        ph.rebuild_index_for_store(store)
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
     def test_stable_turn_id_is_idempotent(self) -> None:
         base = retained_workspace("stable-turn")
         project = base / "project"
@@ -1061,7 +1692,12 @@ Recent Codex tasks in this project:
             ],
         )
         payload = {"session_id": session_id, "cwd": str(project)}
-        first = ph.recover_codex_stop(payload, project=project, codex_home=codex_home)
+        with mock.patch.object(
+            ph,
+            "source_models_by_line",
+            side_effect=AssertionError("Stop recovery must tail from the end"),
+        ):
+            first = ph.recover_codex_stop(payload, project=project, codex_home=codex_home)
         second = ph.recover_codex_stop(payload, project=project, codex_home=codex_home)
         self.assertTrue(first["captured"])
         self.assertEqual(second["reason"], "already_recorded")
@@ -1149,12 +1785,14 @@ Recent Codex tasks in this project:
             project_root=project,
         )
         self.assertEqual(len(list(ph.iter_active_events(store))), 2)
+        self.assertEqual(ph.doctor_store(store, project)["active_event_count"], 2)
         ph.append_session_binding(
             platform="codex",
             session_id="descendant-session",
             project_root=other,
         )
         self.assertEqual([event["event_id"] for event in ph.iter_active_events(store)], [exact["event_id"]])
+        self.assertEqual(ph.doctor_store(store, project)["active_event_count"], 1)
 
     def test_stop_recovery_missing_session_does_not_select_latest_unrelated_rollout(self) -> None:
         base = retained_workspace("stop-recovery-missing-session")

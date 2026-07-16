@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/agent-trace-event.schema.json",
+  "title": "Prompt Harness agent trace event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "trace_event_id",
+    "captured_at",
+    "occurred_at",
+    "event_type",
+    "source",
+    "project",
+    "session",
+    "actor",
+    "content",
+    "context",
+    "links"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "agent_trace"},
+    "trace_event_id": {"type": "string", "pattern": "^ate_[0-9a-f]{32}$"},
+    "model_output_id": {"type": "string", "pattern": "^ate_[0-9a-f]{32}$"},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "event_type": {
+      "enum": [
+        "assistant_text",
+        "assistant_content",
+        "reasoning",
+        "tool_call",
+        "tool_result",
+        "system_instruction",
+        "developer_instruction",
+        "system_event",
+        "agent_event",
+        "message"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "required": ["mode", "platform", "path", "line", "block_index", "raw_type"]
+    },
+    "project": {"type": "object"},
+    "session": {
+      "type": "object",
+      "required": ["id", "transcript_path", "is_subagent"]
+    },
+    "actor": {
+      "type": "object",
+      "required": ["role", "name"]
+    },
+    "content": {
+      "type": "object",
+      "required": [
+        "text",
+        "structured",
+        "sha256",
+        "chars",
+        "secret_redactions",
+        "attachments_omitted"
+      ],
+      "properties": {
+        "text": {"type": "string"},
+        "structured": {},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "chars": {"type": "integer", "minimum": 0},
+        "secret_redactions": {"type": "integer", "minimum": 0},
+        "attachments_omitted": {"type": "integer", "minimum": 0}
+      }
+    },
+    "context": {"type": "object"},
+    "links": {
+      "type": "object",
+      "required": ["prompt_event_id", "tool_call_id", "parent_trace_event_id"],
+      "properties": {
+        "prompt_event_id": {
+          "type": ["string", "null"],
+          "pattern": "^phe_[0-9a-f]{32}$"
+        },
+        "tool_call_id": {"type": ["string", "null"]},
+        "parent_trace_event_id": {
+          "type": ["string", "null"],
+          "pattern": "^ate_[0-9a-f]{32}$"
+        }
+      }
+    }
+  }
+}

@@ -54,6 +54,72 @@ Each line in `events/YYYY/MM/prompts-YYYY-MM-DD.jsonl` is one self-contained JSO
 - Generated indexes are never canonical and may be overwritten.
 - A future badcase record references `event_id`; it does not copy or mutate the source prompt.
 
+## Agent trace event
+
+Complete local execution facts are stored separately under
+`model-events/YYYY/MM/model-outputs-YYYY-MM-DD.jsonl`. Each row uses the
+`agent_trace` envelope and has a stable `trace_event_id` (`ate_...`). The
+compatibility alias `model_output_id` contains the same value.
+
+```json
+{
+  "schema_version": "1.0.0",
+  "record_type": "agent_trace",
+  "trace_event_id": "ate_<stable hash>",
+  "event_type": "assistant_text | reasoning | tool_call | tool_result | system_instruction | developer_instruction | system_event | agent_event",
+  "source": {
+    "platform": "claude | codex",
+    "path": "...",
+    "line": 42,
+    "block_index": 0,
+    "raw_type": "assistant.thinking"
+  },
+  "session": {
+    "id": "native session id",
+    "turn_id": null,
+    "parent_session_id": null,
+    "agent_id": null,
+    "is_subagent": false
+  },
+  "actor": {
+    "role": "assistant | tool | system | developer",
+    "name": null
+  },
+  "content": {
+    "text": "readable projection, possibly empty",
+    "structured": {"type": "native payload"},
+    "sha256": "...",
+    "chars": 20,
+    "secret_redactions": 0,
+    "attachments_omitted": 0
+  },
+  "links": {
+    "prompt_event_id": "phe_... or null",
+    "tool_call_id": "native call id or null",
+    "parent_trace_event_id": null
+  }
+}
+```
+
+One native content block becomes one trace event. Structured tool arguments,
+results, reasoning payloads, injected instructions, runtime context, and
+subagent content are retained after recursive secret/binary sanitation.
+`index/MODELOUT.md` is a readable projection with chronological `O00001`
+labels. `index/TRAJECTORY.md` is the project-wide interaction projection:
+all sessions are present and isolated by `(platform, session_id)`. Inside each
+session, events are grouped by native `turn_id`; every Turn renders all human
+messages first in source order, then its linked trace events in
+timestamp/path/line/block order. Subagent sessions remain separately
+identified, nest under a known parent, and use the linked parent prompt as
+their conversational anchor.
+
+For Codex, `session.turn_id` is copied from the native rollout turn metadata.
+Claude does not expose the same field: Prompt Harness follows `parentUuid`
+ancestry to the nearest human user row and stores that row's `promptId`, or its
+`uuid` as fallback, in the normalized `session.turn_id` slot.
+Unlinked facts are shown after prompt-backed turns. Derived labels may change
+after older history is recovered, while `trace_event_id` remains stable.
+
 ## Derived prompt numbers
 
 `P00001`, `P00002`, and similar labels exist only in generated views. They are the one-based chronological rank of active events, ordered first by `occurred_at` and then by deterministic transcript provenance for exact timestamp ties. Backfilling an earlier event intentionally renumbers later P labels. The stable cross-rebuild identity is always `event_id`.

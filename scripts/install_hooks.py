@@ -137,7 +137,7 @@ def update_stop_recovery_file(
                         "type": "command",
                         "command": stop_recovery_command(script),
                         "timeout": 20,
-                        "statusMessage": "Recovering legacy task prompt",
+                        "statusMessage": "Archiving complete agent turn",
                     }
                 ]
             }
@@ -155,7 +155,7 @@ def update_stop_recovery_file(
         "changed": True,
         "backup": str(backup_path) if backup_path else None,
         "action": "removed" if remove else "installed",
-        "hook": "Stop recovery",
+        "hook": "Stop turn sync",
     }
 
 
