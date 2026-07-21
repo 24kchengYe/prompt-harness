@@ -90,6 +90,48 @@
       "prompt": "I launch general Claude and Codex sessions directly from C:\\Users\\ASUS. Keep their ledger at C:\\Users\\ASUS\\.prompt-harness without absorbing sessions launched from any child project.",
       "expected_output": "The user home is accepted as a project root, exact-home sessions are captured and backfilled in place, descendant sessions remain out of scope unless explicitly bound, user-level registry files can coexist with project fact directories, and filesystem roots remain rejected.",
       "files": []
+    },
+    {
+      "id": 16,
+      "prompt": "This project contains a user correction saying the Windows hook still did not produce an event. Detect it as a possible badcase, but do not declare model failure, rewrite prompts, or register a test.",
+      "expected_output": "A deterministic review-only candidate links the correction prompt, preceding prompt, intervening trace IDs, session, and model; repeated detection is idempotent and explicitly records that the detector does not assert failure.",
+      "files": []
+    },
+    {
+      "id": 17,
+      "prompt": "Confirm one pending badcase with exact red/green conditions, merge a repeated report into it, dismiss a clarification-only candidate, then put the Harness compensation into probation without deleting history.",
+      "expected_output": "Append-only decisions and case events preserve every candidate, the confirmed case has a red-capable failure contract, BADCASES.md and its compact evidence view rebuild, and issue status remains separate from active/stable/probation/retired Harness lifecycle.",
+      "files": []
+    },
+    {
+      "id": 18,
+      "prompt": "Turn three related confirmed badcases into one Feature Chain, prove the old fixture fails at the correct checkpoint, prove the fixed fixture passes every required checkpoint, then run it with another independent chain through Test Hub.",
+      "expected_output": "The chain remains proposed until Red/Green preflight passes; coverage is bidirectional, unknown/missing/duplicate markers fail, mixed Test Hub results remain independent, failures preserve evidence, and a fixed rerun cleans only new passing artifacts.",
+      "files": []
+    },
+    {
+      "id": 19,
+      "prompt": "Pin one confirmed case to a private project snapshot and replay it through two deterministic fake model adapters without leaking the correction, historical answer, root cause, fix, or judge oracle.",
+      "expected_output": "A stable sanitized snapshot distinguishes dirty state, adapters require protocol approval, both runs share one case/snapshot, hidden fields are absent from model input, and timeout/nonzero/malformed adapter failures have separate attribution and evidence.",
+      "files": []
+    },
+    {
+      "id": 20,
+      "prompt": "The deterministic replay fails. Propose the smallest instruction compensation, approve it only if baseline still fails and compensated replay passes, activate it, then evaluate whether new uncompensated cross-model passes justify probation or retirement.",
+      "expected_output": "Compensation starts proposed, approval records baseline and compensated runs, activation is explicit, policy recommendations are read-only, probation omits compensation while retaining guards, retirement preserves history, and a later recurrence recommends reactivation.",
+      "files": []
+    },
+    {
+      "id": 21,
+      "prompt": "Create an ordered recovery Task Case with two phases, cleanup, exclusions, blocker handling, and one linked badcase. Bind a child agent to this exact local project and record completion twice.",
+      "expected_output": "Task approval localizes Red to one phase and Green passes both, Test Hub runs it, case coverage is bidirectional, remote/wrong roots are rejected, and repeated child completion evidence is idempotent without leaking to another project.",
+      "files": []
+    },
+    {
+      "id": 22,
+      "prompt": "Set strict attempt/token/cost limits for one replay case, run a matrix that exceeds them, rebuild all human views, and corrupt one record in each adaptive ledger before running doctor in a disposable copy.",
+      "expected_output": "Execution stops at the approved budget, policy history is retained, BADCASES/TEST_HUB/CONTEXT/HTML rebuild deterministically, and doctor identifies invalid IDs, references, transitions, approvals, snapshots, evidence paths, secrets, and stale views per ledger.",
+      "files": []
     }
   ]
 }

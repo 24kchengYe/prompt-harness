@@ -52,6 +52,13 @@ class PromptHarnessTests(unittest.TestCase):
         else:
             os.environ["PROMPT_HARNESS_HOME"] = self._prior_harness_home
 
+    def test_windows_drive_unc_and_extended_paths_normalize_portably(self) -> None:
+        self.assertEqual(ph.normalize_path("C:\\Work\\Repo\\"), "c:/work/repo")
+        self.assertEqual(ph.normalize_path(r"\\?\C:\Work\Repo"), "c:/work/repo")
+        self.assertEqual(ph.normalize_path("\\\\Server\\Share\\Repo\\"), "//server/share/repo")
+        self.assertTrue(ph.is_within(r"C:\Work\Repo\child", Path(r"C:\Work\Repo")))
+        self.assertFalse(ph.is_within(r"C:\Work\Other", Path(r"C:\Work\Repo")))
+
     def test_backfill_matches_legacy_image_prompt_by_native_identity(self) -> None:
         base = retained_workspace("legacy-image-identity")
         project = base / "project"
@@ -855,6 +862,43 @@ class PromptHarnessTests(unittest.TestCase):
         )
         self.assertEqual(codex_only["sources"], {"claude": claude, "current": current})
 
+    def test_incremental_sync_prunes_missing_selected_source_cursor(self) -> None:
+        base = retained_workspace("missing-source-cursor")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        codex_home = base / ".codex"
+        store, _ = ph.init_store(project)
+        missing = codex_home / "archived_sessions" / "rollout-missing.jsonl"
+        ph.write_cursor_snapshots(
+            store,
+            {
+                ph.normalize_path(missing): {
+                    "path": str(missing),
+                    "platform": "codex",
+                    "session_id": "missing-session",
+                    "size": 100,
+                    "mtime_ns": 1,
+                    "byte_offset": 100,
+                    "line_count": 1,
+                    "trailing_newline": True,
+                }
+            },
+            full_scan=False,
+        )
+
+        result = ph.incremental_backfill_project(
+            project,
+            platform="codex",
+            source_platform="codex",
+            session_id="current-session",
+            codex_home=codex_home,
+        )
+
+        self.assertEqual(result["mode"], "incremental")
+        self.assertEqual(result["sources_known"], 0)
+        self.assertEqual(ph.read_source_cursors(store)["sources"], {})
+
     def test_backfill_keeps_distinct_messages_in_the_same_codex_turn(self) -> None:
         base = retained_workspace("same-turn")
         project = base / "project"
@@ -1120,6 +1164,7 @@ class PromptHarnessTests(unittest.TestCase):
         prompts = (store / "index" / "PROMPTS.md").read_text(encoding="utf-8")
         self.assertIn(f"![P00001 image 1](../{images[0]['asset']['path']})", prompts)
         self.assertIn("assets/", (store / ".gitignore").read_text(encoding="utf-8"))
+        self.assertIn("badcases/", (store / ".gitignore").read_text(encoding="utf-8"))
         self.assertTrue(ph.doctor_store(store, project)["ok"])
 
     def test_backfill_images_is_idempotent_for_claude_and_codex(self) -> None:
@@ -2175,6 +2220,1289 @@ Recent Codex tasks in this project:
         self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
         payload = json.loads(completed.stdout.decode("utf-8"))
         self.assertEqual(payload[0]["prompt"]["text"], "编码检查 ⚠")
+
+    def test_badcase_detector_creates_review_only_candidate_with_trace_evidence(self) -> None:
+        base = retained_workspace("badcase-detect")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        first = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="更新 Windows Hook 并验证",
+            session_id="badcase-session",
+            occurred_at="2026-07-18T01:00:00.000Z",
+            turn_id="turn-one",
+        )
+        correction = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="还是没有生成事件，Windows Hook 仍然不工作",
+            session_id="badcase-session",
+            occurred_at="2026-07-18T01:02:00.000Z",
+            turn_id="turn-two",
+        )
+        self.assertTrue(ph.append_event(store, first))
+        trace = ph.build_model_output_event(
+            root=project,
+            platform="codex",
+            session_id="badcase-session",
+            occurred_at="2026-07-18T01:01:00.000Z",
+            event_type="assistant_text",
+            actor_role="assistant",
+            output_text="已经修复 Windows Hook。",
+            structured=None,
+            source_path=str(base / "rollout.jsonl"),
+            source_line=10,
+            turn_id="turn-one",
+            model="gpt-test",
+            phase="final_answer",
+            prompt_event_id=first["event_id"],
+        )
+        self.assertTrue(ph.append_model_output(store, trace))
+        self.assertTrue(ph.append_event(store, correction))
+
+        detected = ph.detect_badcase_candidates(store)
+        self.assertEqual(detected["added"], 1)
+        repeated = ph.detect_badcase_candidates(store)
+        self.assertEqual(repeated["added"], 0)
+        self.assertFalse(repeated["trace_scan"])
+        candidate = list(ph.iter_badcase_candidates(store))[0]
+        self.assertFalse(candidate["detector"]["asserts_failure"])
+        self.assertEqual(
+            candidate["evidence"]["prompt_event_ids"],
+            [first["event_id"], correction["event_id"]],
+        )
+        self.assertIn(trace["trace_event_id"], candidate["evidence"]["trace_event_ids"])
+        self.assertEqual(candidate["session"]["models"], ["gpt-test"])
+
+        catalog = ph.rebuild_index_for_store(store)
+        self.assertEqual(catalog["badcases"]["candidate_count"], 1)
+        index = (store / "index" / "BADCASES.md").read_text(encoding="utf-8")
+        self.assertIn("Pending review: `1`", index)
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
+
+    def test_badcase_confirmation_merge_dismiss_and_lifecycle_are_append_only(self) -> None:
+        base = retained_workspace("badcase-lifecycle")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+
+        prompts = []
+        for number, text in enumerate(
+            (
+                "实现自动刷新",
+                "不对，自动刷新后还是没有内容",
+                "修复会话顺序",
+                "顺序还是不对，会话混在一起",
+                "更新说明",
+                "你漏了验证步骤",
+            ),
+            1,
+        ):
+            event = ph.build_event(
+                root=project,
+                platform="codex",
+                source_mode="backfill",
+                prompt_text=text,
+                session_id="lifecycle-session",
+                occurred_at=f"2026-07-18T02:{number:02d}:00.000Z",
+                turn_id=f"turn-{number}",
+            )
+            self.assertTrue(ph.append_event(store, event))
+            prompts.append(event)
+
+        result = ph.detect_badcase_candidates(store)
+        self.assertEqual(result["added"], 3)
+        candidates = list(ph.iter_badcase_candidates(store))
+        first_candidate, merge_candidate, dismiss_candidate = candidates
+        self.assertEqual(len({item["source_prompt_event_id"] for item in candidates}), 3)
+        self.assertEqual(len({item["fingerprint"] for item in candidates}), 3)
+        self.assertEqual(
+            [item["proposal"]["title"] for item in candidates],
+            [
+                "不对，自动刷新后还是没有内容",
+                "顺序还是不对，会话混在一起",
+                "你漏了验证步骤",
+            ],
+        )
+        confirmed = ph.confirm_badcase_candidate(
+            store,
+            candidate_id=first_candidate["candidate_id"],
+            title="自动刷新未写入内容",
+            phenomenon="刷新完成但索引没有新增内容",
+            red_condition="同步结束后索引仍缺少新事件",
+            green_condition="同步结束后索引包含对应事件 ID",
+            expected_failure_reason="旧实现只更新原始事件文件而没有重建索引",
+            category="index_consistency Authorization: Bearer test-secret-value",
+            severity="high",
+            guard_type="integration password=test-guard-secret",
+            verification="运行一次增量同步并检查 BADCASES 索引",
+            root_cause="索引刷新遗漏",
+            fix_method=None,
+        )
+        case_id = confirmed["case_id"]
+        merged = ph.decide_badcase_candidate(
+            store,
+            candidate_id=merge_candidate["candidate_id"],
+            action="merged",
+            reason="属于同一个索引一致性工作流",
+            target_case_id=case_id,
+        )
+        self.assertTrue(merged["changed"])
+        merge_event_count = len(list(ph.iter_badcase_case_events(store)))
+        repeated_merge = ph.decide_badcase_candidate(
+            store,
+            candidate_id=merge_candidate["candidate_id"],
+            action="merged",
+            reason="重复调用不应追加第二个 merge update",
+            target_case_id=case_id,
+        )
+        self.assertFalse(repeated_merge["changed"])
+        self.assertEqual(len(list(ph.iter_badcase_case_events(store))), merge_event_count)
+        dismissed = ph.decide_badcase_candidate(
+            store,
+            candidate_id=dismiss_candidate["candidate_id"],
+            action="dismissed",
+            reason="只是要求补充验证，不足以证明发生 badcase",
+        )
+        self.assertTrue(dismissed["changed"])
+        updated = ph.update_badcase_case(
+            store,
+            case_id=case_id,
+            patch={
+                "status": "resolved",
+                "last_checked_at": "2026-07-18T03:00:00.000Z",
+                "harness": {"lifecycle": "probation"},
+            },
+            note="新模型在不注入补偿规则时连续通过，进入观察期",
+        )
+        self.assertTrue(updated["changed"])
+
+        cases = ph.active_badcase_cases(store)
+        self.assertEqual(cases[case_id]["status"], "resolved")
+        self.assertEqual(cases[case_id]["harness"]["lifecycle"], "probation")
+        self.assertNotIn("test-secret-value", cases[case_id]["category"])
+        self.assertNotIn("test-guard-secret", cases[case_id]["acceptance"]["guard_type"])
+        self.assertEqual(len(cases[case_id]["source_candidate_ids"]), 2)
+        decisions = ph.badcase_candidate_decisions(store)
+        self.assertEqual(decisions[first_candidate["candidate_id"]]["action"], "confirmed")
+        self.assertEqual(decisions[merge_candidate["candidate_id"]]["action"], "merged")
+        self.assertEqual(decisions[dismiss_candidate["candidate_id"]]["action"], "dismissed")
+
+        ph.rebuild_index_for_store(store)
+        detail = (store / "index" / "badcase" / f"{case_id}.md").read_text(encoding="utf-8")
+        self.assertIn("Red condition: 同步结束后索引仍缺少新事件", detail)
+        self.assertIn("Harness lifecycle: `probation`", detail)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["badcase_candidate_count"], 3)
+        self.assertEqual(doctor["badcase_case_count"], 1)
+        ph.update_badcase_case(
+            store,
+            case_id=case_id,
+            patch={"status": "recurred", "recurrence_analysis": None},
+            note="corruption fixture: recurrence lacks analysis",
+        )
+        ph.rebuild_index_for_store(store)
+        invalid = ph.doctor_store(store, project)
+        self.assertFalse(invalid["ok"])
+        self.assertTrue(any("requires checked recurrence analysis" in value for value in invalid["errors"]))
+
+    def test_feature_chain_red_green_approval_and_test_hub_evidence_lifecycle(self) -> None:
+        base = retained_workspace("feature-chain-red-green")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        first = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="实现状态保存",
+            session_id="feature-chain-session",
+            occurred_at="2026-07-18T05:00:00.000Z",
+            turn_id="turn-one",
+        )
+        correction = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="还是没有保存，刷新后状态又丢了",
+            session_id="feature-chain-session",
+            occurred_at="2026-07-18T05:01:00.000Z",
+            turn_id="turn-two",
+        )
+        self.assertTrue(ph.append_event(store, first))
+        self.assertTrue(ph.append_event(store, correction))
+        ph.detect_badcase_candidates(store)
+        candidate = next(ph.iter_badcase_candidates(store))
+        case_id = ph.confirm_badcase_candidate(
+            store,
+            candidate_id=candidate["candidate_id"],
+            title="状态刷新后丢失",
+            phenomenon="刷新后恢复旧状态",
+            red_condition="刷新后状态丢失",
+            green_condition="刷新后保留新状态",
+            expected_failure_reason="旧实现没有持久化状态",
+            category="persistence",
+            severity="high",
+            guard_type="feature-chain",
+            verification="运行保存和刷新流程",
+            root_cause="状态只保存在内存",
+            fix_method="写入持久化存储",
+        )["case_id"]
+        proposed = ph.create_feature_chain(
+            store,
+            title="状态保存与刷新",
+            entry="修改状态并刷新",
+            exit_check="刷新后仍显示新状态",
+            checkpoint_title="状态已持久化",
+            checkpoint_check="刷新后必须恢复新状态",
+            case_ids=[case_id],
+        )
+        chain_id = proposed["chain_id"]
+        ph.attach_feature_chain_case(
+            store,
+            chain_id=chain_id,
+            checkpoint_title="页面恢复正确状态",
+            checkpoint_check="页面必须显示持久化后的状态",
+            case_id=case_id,
+        )
+
+        runner = project / "feature_chain_runner.py"
+        runner.write_text(
+            "import os, pathlib, sys, time\n"
+            "mode = sys.argv[1]\n"
+            "if mode == 'red':\n"
+            "    print('PH_CHECKPOINT:状态已持久化:FAIL:old symptom returned')\n"
+            "    print('PH_CHECKPOINT:页面恢复正确状态:PASS')\n"
+            "elif mode == 'fail-green':\n"
+            "    print('PH_CHECKPOINT:状态已持久化:PASS')\n"
+            "    print('PH_CHECKPOINT:页面恢复正确状态:FAIL:refresh lost state')\n"
+            "    pathlib.Path(os.environ['PROMPT_HARNESS_RUN_DIR'], 'state.txt').write_text('lost', encoding='utf-8')\n"
+            "elif mode == 'missing':\n"
+            "    print('PH_CHECKPOINT:状态已持久化:PASS')\n"
+            "elif mode == 'unknown':\n"
+            "    print('PH_CHECKPOINT:状态已持久化:PASS')\n"
+            "    print('PH_CHECKPOINT:页面恢复正确状态:PASS')\n"
+            "    print('PH_CHECKPOINT:未注册步骤:PASS')\n"
+            "elif mode == 'timeout':\n"
+            "    time.sleep(2)\n"
+            "else:\n"
+            "    print('PH_CHECKPOINT:状态已持久化:PASS')\n"
+            "    print('PH_CHECKPOINT:页面恢复正确状态:PASS')\n"
+            "    pathlib.Path(os.environ['PROMPT_HARNESS_RUN_DIR'], 'temporary.txt').write_text('ok', encoding='utf-8')\n"
+            "",
+            encoding="utf-8",
+        )
+
+        command = lambda mode: {"argv": [sys.executable, str(runner), mode]}
+        rejected = ph.approve_feature_chain(
+            store,
+            root=project,
+            chain_id=chain_id,
+            red_command=command("green"),
+            green_command=command("green"),
+            expected_red_reason="old symptom returned",
+        )
+        self.assertFalse(rejected["changed"])
+        self.assertEqual(rejected["reason"], "approval_preflight_failed")
+        self.assertEqual(ph.active_feature_chains(store)[chain_id]["status"], "proposed")
+
+        approved = ph.approve_feature_chain(
+            store,
+            root=project,
+            chain_id=chain_id,
+            red_command=command("red"),
+            green_command=command("green"),
+            expected_red_reason="old symptom returned",
+        )
+        self.assertTrue(approved["changed"])
+        self.assertTrue(approved["dry_run"]["passed"])
+        chain = ph.active_feature_chains(store)[chain_id]
+        self.assertEqual(chain["status"], "approved")
+        self.assertFalse(any((store / "badcases" / "runs" / run_id).exists() for run_id in approved["dry_run"]["run_ids"]))
+        duplicate_chain_id = ph.create_feature_chain(
+            store,
+            title="刷新后状态保存",
+            entry="修改状态并刷新页面",
+            exit_check="页面恢复已保存状态",
+            checkpoint_title="状态已持久化",
+            checkpoint_check="刷新后必须恢复新状态",
+            case_ids=[case_id],
+        )["chain_id"]
+        duplicate_approval = ph.approve_feature_chain(
+            store,
+            root=project,
+            chain_id=duplicate_chain_id,
+            red_command=command("red"),
+            green_command=command("green"),
+            expected_red_reason="old symptom returned",
+        )
+        self.assertEqual(duplicate_approval["reason"], "duplicate_feature_chain")
+        self.assertEqual(ph.active_feature_chains(store)[duplicate_chain_id]["status"], "proposed")
+
+        passed_sync = ph.auto_sync_project(
+            project,
+            source_platform="codex",
+            session_id="feature-chain-session",
+            trigger="stop",
+            force=True,
+            claude_home=base / ".claude",
+            codex_home=base / ".codex",
+        )
+        self.assertEqual(passed_sync["status"], "completed")
+        passed = passed_sync["completion_tests"]
+        self.assertEqual((passed["passed"], passed["failed"], passed["blocked"]), (1, 0, 0))
+        self.assertIsNone(passed["results"][0]["evidence_path"])
+        ph.set_feature_chain_run_policy(
+            store, chain_id=chain_id, run_policy="manual", reason="manual selection fixture"
+        )
+        self.assertEqual(ph.test_hub_dev_complete(store, root=project)["selected_count"], 0)
+        explicit = ph.test_hub_dev_complete(
+            store, root=project, selected_target_ids={chain_id}
+        )
+        self.assertEqual((explicit["selected_count"], explicit["passed"]), (1, 1))
+        ph.set_feature_chain_run_policy(
+            store, chain_id=chain_id, run_policy="every-dev-completion", reason="restore scheduled completion"
+        )
+
+        # Canonical records remain immutable; this local folded-chain override
+        # exercises the runner's failure path without rewriting approval state.
+        failed = ph.run_feature_chain_command(
+            store,
+            root=project,
+            chain={**ph.active_feature_chains(store)[chain_id], "green_command": command("fail-green")},
+            command=command("fail-green"),
+            mode="dev_complete",
+            expectation="green",
+        )
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["expectation_met"])
+        evidence = Path(failed["evidence_path"])
+        self.assertTrue((evidence / "state.txt").is_file())
+
+        missing = ph.run_feature_chain_command(
+            store,
+            root=project,
+            chain=ph.active_feature_chains(store)[chain_id],
+            command=command("missing"),
+            mode="dev_complete",
+            expectation="green",
+        )
+        self.assertEqual(missing["reason"], "missing required checkpoint: 页面恢复正确状态")
+        unknown = ph.run_feature_chain_command(
+            store,
+            root=project,
+            chain=ph.active_feature_chains(store)[chain_id],
+            command=command("unknown"),
+            mode="dev_complete",
+            expectation="green",
+        )
+        self.assertEqual(unknown["reason"], "unknown checkpoint marker: 未注册步骤")
+        blocked = ph.run_feature_chain_command(
+            store,
+            root=project,
+            chain=ph.active_feature_chains(store)[chain_id],
+            command={"argv": [sys.executable, str(runner), "timeout"], "timeout_seconds": 1},
+            mode="dev_complete",
+            expectation="green",
+        )
+        self.assertEqual((blocked["status"], blocked["reason"]), ("blocked", "command timed out"))
+        self.assertTrue(Path(blocked["evidence_path"]).is_dir())
+
+        optional = ph.set_feature_chain_checkpoint_policy(
+            store,
+            chain_id=chain_id,
+            checkpoint_title="页面恢复正确状态",
+            required=False,
+            reason="该步骤只在浏览器集成环境运行",
+        )
+        self.assertTrue(optional["changed"])
+        optional_run = ph.run_feature_chain_command(
+            store,
+            root=project,
+            chain=ph.active_feature_chains(store)[chain_id],
+            command=command("missing"),
+            mode="dev_complete",
+            expectation="green",
+        )
+        self.assertTrue(optional_run["expectation_met"])
+
+        rerun = ph.run_feature_chain_command(
+            store,
+            root=project,
+            chain=ph.active_feature_chains(store)[chain_id],
+            command=command("green"),
+            mode="dev_complete",
+            expectation="green",
+        )
+        self.assertTrue(rerun["expectation_met"])
+        self.assertFalse((store / "badcases" / "runs" / rerun["run_id"]).exists())
+        self.assertEqual(len(ph.active_harness_runs(store)), 12)
+        catalog = ph.rebuild_index_for_store(store)
+        self.assertEqual(catalog["test_hub"]["feature_chain_count"], 2)
+        self.assertIn("状态保存与刷新", (store / "index" / "TEST_HUB.md").read_text(encoding="utf-8"))
+        self.assertIn("Prompt Harness Test Hub", (store / "index" / "test-hub" / "index.html").read_text(encoding="utf-8"))
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["feature_chain_count"], 2)
+        self.assertEqual(doctor["harness_run_count"], 12)
+
+    def test_feature_chain_planning_overlap_coverage_and_candidate_groups_are_read_only(self) -> None:
+        base = retained_workspace("feature-chain-planning")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+
+        specifications = (
+            ("实现 Markdown 公式预览", "还是不对，公式预览没有渲染", "公式预览未渲染", ["markdown", "preview"]),
+            ("保存 Markdown 草稿", "仍然没有保存，刷新后草稿丢了", "Markdown 草稿丢失", ["markdown", "persistence"]),
+            ("实现游戏暂停恢复", "还是不行，暂停后无法恢复", "游戏暂停无法恢复", ["game", "state"]),
+            ("实现游戏关卡重试", "仍然错误，重试后状态混在一起", "游戏重试状态串线", ["game", "state"]),
+        )
+        case_ids = []
+        minute = 0
+        for index, (request, correction_text, title, tags) in enumerate(specifications, 1):
+            request_event = ph.build_event(
+                root=project,
+                platform="codex",
+                source_mode="backfill",
+                prompt_text=request,
+                session_id="planning-session",
+                occurred_at=f"2026-07-18T06:{minute:02d}:00.000Z",
+                turn_id=f"turn-{index}-request",
+            )
+            minute += 1
+            correction_event = ph.build_event(
+                root=project,
+                platform="codex",
+                source_mode="backfill",
+                prompt_text=correction_text,
+                session_id="planning-session",
+                occurred_at=f"2026-07-18T06:{minute:02d}:00.000Z",
+                turn_id=f"turn-{index}-correction",
+            )
+            minute += 1
+            self.assertTrue(ph.append_event(store, request_event))
+            self.assertTrue(ph.append_event(store, correction_event))
+        ph.detect_badcase_candidates(store)
+        candidates = list(ph.iter_badcase_candidates(store))
+        self.assertEqual(len(candidates), 4)
+        for candidate, (_, _, title, tags) in zip(candidates, specifications):
+            case_ids.append(
+                ph.confirm_badcase_candidate(
+                    store,
+                    candidate_id=candidate["candidate_id"],
+                    title=title,
+                    phenomenon=title,
+                    red_condition=f"{title}再次发生",
+                    green_condition=f"{title}不再发生",
+                    expected_failure_reason=f"旧症状会触发 {title} checkpoint",
+                    category=tags[0],
+                    severity="medium",
+                    guard_type="feature-chain",
+                    verification=f"运行 {title} 用户流程",
+                    root_cause="unknown",
+                    fix_method=None,
+                    tags=tags,
+                    trigger_reproduction=f"执行 {title} 对应入口",
+                )["case_id"]
+            )
+
+        primary = ph.create_feature_chain(
+            store,
+            title="Markdown 编辑与预览",
+            entry="输入 Markdown 并刷新预览",
+            exit_check="预览和草稿状态正确",
+            checkpoint_title="公式预览完成",
+            checkpoint_check="公式必须完成渲染",
+            case_ids=[case_ids[0]],
+        )["chain_id"]
+        ph.attach_feature_chain_case(
+            store,
+            chain_id=primary,
+            checkpoint_title="草稿保存完成",
+            checkpoint_check="刷新后必须恢复 Markdown 草稿",
+            case_id=case_ids[1],
+        )
+        duplicate = ph.create_feature_chain(
+            store,
+            title="Markdown 公式预览与草稿",
+            entry="编辑 Markdown 后查看预览",
+            exit_check="公式和草稿保持正确",
+            checkpoint_title="Markdown 预览稳定",
+            checkpoint_check="公式预览不能显示原始文本",
+            case_ids=[case_ids[0]],
+        )["chain_id"]
+
+        coverage = ph.feature_chain_coverage_report(store)
+        self.assertEqual(coverage["covered_case_count"], 2)
+        self.assertEqual({item["case_id"] for item in coverage["unassigned"]}, set(case_ids[2:]))
+        groups = ph.feature_chain_candidate_groups(store)
+        self.assertEqual(groups["candidate_group_count"], 1)
+        self.assertEqual(set(groups["groups"][0]["case_ids"]), set(case_ids[2:]))
+        ph.attach_feature_chain_case(
+            store,
+            chain_id=primary,
+            checkpoint_title="预览错误定位完成",
+            checkpoint_check="错误必须定位到对应 Markdown 块",
+            case_id=case_ids[2],
+        )
+        primary_case_ids = {
+            case_id
+            for checkpoint in ph.active_feature_chains(store)[primary]["checkpoints"]
+            for case_id in checkpoint.get("case_ids", [])
+        }
+        self.assertEqual(len(primary_case_ids), 3)
+        event_count = len(list(ph.iter_feature_chain_events(store)))
+        overlap = ph.feature_chain_overlap_report(store)
+        self.assertTrue(
+            any(
+                {item["left_chain_id"], item["right_chain_id"]} == {primary, duplicate}
+                for item in overlap["pairs"]
+            )
+        )
+        plan = ph.feature_chain_plan(store, query=case_ids[1])
+        self.assertEqual(plan["action"], "review-existing-chain")
+        self.assertEqual(plan["match"]["chain_id"], primary)
+        self.assertFalse(plan["mutated"])
+        self.assertEqual(len(list(ph.iter_feature_chain_events(store))), event_count)
+
+        ph.rebuild_index_for_store(store)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+
+    def test_test_hub_runs_two_chains_preserves_one_failure_and_recovers(self) -> None:
+        base = retained_workspace("test-hub-multi-chain")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        case_ids = []
+        for index, (request, correction, title) in enumerate(
+            (
+                ("实现清单保存", "还是没有保存，刷新后丢了", "清单刷新后丢失"),
+                ("实现故事卡生成", "仍然不对，重复生成结果变了", "故事卡重复生成漂移"),
+            ),
+            1,
+        ):
+            first = ph.build_event(
+                root=project,
+                platform="codex",
+                source_mode="backfill",
+                prompt_text=request,
+                session_id=f"hub-session-{index}",
+                occurred_at=f"2026-07-18T07:0{index}:00.000Z",
+                turn_id="request",
+            )
+            second = ph.build_event(
+                root=project,
+                platform="codex",
+                source_mode="backfill",
+                prompt_text=correction,
+                session_id=f"hub-session-{index}",
+                occurred_at=f"2026-07-18T07:1{index}:00.000Z",
+                turn_id="correction",
+            )
+            ph.append_event(store, first)
+            ph.append_event(store, second)
+        ph.detect_badcase_candidates(store)
+        for candidate, title in zip(
+            ph.iter_badcase_candidates(store),
+            ("清单刷新后丢失", "故事卡重复生成漂移"),
+        ):
+            case_ids.append(
+                ph.confirm_badcase_candidate(
+                    store,
+                    candidate_id=candidate["candidate_id"],
+                    title=title,
+                    phenomenon=title,
+                    red_condition=f"{title}再次发生",
+                    green_condition=f"{title}不再发生",
+                    expected_failure_reason="old symptom",
+                    category="workflow",
+                    severity="high",
+                    guard_type="feature-chain",
+                    verification=f"执行 {title} 流程",
+                    root_cause="unknown",
+                    fix_method=None,
+                )["case_id"]
+            )
+
+        runner = project / "multi_chain_runner.py"
+        runner.write_text(
+            "import os, pathlib, sys\n"
+            "label, mode = sys.argv[1], sys.argv[2]\n"
+            "flag = pathlib.Path(sys.argv[3])\n"
+            "if mode == 'red':\n"
+            "    print(f'PH_CHECKPOINT:{label}:FAIL:old symptom')\n"
+            "elif flag.exists():\n"
+            "    print(f'PH_CHECKPOINT:{label}:FAIL:forced regression')\n"
+            "    pathlib.Path(os.environ['PROMPT_HARNESS_RUN_DIR'], 'failure.txt').write_text(label, encoding='utf-8')\n"
+            "else:\n"
+            "    print(f'PH_CHECKPOINT:{label}:PASS')\n",
+            encoding="utf-8",
+        )
+        flags = [project / "fail-one.flag", project / "fail-two.flag"]
+        labels = ["清单状态已保存", "故事卡输出稳定"]
+        chain_ids = []
+        for index, (case_id, label, flag) in enumerate(zip(case_ids, labels, flags), 1):
+            chain_id = ph.create_feature_chain(
+                store,
+                title=f"独立工作流 {index}",
+                entry=f"触发工作流 {index}",
+                exit_check=f"工作流 {index} 正确完成",
+                checkpoint_title=label,
+                checkpoint_check=f"{label} 必须通过",
+                case_ids=[case_id],
+            )["chain_id"]
+            chain_ids.append(chain_id)
+            command = lambda mode, label=label, flag=flag: {
+                "argv": [sys.executable, str(runner), label, mode, str(flag)]
+            }
+            approved = ph.approve_feature_chain(
+                store,
+                root=project,
+                chain_id=chain_id,
+                red_command=command("red"),
+                green_command=command("green"),
+                expected_red_reason="old symptom",
+            )
+            self.assertTrue(approved["changed"])
+
+        flags[1].write_text("fail", encoding="utf-8")
+        mixed = ph.test_hub_dev_complete(store, root=project, jobs=2)
+        self.assertEqual((mixed["passed"], mixed["failed"], mixed["blocked"]), (1, 1, 0))
+        results = {item["target_id"]: item for item in mixed["results"]}
+        self.assertEqual(results[chain_ids[0]]["status"], "passed")
+        self.assertEqual(results[chain_ids[1]]["status"], "failed")
+        failed_evidence = Path(results[chain_ids[1]]["evidence_path"])
+        self.assertTrue((failed_evidence / "failure.txt").is_file())
+
+        flags[1].unlink()
+        recovered = ph.test_hub_dev_complete(store, root=project, jobs=2)
+        self.assertEqual((recovered["passed"], recovered["failed"], recovered["blocked"]), (2, 0, 0))
+        self.assertTrue(failed_evidence.is_dir())
+        self.assertTrue(all(item["evidence_path"] is None for item in recovered["results"]))
+        last_run = json.loads(
+            (store / "index" / "test-hub" / "last-run.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(last_run["passed"], 2)
+
+        ph.rebuild_index_for_store(store)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+
+    def test_snapshot_and_two_adapter_replay_matrix_are_stable_private_and_auditable(self) -> None:
+        base = retained_workspace("snapshot-replay-matrix")
+        project = base / "project"
+        project.mkdir()
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        source = project / "app.txt"
+        source.write_text("initial\n", encoding="utf-8")
+        (project / ".env").write_text("API_KEY=should-never-be-copied\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(project), "add", "app.txt", ".env"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(project), "-c", "user.name=Prompt Harness Test",
+                "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture",
+            ],
+            check=True,
+        )
+        store, _ = ph.init_store(project)
+        request = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="实现稳定输出",
+            session_id="replay-session",
+            occurred_at="2026-07-18T08:00:00.000Z",
+            turn_id="request",
+        )
+        correction = ph.build_event(
+            root=project,
+            platform="codex",
+            source_mode="backfill",
+            prompt_text="还是不对，输出又发生漂移",
+            session_id="replay-session",
+            occurred_at="2026-07-18T08:01:00.000Z",
+            turn_id="correction",
+        )
+        ph.append_event(store, request)
+        ph.append_event(store, correction)
+        ph.detect_badcase_candidates(store)
+        candidate = next(ph.iter_badcase_candidates(store))
+        case_id = ph.confirm_badcase_candidate(
+            store,
+            candidate_id=candidate["candidate_id"],
+            title="输出漂移",
+            phenomenon="相同输入产生不兼容输出",
+            red_condition="输出结构漂移",
+            green_condition="输出结构稳定",
+            expected_failure_reason="historical output mismatch",
+            category="model-behavior",
+            severity="high",
+            guard_type="replay",
+            verification="固定快照重放",
+            root_cause="historical root cause must stay hidden",
+            fix_method="historical fix must stay hidden",
+        )["case_id"]
+
+        first = ph.create_project_snapshot(
+            store,
+            root=project,
+            case_id=case_id,
+            tools=["fake-tool"],
+            skills=["fake-skill"],
+            configuration={"token": "sk-abcdefghijklmnopqrstuvwxyz123456"},
+        )
+        second = ph.create_project_snapshot(store, root=project, case_id=case_id, tools=["fake-tool"], skills=["fake-skill"], configuration={"token": "sk-abcdefghijklmnopqrstuvwxyz123456"})
+        self.assertEqual(first["snapshot"]["snapshot_id"], second["snapshot"]["snapshot_id"])
+        self.assertFalse(second["changed"])
+        manifest = first["snapshot"]["manifest"]
+        self.assertNotIn(".env", {item["path"] for item in manifest["files"]})
+        self.assertIn(".env", {item["path"] for item in manifest["excluded"]})
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz", json.dumps(manifest))
+        self.assertEqual(source.read_text(encoding="utf-8"), "initial\n")
+        source.write_text("dirty\n", encoding="utf-8")
+        dirty = ph.create_project_snapshot(store, root=project, case_id=case_id)
+        self.assertNotEqual(first["snapshot"]["snapshot_id"], dirty["snapshot"]["snapshot_id"])
+        materialized_parent = base / "materialized"
+        materialized_parent.mkdir()
+        with self.assertRaises(ValueError):
+            ph.materialize_project_snapshot(
+                store, root=project, snapshot_id=dirty["snapshot"]["snapshot_id"]
+            )
+        ph.approve_snapshot_materialization(
+            store,
+            root=project,
+            snapshot_id=dirty["snapshot"]["snapshot_id"],
+            destination_parent=materialized_parent,
+            reason="isolated replay workspace",
+        )
+        materialized = ph.materialize_project_snapshot(
+            store, root=project, snapshot_id=dirty["snapshot"]["snapshot_id"]
+        )
+        materialized_root = Path(materialized["destination"])
+        self.assertEqual((materialized_root / "app.txt").read_text(encoding="utf-8"), "dirty\n")
+        self.assertFalse((materialized_root / ".env").exists())
+        self.assertEqual(source.read_text(encoding="utf-8"), "dirty\n")
+        outside = base / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        (project / "escape-link").symlink_to(outside)
+        with self.assertRaises(ValueError):
+            ph.create_project_snapshot(store, root=project, case_id=case_id)
+        (project / "escape-link").unlink()
+
+        adapter_script = project / "fake_adapter.py"
+        adapter_script.write_text(
+            "import json, os, pathlib, sys\n"
+            "data=json.loads(pathlib.Path(os.environ['PROMPT_HARNESS_INPUT_PATH']).read_text(encoding='utf-8'))\n"
+            "blob=json.dumps(data, ensure_ascii=False)\n"
+            "assert 'historical root cause' not in blob and 'historical fix' not in blob\n"
+            "name=sys.argv[1]\n"
+            "result={'schema_version':'1.0.0','status':'completed','answer':name+' ok','metrics':{'score':1}}\n"
+            "pathlib.Path(os.environ['PROMPT_HARNESS_RESULT_PATH']).write_text(json.dumps(result), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        adapter_ids = []
+        for name in ("model-a", "model-b"):
+            proposed = ph.propose_model_adapter(
+                store,
+                root=project,
+                name=name,
+                platform="fake",
+                model=name,
+                command={"argv": [sys.executable, str(adapter_script), name]},
+            )
+            adapter_ids.append(proposed["adapter_id"])
+            approved = ph.approve_model_adapter(store, root=project, adapter_id=proposed["adapter_id"])
+            self.assertTrue(approved["changed"], approved)
+
+        matrix = ph.run_replay_matrix(
+            store,
+            root=project,
+            case_id=case_id,
+            snapshot_id=dirty["snapshot"]["snapshot_id"],
+            adapter_ids=adapter_ids,
+        )
+        self.assertEqual((matrix["passed"], matrix["failed"], matrix["blocked"]), (2, 0, 0))
+        self.assertEqual({run["result"]["answer"] for run in matrix["runs"]}, {"model-a ok", "model-b ok"})
+        self.assertEqual(
+            {run["execution_isolation"] for run in matrix["runs"]},
+            {"approved-materialized-snapshot"},
+        )
+        ph.rebuild_index_for_store(store)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["snapshot_count"], 2)
+        self.assertEqual(doctor["model_adapter_count"], 2)
+
+    def test_adapter_preflight_rejects_timeout_nonzero_and_malformed_results(self) -> None:
+        base = retained_workspace("adapter-failures")
+        project = base / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        script = project / "bad_adapter.py"
+        script.write_text(
+            "import os, pathlib, sys, time\n"
+            "mode=sys.argv[1]\n"
+            "if mode=='timeout': time.sleep(2)\n"
+            "elif mode=='nonzero': raise SystemExit(7)\n"
+            "elif mode=='malformed': pathlib.Path(os.environ['PROMPT_HARNESS_RESULT_PATH']).write_text('{bad json', encoding='utf-8')\n"
+            "elif mode in {'task','policy'}:\n"
+            " import json\n"
+            " result={'schema_version':'1.0.0','status':'failed' if mode=='task' else 'blocked','answer':'classified','reason':mode,'metrics':{}}\n"
+            " pathlib.Path(os.environ['PROMPT_HARNESS_RESULT_PATH']).write_text(json.dumps(result), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        expected = {
+            "timeout": ("blocked", "environment"),
+            "nonzero": ("failed", "tool-runtime"),
+            "malformed": ("failed", "adapter-protocol"),
+            "task": ("failed", "task"),
+            "policy": ("blocked", "policy-blocker"),
+        }
+        for mode, (status, attribution) in expected.items():
+            adapter_id = ph.propose_model_adapter(
+                store, root=project, name=mode, platform="fake", model=mode,
+                command={
+                    "argv": [sys.executable, str(script), mode],
+                    "timeout_seconds": 1,
+                },
+            )["adapter_id"]
+            approval = ph.approve_model_adapter(store, root=project, adapter_id=adapter_id)
+            self.assertEqual(approval["reason"], "approval_preflight_failed")
+            self.assertEqual(approval["run"]["status"], status)
+            self.assertEqual(approval["run"]["attribution"], attribution)
+            self.assertTrue(Path(approval["run"]["evidence_path"]).is_dir())
+            self.assertEqual(ph.active_model_adapters(store)[adapter_id]["status"], "proposed")
+
+    def test_doctor_rejects_corruption_in_every_adaptive_ledger(self) -> None:
+        fixtures = [
+            (
+                ph.task_case_event_file,
+                {"record_type": ph.TASK_CASE_EVENT_RECORD_TYPE, "event_id": "bad", "task_case_id": "bad", "action": "approved"},
+                "task-case event_id",
+            ),
+            (
+                ph.adapter_event_file,
+                {"record_type": ph.ADAPTER_EVENT_RECORD_TYPE, "event_id": "bad", "adapter_id": "bad", "action": "approved"},
+                "model adapter event_id",
+            ),
+            (
+                ph.judge_event_file,
+                {"record_type": ph.JUDGE_EVENT_RECORD_TYPE, "event_id": "bad", "judge_id": "deterministic", "action": "evaluated", "replay_run_id": "missing"},
+                "judge event_id",
+            ),
+            (
+                ph.compensation_event_file,
+                {"record_type": ph.COMPENSATION_EVENT_RECORD_TYPE, "event_id": "bad", "compensation_id": "bad", "action": "approved"},
+                "compensation event_id",
+            ),
+            (
+                ph.attribution_event_file,
+                {"record_type": ph.ATTRIBUTION_EVENT_RECORD_TYPE, "event_id": "bad", "run_id": "missing", "action": "overridden", "attribution": "unknown"},
+                "attribution event_id",
+            ),
+            (
+                ph.policy_event_file,
+                {"record_type": ph.POLICY_EVENT_RECORD_TYPE, "event_id": "bad", "target_type": "project", "target_id": "bad", "action": "set", "policy": {}},
+                "policy event_id",
+            ),
+            (
+                ph.subagent_event_file,
+                {"record_type": ph.SUBAGENT_EVENT_RECORD_TYPE, "event_id": "bad", "binding_id": "bad", "action": "completed"},
+                "subagent event_id",
+            ),
+            (
+                ph.snapshot_event_file,
+                {"record_type": ph.SNAPSHOT_EVENT_RECORD_TYPE, "snapshot_id": "bad", "case_id": "missing", "project": {}, "manifest": {}, "manifest_sha256": "bad"},
+                "snapshot_id",
+            ),
+            (
+                ph.harness_run_event_file,
+                {"record_type": ph.HARNESS_RUN_EVENT_RECORD_TYPE, "run_event_id": "bad", "run_id": "bad", "action": "completed"},
+                "run_event_id",
+            ),
+        ]
+        for index, (path_getter, row, expected) in enumerate(fixtures):
+            with self.subTest(ledger=path_getter.__name__):
+                project = retained_workspace(f"doctor-ledger-{index}") / "project"
+                project.mkdir()
+                store, _ = ph.init_store(project)
+                ph.rebuild_index_for_store(store)
+                write_jsonl(path_getter(store), [{"schema_version": "1.0.0", **row}])
+                result = ph.doctor_store(store, project)
+                self.assertFalse(result["ok"])
+                self.assertIn(expected, "\n".join(result["errors"]))
+
+    def test_context_view_tracks_task_switch_and_resume_without_copying_trajectory(self) -> None:
+        project = retained_workspace("context-switch") / "project"
+        project.mkdir()
+        store, _ = ph.init_store(project)
+        for session_id, minute, text in (
+            ("task-a", 0, "必须保留原始证据，开始任务 A"),
+            ("task-b", 1, "切换到任务 B，只做只读检查"),
+            ("task-c", 2, "现在处理任务 C"),
+        ):
+            ph.append_event(
+                store,
+                ph.build_event(
+                    root=project, platform="codex", source_mode="backfill",
+                    prompt_text=text, session_id=session_id, turn_id="start",
+                    occurred_at=f"2026-07-18T10:0{minute}:00.000Z",
+                ),
+            )
+        catalog = ph.rebuild_index_for_store(store)
+        self.assertEqual(catalog["context"]["active_session"]["session_id"], "task-c")
+        self.assertEqual(catalog["context"]["parked_session_count"], 2)
+        ph.append_event(
+            store,
+            ph.build_event(
+                root=project, platform="codex", source_mode="backfill",
+                prompt_text="恢复任务 A，从上次下一步继续", session_id="task-a", turn_id="resume",
+                occurred_at="2026-07-18T10:04:00.000Z",
+            ),
+        )
+        resumed = ph.rebuild_index_for_store(store)
+        self.assertEqual(resumed["context"]["active_session"]["session_id"], "task-a")
+        context = (store / "index" / "CONTEXT.md").read_text(encoding="utf-8")
+        self.assertIn("task-b", context)
+        self.assertIn("必须保留原始证据", context)
+        self.assertNotIn("# Complete trajectory", context)
+
+    def test_task_judge_compensation_policy_and_subagent_lifecycles(self) -> None:
+        base = retained_workspace("adaptive-lifecycles")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("fixture", encoding="utf-8")
+        store, _ = ph.init_store(project)
+        first = ph.build_event(
+            root=project, platform="codex", source_mode="backfill",
+            prompt_text="实现多阶段恢复", session_id="adaptive", turn_id="one",
+            occurred_at="2026-07-18T09:00:00.000Z",
+        )
+        correction = ph.build_event(
+            root=project, platform="codex", source_mode="backfill",
+            prompt_text="还是失败，恢复后没有清理临时状态", session_id="adaptive", turn_id="two",
+            occurred_at="2026-07-18T09:01:00.000Z",
+        )
+        ph.append_event(store, first)
+        ph.append_event(store, correction)
+        ph.detect_badcase_candidates(store)
+        candidate = next(ph.iter_badcase_candidates(store))
+        case_id = ph.confirm_badcase_candidate(
+            store, candidate_id=candidate["candidate_id"], title="恢复后未清理",
+            phenomenon="恢复完成后残留临时状态", red_condition="临时状态仍存在",
+            green_condition="恢复后临时状态已清理", expected_failure_reason="cleanup missing",
+            category="workflow", severity="high", guard_type="task-case",
+            verification="运行恢复和清理阶段", root_cause="cleanup phase omitted", fix_method="add cleanup",
+        )["case_id"]
+        snapshot_id = ph.create_project_snapshot(store, root=project, case_id=case_id)["snapshot"]["snapshot_id"]
+
+        adapter_script = project / "adaptive_adapter.py"
+        adapter_script.write_text(
+            "import json, os, pathlib, sys\n"
+            "data=json.loads(pathlib.Path(os.environ['PROMPT_HARNESS_INPUT_PATH']).read_text(encoding='utf-8'))\n"
+            "mode=sys.argv[1]\n"
+            "comp=bool(data.get('compensation'))\n"
+            "metrics={} if mode=='judge-path' and data.get('purpose')=='badcase-replay' else {'passed': mode=='modern' or comp or data.get('purpose')=='approval-self-test','tokens':2,'cost_usd':0.5}\n"
+            "answer='good result' if mode=='judge-path' else ('fixed' if comp else 'old failure')\n"
+            "result={'schema_version':'1.0.0','status':'completed','answer':answer,'metrics':metrics}\n"
+            "pathlib.Path(os.environ['PROMPT_HARNESS_RESULT_PATH']).write_text(json.dumps(result), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        proposed = ph.propose_model_adapter(
+            store, root=project, name="adaptive", platform="fake", model="adaptive-v1",
+            command={"argv": [sys.executable, str(adapter_script), "adaptive"]},
+        )
+        adapter_id = proposed["adapter_id"]
+        self.assertTrue(ph.approve_model_adapter(store, root=project, adapter_id=adapter_id)["changed"])
+        baseline = ph.run_replay_matrix(
+            store, root=project, case_id=case_id, snapshot_id=snapshot_id, adapter_ids=[adapter_id]
+        )["runs"][0]
+        evaluation = ph.evaluate_replay_outcome(store, root=project, run_id=baseline["run_id"])
+        self.assertFalse(evaluation["evaluation"]["passed"])
+        proposal = ph.propose_compensation(
+            store, replay_run_id=baseline["run_id"], compensation_type="instruction",
+            content="Always execute the cleanup phase after recovery.", scope="recovery workflow",
+            rationale="The judged baseline reproduces the missing cleanup.",
+        )
+        compensation_id = proposal["compensation_id"]
+        approved = ph.approve_compensation(store, root=project, compensation_id=compensation_id)
+        self.assertTrue(approved["changed"], approved)
+        ph.transition_compensation(
+            store, compensation_id=compensation_id, action="activated", reason="Red/Green replay passed"
+        )
+
+        task_runner = project / "task_runner.py"
+        task_runner.write_text(
+            "import sys\n"
+            "mode=sys.argv[1]\n"
+            "if mode=='red':\n"
+            " print('PH_CHECKPOINT:恢复:PASS')\n"
+            " print('PH_CHECKPOINT:清理:FAIL:cleanup missing')\n"
+            "else:\n"
+            " print('PH_CHECKPOINT:恢复:PASS')\n"
+            " print('PH_CHECKPOINT:清理:PASS')\n",
+            encoding="utf-8",
+        )
+        task_case_id = ph.propose_task_case(
+            store, root=project, title="恢复与清理",
+            phases=[{"name": "恢复", "check": "恢复成功"}, {"name": "清理", "check": "临时状态已删除"}],
+            linked_case_ids=[case_id], stop_condition="清理完成", cleanup="删除测试状态",
+            exclusions=["不调用生产服务"], blocker_policy=["缺少权限时停止"],
+        )["task_case_id"]
+        task_approval = ph.approve_task_case(
+            store, root=project, task_case_id=task_case_id,
+            red_command={"argv": [sys.executable, str(task_runner), "red"]},
+            green_command={"argv": [sys.executable, str(task_runner), "green"]},
+            expected_red_reason="cleanup missing",
+        )
+        self.assertTrue(task_approval["changed"], task_approval)
+        task_approval_runs = [
+            ph.active_harness_runs(store)[run_id]
+            for run_id in ph.active_task_cases(store)[task_case_id]["approval_run_ids"]
+        ]
+        self.assertIn("清理", task_approval_runs[0]["reason"])
+        hub = ph.test_hub_dev_complete(store, root=project, jobs=2)
+        self.assertEqual((hub["task_case_count"], hub["passed"]), (1, 1))
+
+        ph.set_harness_policy(
+            store, target_type="badcase", target_id=case_id,
+            policy={"max_attempts": 1, "max_tokens": 1}, reason="bounded regression budget",
+        )
+        bounded = ph.run_replay_matrix(
+            store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+            adapter_ids=[adapter_id], compensation_ids=[compensation_id],
+        )
+        self.assertEqual(bounded["budget_stop"]["reason"], "max_attempts")
+        ph.set_harness_policy(
+            store, target_type="badcase", target_id=case_id,
+            policy={"max_attempts": 8, "max_tokens": 1}, reason="token budget fixture",
+        )
+        token_bounded = ph.run_replay_matrix(
+            store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+            adapter_ids=[adapter_id, adapter_id],
+        )
+        self.assertEqual(token_bounded["budget_stop"]["reason"], "max_tokens")
+        ph.set_harness_policy(
+            store, target_type="badcase", target_id=case_id,
+            policy={"max_attempts": 8, "max_tokens": 0, "max_cost_usd": 0.1},
+            reason="cost budget fixture",
+        )
+        cost_bounded = ph.run_replay_matrix(
+            store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+            adapter_ids=[adapter_id, adapter_id],
+        )
+        self.assertEqual(cost_bounded["budget_stop"]["reason"], "max_cost_usd")
+        ph.set_harness_policy(
+            store, target_type="badcase", target_id=case_id,
+            policy={"max_attempts": 8, "max_tokens": 0, "max_cost_usd": 0}, reason="restore normal replay budget",
+        )
+        binding = ph.bind_subagent(
+            store, root=project, platform="codex", session_id="child-session",
+            agent_id="worker-1", child_root=project, parent_session_id="adaptive",
+        )["binding"]
+        completion = ph.record_subagent_completion(
+            store, binding_id=binding["binding_id"], evidence_ids=[first["event_id"]], summary="child completed fixture"
+        )
+        repeated = ph.record_subagent_completion(
+            store, binding_id=binding["binding_id"], evidence_ids=[first["event_id"]], summary="child completed fixture"
+        )
+        self.assertTrue(completion["changed"])
+        self.assertFalse(repeated["changed"])
+        with self.assertRaises(ValueError):
+            ph.bind_subagent(
+                store, root=project, platform="codex", session_id="remote", agent_id="remote",
+                child_root="https://example.com/repo",
+            )
+
+        judge_adapter = ph.propose_model_adapter(
+            store, root=project, name="judge-path", platform="fake", model="judge-model",
+            command={"argv": [sys.executable, str(adapter_script), "judge-path"]},
+        )
+        ph.approve_model_adapter(store, root=project, adapter_id=judge_adapter["adapter_id"])
+        judge_replay = ph.run_replay_matrix(
+            store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+            adapter_ids=[judge_adapter["adapter_id"]],
+        )["runs"][0]
+        self.assertFalse(ph.evaluate_replay_outcome(store, root=project, run_id=judge_replay["run_id"])["decided"])
+        judge_script = project / "judge_adapter.py"
+        judge_script.write_text(
+            "import json, os, pathlib\n"
+            "data=json.loads(pathlib.Path(os.environ['PROMPT_HARNESS_INPUT_PATH']).read_text(encoding='utf-8'))\n"
+            "passed=data.get('purpose')=='approval-self-test' or 'good' in str(data.get('candidate',{}).get('answer',''))\n"
+            "result={'schema_version':'1.0.0','status':'completed','answer':'narrow outcome decision','metrics':{'passed':passed}}\n"
+            "pathlib.Path(os.environ['PROMPT_HARNESS_RESULT_PATH']).write_text(json.dumps(result), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        judge_id = ph.propose_judge_adapter(
+            store, root=project, name="narrow-judge",
+            command={"argv": [sys.executable, str(judge_script)]},
+        )["judge_id"]
+        self.assertTrue(ph.approve_judge_adapter(store, root=project, judge_id=judge_id)["changed"])
+        judged = ph.evaluate_replay_outcome(
+            store, root=project, run_id=judge_replay["run_id"], judge_id=judge_id,
+        )
+        self.assertTrue(judged["evaluation"]["passed"])
+        modern_ids = []
+        for model in ("modern-a", "modern-b"):
+            modern_id = ph.propose_model_adapter(
+                store, root=project, name=model, platform="fake", model=model,
+                command={"argv": [sys.executable, str(adapter_script), "modern"]},
+            )["adapter_id"]
+            ph.approve_model_adapter(store, root=project, adapter_id=modern_id)
+            modern_ids.append(modern_id)
+        for _ in range(2):
+            modern_matrix = ph.run_replay_matrix(
+                store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+                adapter_ids=modern_ids if _ == 0 else modern_ids[:1],
+            )
+            for run in modern_matrix["runs"]:
+                ph.evaluate_replay_outcome(store, root=project, run_id=run["run_id"])
+        recommendation = ph.compensation_lifecycle_recommendation(
+            store, compensation_id=compensation_id, required_consecutive_passes=3,
+            distinct_model_minimum=2,
+        )
+        self.assertEqual(recommendation["recommendation"], "enter-probation")
+        ph.transition_compensation(
+            store, compensation_id=compensation_id, action="probation",
+            reason="three uncompensated passes across two models",
+        )
+        with self.assertRaises(ValueError):
+            ph.run_replay_matrix(
+                store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+                adapter_ids=[modern_ids[0]], compensation_ids=[compensation_id],
+            )
+        probation_runs = []
+        for selected in (modern_ids, modern_ids[:1]):
+            probation_runs.extend(
+                ph.run_replay_matrix(
+                    store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+                    adapter_ids=selected,
+                )["runs"]
+            )
+        for run in probation_runs:
+            ph.evaluate_replay_outcome(store, root=project, run_id=run["run_id"])
+        self.assertEqual(
+            ph.compensation_lifecycle_recommendation(
+                store, compensation_id=compensation_id,
+                required_consecutive_passes=3, distinct_model_minimum=2,
+            )["recommendation"],
+            "retire",
+        )
+        recurrence = ph.run_replay_matrix(
+            store, root=project, case_id=case_id, snapshot_id=snapshot_id,
+            adapter_ids=[adapter_id],
+        )["runs"][0]
+        ph.evaluate_replay_outcome(store, root=project, run_id=recurrence["run_id"])
+        self.assertEqual(
+            ph.compensation_lifecycle_recommendation(
+                store, compensation_id=compensation_id,
+                required_consecutive_passes=3, distinct_model_minimum=2,
+            )["recommendation"],
+            "reactivate",
+        )
+        ph.transition_compensation(
+            store, compensation_id=compensation_id, action="reactivated",
+            reason="post-probation recurrence",
+        )
+        ph.append_attribution_override(
+            store, run_id=baseline["run_id"], attribution="changed-intent", reason="manual audit override"
+        )
+        for entity_type, entity_id in (
+            ("task_case", task_case_id),
+            ("adapter", adapter_id),
+            ("judge", judge_id),
+        ):
+            ph.transition_workflow_entity(
+                store, entity_type=entity_type, entity_id=entity_id,
+                action="disabled", reason="transition audit fixture",
+            )
+            ph.transition_workflow_entity(
+                store, entity_type=entity_type, entity_id=entity_id,
+                action="reactivated", reason="transition audit fixture recovered",
+            )
+        ph.rebuild_index_for_store(store)
+        doctor = ph.doctor_store(store, project)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertEqual(doctor["task_case_count"], 1)
+        self.assertEqual(doctor["compensation_count"], 1)
+        self.assertTrue((store / "index" / "CONTEXT.md").is_file())
+        stable_paths = [
+            store / "index" / "BADCASES.md",
+            store / "index" / "TEST_HUB.md",
+            store / "index" / "CONTEXT.md",
+            store / "index" / "test-hub" / "index.html",
+        ]
+        before = {path: path.read_bytes() for path in stable_paths}
+        ph.rebuild_index_for_store(store)
+        self.assertEqual(before, {path: path.read_bytes() for path in stable_paths})
+
+    def test_auto_sync_detects_badcase_candidate_after_trace_reconciliation(self) -> None:
+        base = retained_workspace("badcase-auto-sync")
+        project = base / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("project", encoding="utf-8")
+        claude_home = base / ".claude"
+        encoded = __import__("re").sub(r"[^A-Za-z0-9]", "-", str(project))
+        transcript = claude_home / "projects" / encoded / "badcase-session.jsonl"
+        write_jsonl(
+            transcript,
+            [
+                {
+                    "type": "user",
+                    "uuid": "badcase-user-one",
+                    "promptId": "badcase-turn-one",
+                    "timestamp": "2026-07-18T04:00:00Z",
+                    "cwd": str(project),
+                    "message": {"role": "user", "content": "实现 Windows 自动刷新"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "badcase-assistant-one",
+                    "parentUuid": "badcase-user-one",
+                    "timestamp": "2026-07-18T04:01:00Z",
+                    "cwd": str(project),
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "已经实现自动刷新。"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "badcase-user-two",
+                    "promptId": "badcase-turn-two",
+                    "parentUuid": "badcase-assistant-one",
+                    "timestamp": "2026-07-18T04:02:00Z",
+                    "cwd": str(project),
+                    "message": {"role": "user", "content": "还是没有更新，Windows 上不工作"},
+                },
+            ],
+        )
+        result = ph.auto_sync_project(
+            project,
+            source_platform="claude",
+            session_id="badcase-session",
+            trigger="test",
+            source_path=transcript,
+            claude_home=claude_home,
+            codex_home=base / ".codex",
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["badcase_candidates_added"], 1)
+        self.assertTrue(result["index_rebuilt"])
+        store = project / ".prompt-harness"
+        candidate = list(ph.iter_badcase_candidates(store))[0]
+        self.assertEqual(candidate["session"]["models"], ["claude-test"])
+        self.assertTrue((store / "index" / "BADCASES.md").is_file())
+        self.assertTrue(ph.doctor_store(store, project)["ok"])
 
 
 if __name__ == "__main__":

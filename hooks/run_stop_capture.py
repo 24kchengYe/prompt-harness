@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import runpy
@@ -49,17 +50,19 @@ def main() -> int:
     prior_argv = sys.argv
     sys.argv = [str(script), "capture-stop-recovery"]
     try:
-        runpy.run_path(str(script), run_name="__main__")
+        # Keep the capture result out of stdout and return one neutral Codex
+        # hook response after the side effect completes.
+        with contextlib.redirect_stdout(io.StringIO()):
+            runpy.run_path(str(script), run_name="__main__")
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
         if code:
             record_launcher_error(f"capture-stop-recovery exited with code {code}", script=script)
-        return 0
     except Exception as exc:
         record_launcher_error(exc, script=script)
-        return 0
     finally:
         sys.argv = prior_argv
+    sys.stdout.write("{}\n")
     return 0
 
 

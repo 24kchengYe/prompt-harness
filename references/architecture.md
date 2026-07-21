@@ -30,7 +30,12 @@ flowchart LR
   O --> M["MODELOUT.md"]
   O --> Y["TRAJECTORY.md by session"]
   O -. prompt_event_id .-> E
-  E -. event_id .-> R["Future badcase runs"]
+  E --> BC["Review-only badcase detector"]
+  O --> BC
+  BC --> CAND["Append-only candidates"]
+  CAND --> DEC["Confirm / dismiss / merge"]
+  DEC --> CASE["Red/Green case lifecycle"]
+  CASE -. "future approved replay" .-> R["Badcase runs"]
 ```
 
 ## Ingestion paths
@@ -58,6 +63,8 @@ Each hook invocation schedules a background check. `state/auto-sync.json` tracks
 This is an eventual-consistency design: the current prompt is durable before the assistant starts, while older missing rows and images appear when the detached check completes. Ordinary turns do not enumerate or parse every local transcript.
 
 Derived views use `state/index-dirty.json` to skip redundant rebuilds when reconciliation changed no prompt or image fact. Transcript-derived model mappings are cached in `state/source-models.json` by source size and modification time, so rebuilding a view does not repeatedly parse unchanged source transcripts.
+
+After a full or incremental reconciliation has ingested every pending source tail, automatic sync runs the deterministic badcase candidate detector once. On configured Stop/Goal triggers, the same detached worker then runs only explicitly approved `every-dev-completion` Feature Chains and Task Cases before performing at most one dirty index rebuild. Detection reads only local canonical facts, calls no model, and writes only review candidates. Test failures are recorded independently and never change hook success or prompt durability.
 
 The recovery path scans native local transcripts. Claude Code branch copies are merged when timestamp and normalized prompt hash match; native IDs and every source reference are retained for provenance. Claude sidechains and Codex subagent rollouts are included in the trace ledger and marked with parent/agent metadata, while they remain excluded from the human-prompt ledger. If a Codex rollout was imported from Claude, rows at or before the source transcript's latest timestamp are mirror data; only genuinely new Codex continuation facts are candidates.
 
@@ -116,6 +123,8 @@ The project trajectory header reports total sessions, platform-specific session
 counts, total normalized turns, total human prompts, and trace events. Its
 session index reports per-session turn, prompt, and trace counts before the
 detailed trajectories.
+
+`index/BADCASES.md` is a lightweight review queue and confirmed-case catalog. `index/badcase/<case-id>.md` contains the complete referenced human prompts and final answers plus trace-category counts and links to the complete session trajectory. Candidate, decision, and case lifecycle JSONL remain canonical; the Markdown can be deleted and rebuilt.
 
 Each generated event view receives a one-based `P` number after active events are sorted by occurrence time. An earlier recovered event therefore shifts every later P number. Exact timestamp ties use transcript path, source line, native message/turn identity, and finally `event_id` for deterministic ordering. Durable links always use the immutable `event_id`, not the derived P number.
 

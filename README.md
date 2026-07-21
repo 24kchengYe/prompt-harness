@@ -1,7 +1,7 @@
 # Prompt Harness
 
 [![GitHub](https://img.shields.io/badge/GitHub-24kchengYe%2Fprompt--harness-181717?logo=github)](https://github.com/24kchengYe/prompt-harness)
-[![Version](https://img.shields.io/badge/version-0.10.0-176a5a)](https://github.com/24kchengYe/prompt-harness)
+[![Version](https://img.shields.io/badge/version-0.12.1-176a5a)](https://github.com/24kchengYe/prompt-harness)
 [![License](https://img.shields.io/badge/license-MIT-b54e32)](LICENSE)
 [![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
@@ -9,9 +9,7 @@
 
 Prompt Harness 同时提供实时 `UserPromptSubmit` Hook、旧任务轮末恢复和自动历史对账。第一次从项目根目录开始对话时，它会自动创建 `.prompt-harness`，先保存当前输入，再在独立后台进程中检查并补齐启动目录恰好等于该项目根目录的 Claude Code 与 Codex 会话。父项目不会自动吸收从子目录启动的会话；确需跨根归属时可显式绑定。它分别保留用户真正输入的指令、用户发送的图片，以及模型可见输出、reasoning/thinking、工具调用与结果、系统/开发者注入和 subagent 内容；导入镜像仍会去重。
 
-这个事实层将作为后续 badcase 分析、可复现测试和跨模型回归的稳定输入。
-
-> 当前版本完成 Phase 1：提示词捕获与事实化。Phase 2 的 badcase harness 已预留命名空间，但尚未实现失败分类、测试运行和模型回归。
+这个事实层现在也驱动完整的 review-gated badcase harness：系统从明确的用户纠错中生成待审核 candidate，用户确认后才形成正式 case；Feature Chain 与 Task Case 必须通过 Red/Green 预检才能批准；安全快照、跨模型 replay、窄 Judge、归因、最小补偿、probation 与 retirement 全部保留追加式审计记录。自动检测仍不会认定模型失败、修改 Prompt、注册测试或注入补偿。
 
 ## 它解决什么问题
 
@@ -42,6 +40,9 @@ Prompt Harness 将这些内容整理为：
 | 会话项目绑定 | 多根工作区、旧任务或错误 `cwd` 可显式绑定到一个项目；切换和迁移保持追加式审计 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | Agent 轨迹归档 | 从本地 transcript 提取 assistant 文本、reasoning/thinking、工具调用与结果、系统/开发者注入和 subagent 内容，按统一事件格式生成 `MODELOUT.md` |
+| Badcase 候选 | 自动同步后以确定性规则识别明确用户纠错，只生成待审核 candidate，不自动判定失败 |
+| Badcase 生命周期 | 支持确认、驳回、合并及 `open/resolved/recurred/deferred` 状态，并跟踪 `active/stable/probation/retired` Harness 生命周期 |
+| 失败契约 | 正式 case 必须定义 Red、Green 和预期失败原因，证据引用稳定的 prompt/trace ID |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
 | 模型元数据 | 优先使用 Hook 捕获值；历史记录可从 Claude assistant 行或 Codex `turn_context` 可靠推导 |
 | 图片归档 | 保存用户发送的常见栅格图片，按内容哈希去重并嵌入 `PROMPTS.md`；不联网下载 |
@@ -77,7 +78,9 @@ flowchart LR
   A --> M
   E --> S["可变会话总结"]
   E --> V["离线 HTML 时间线"]
-  E -. "event_id" .-> Q["未来 badcase 测试"]
+  E --> Q["review-only badcase candidates"]
+  O --> Q
+  Q --> R["人工确认的 Red/Green case"]
 ```
 
 Hook 前台路径保持有界：先验证原生会话 `cwd` 与候选项目根目录完全相同（或存在显式绑定），再自动初始化、清洗并追加当前提示词；如有图片，再校验并复制到本地内容哈希路径。随后它启动独立后台进程，不等待对账完成，也不联网或调用模型。项目第一次启用时做一次全量发现；之后每条输入都立即对账，但只比较已知源文件的大小与修改时间，并从保存的字节游标读取新增 JSONL 行。项目锁合并同项目重叠请求，全局锁避免多个项目同时重扫磁盘。
@@ -331,6 +334,8 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 │   ├── PROMPTS.md                    # 纯事实提示词 Markdown
 │   ├── MODELOUT.md                   # 逐条 Agent trace 事实 Markdown
 │   ├── TRAJECTORY.md                 # 本项目全部会话的分段交互轨迹
+│   ├── BADCASES.md                   # candidate 队列与正式 case 索引
+│   ├── badcase/*.md                  # 每个正式 case 的精简证据视图
 │   ├── prompt/*.md                   # 每个会话独立的提示词文件
 │   ├── modelout/*.md                 # 每个会话独立的模型/Agent trace 文件
 │   └── trajectory/*.md               # 每个会话独立的完整交互轨迹
@@ -347,7 +352,11 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 │   ├── auto-sync-pending.json         # 重叠触发合并队列
 │   ├── event-supersessions.jsonl      # 追加式旧事件替代关系
 │   └── event-exclusions.jsonl         # 追加式非人类事件排除关系
-└── badcases/                         # Phase 2 预留空间
+└── badcases/
+    ├── candidates.jsonl              # 自动检测、待审核的候选
+    ├── decisions.jsonl               # confirm/dismiss/merge 决策
+    ├── case-events.jsonl              # 正式 case 的追加式生命周期
+    └── runs/                          # 后续 replay/run 记录预留
 ```
 
 ### 事实层与派生层
@@ -362,12 +371,14 @@ python scripts/install_hooks.py --platform codex --codex-hook stop-recovery
 | 可读事实 | `index/PROMPTS.md` | 只有最小标题、逐条元数据和完整清洗后提示词 |
 | 可读 Agent trace | `index/MODELOUT.md` | 按 `O00001` 排列完整轨迹事件，显示事件类型、actor、subagent、结构化 payload 与对应 `P` 编号 |
 | 项目会话轨迹 | `index/TRAJECTORY.md` | 文件开头统计总 Session、Claude/Codex Session、总 Turn、总 Prompt；逐会话表列出各自 Turn/Prompt/trace 数，再按 `platform + session_id` 隔离展示问答 Turn |
+| Badcase 事实 | `badcases/*.jsonl` | candidate、审核决策和 case 更新均 append-only；candidate 不代表已经确认失败 |
+| Badcase 视图 | `index/BADCASES.md`、`index/badcase/*.md` | 可重建；逐 case 只复制完整相关 Prompt/最终回答，其他 trace 通过稳定 ID 和会话轨迹引用 |
 | 逐会话文件 | `index/{prompt,modelout,trajectory}/*.md` | 三个目录使用同一会话文件名：`时间-platform-model-会话主题.md`；其中 trajectory 按 Prompt-first Turn 展示，若名称冲突则追加稳定短哈希 |
 | 派生索引 | `catalog.json`、`sessions.json` | 可以重建 |
 | 可变总结 | `reports/*.md` | 允许随新会话改变结论 |
 | 可视化 | `visualizations/timeline.html` | 可以重建，不是事实源 |
 
-每条事件都带有稳定的 `event_id`。未来 badcase 记录只引用这个 ID，不复制或修改原始提示词。
+每条事件都带有稳定 ID。Badcase canonical 记录只引用 `event_id`/`trace_event_id`，不会修改原始提示词或执行轨迹。
 
 轨迹中的统一 `turn_id` 是规范化字段：Codex 直接使用 rollout 原生
 `turn_id`；Claude 沿 `parentUuid` 消息链回溯到对应的人类 user 行，使用
@@ -540,38 +551,93 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 
 不要通过直接改写 canonical JSONL 来“修复”计数。优先修复采集逻辑、追加补偿事件，或执行有来源记录的迁移。
 
+## Badcase 候选与审核
+
+自动同步会运行高精度、无模型调用的用户纠错检测器。也可以手动重跑；相同来源 Prompt 的 candidate 会按稳定 ID 去重：
+
+```powershell
+python scripts/prompt_harness.py badcase-detect --project "<project>"
+python scripts/prompt_harness.py badcase-list --project "<project>" --state pending
+```
+
+Candidate 只是“值得审核的证据”，不是模型失败结论。确认时必须给出可回归的失败契约：
+
+```powershell
+python scripts/prompt_harness.py badcase-confirm `
+  --project "<project>" `
+  --candidate-id "bcc_..." `
+  --title "Windows Hook 没有写入事件" `
+  --red "Hook 返回非零或没有新增事件" `
+  --green "Hook 返回 0 且账本出现对应 event_id" `
+  --expected-failure "旧实现使用了不可用的 Windows 路径" `
+  --guard-type integration
+```
+
+误报可以驳回，相同问题可以并入已有 case：
+
+```powershell
+python scripts/prompt_harness.py badcase-decide --project "<project>" --candidate-id "bcc_..." --action dismissed --reason "只是澄清需求"
+python scripts/prompt_harness.py badcase-decide --project "<project>" --candidate-id "bcc_..." --action merged --target-case-id "BC-..." --reason "同一工作流的复发证据"
+```
+
+先把多个 case 组织为 Feature Chain，或把队列、重试、恢复、浏览器等复杂流程组织为 Task Case。两者都必须先 Red 复现、再 Green 通过：
+
+```powershell
+python scripts/prompt_harness.py feature-chain-propose --project "<project>" --title "Hook 写入链" --entry "触发 Hook" --exit-check "事件和索引都存在" --checkpoint-title "事件已写入" --checkpoint-check "按 event_id 查询成功" --case-ids "BC-..."
+python scripts/prompt_harness.py feature-chain-approve --project "<project>" --chain-id "FC-..." --red-command-json '@red.json' --green-command-json '@green.json' --expected-red-reason "旧症状"
+python scripts/prompt_harness.py dev-complete --project "<project>" --jobs 2
+```
+
+跨模型比较先固定安全快照，再批准 adapter；模型输入不会包含纠正 Prompt、历史答案、根因、修复方式或 Judge oracle：
+
+```powershell
+python scripts/prompt_harness.py snapshot-create --project "<project>" --case-id "BC-..."
+python scripts/prompt_harness.py adapter-propose --project "<project>" --name "model-a" --platform codex --model "model-a" --command-json '@adapter.json'
+python scripts/prompt_harness.py adapter-approve --project "<project>" --adapter-id "MA-..."
+python scripts/prompt_harness.py replay-matrix --project "<project>" --case-id "BC-..." --snapshot-id "snp_..." --adapter-ids "MA-...,MA-..."
+```
+
+失败结果可产生“仅提案”的最小补偿。只有基线仍失败且补偿后通过才能批准；随后才能显式激活、进入无补偿 probation 或退役：
+
+```powershell
+python scripts/prompt_harness.py compensation-propose --project "<project>" --run-id "hrn_..." --type instruction --content "执行完成前检查落盘" --scope "Hook workflow" --rationale "固定快照可复现"
+python scripts/prompt_harness.py compensation-approve --project "<project>" --compensation-id "CP-..."
+python scripts/prompt_harness.py compensation-transition --project "<project>" --compensation-id "CP-..." --action activated --reason "Red/Green replay 通过"
+python scripts/prompt_harness.py compensation-recommend --project "<project>" --compensation-id "CP-..."
+```
+
 ## 项目边界
 
 当前版本会做：
 
 - 提示词与完整 Agent trace 的捕获/回填、清洗、去重和 Markdown 索引；
 - 首次对话自动初始化并发现全项目历史，后续每次输入执行游标式增量对账；
-- 为未来 badcase 提供稳定 `event_id` 和项目级目录结构。
+- 从明确用户纠错生成 review-only badcase candidate；
+- 以 append-only 决策确认、驳回或合并 candidate，并固化 Red/Green/预期失败原因；
+- 用 Feature Chain 和多阶段 Task Case 覆盖 case，并通过 Red/Green 门禁批准；
+- 在 Test Hub 中并行运行独立检查，失败保留证据、成功清理临时产物；
+- 固定不复制私密文件的项目快照，经批准后跨模型 replay，并用确定性断言或窄 Judge 判定；
+- 管理归因、预算、最小补偿、probation、复发再激活与 retirement；
+- 生成可重建的 `BADCASES.md`、`TEST_HUB.md`、`CONTEXT.md`、逐 case 证据和只读 HTML。
 
 当前版本不会做：
 
-- 不会评判模型输出质量；reasoning、工具调用与结果只按本地 transcript 中实际可恢复的内容归档；
-- 自动认定一次会话是否成功；
+- 自动认定一次会话或 candidate 是否真的失败；
 - 上传提示词到云端；
 - 读取用户提示词中引用的文件正文；
 - 下载远程图片 URL 或保存 SVG；
 - 自动发布项目提示词数据；
-- 执行 Phase 2 的 badcase 回归测试。
+- 自动修改 Prompt/Skill、自动批准/注册测试、自动批准 Adapter/Judge，或自动激活补偿。
 
-## Badcase Harness 路线图
+## Adaptive Badcase Harness
 
-未来 badcase 层计划通过 `event_id` 引用提示词，并增加：
+完整链路为：
 
 ```text
-badcases/cases/<case-id>/
-├── case.json                 # 失败定义与来源事件
-├── analysis.md               # 根因分析
-├── fixtures/paths.json       # 只保存测试所需路径映射
-├── acceptance.json           # 可执行验收标准
-└── runs/<model>/<run-id>.jsonl
+轨迹 → review candidate → confirmed case → Red/Green guard → snapshot → replay → judge/attribution → compensation → probation/retired
 ```
 
-目标流程是：发现长期无法解决的问题 → 固化 badcase → 定义验收测试 → 对指定模型反复运行 → 形成可复现的解决流程与回归记录。
+目标不是让规则无限增长，而是只在模型仍不可靠的地方提供最小补偿，并在新基模稳定通过后让补偿进入观察期和退役。所有自动检测都停留在 proposal；审批、激活和状态迁移必须显式执行。
 
 详见 [references/badcase-roadmap.md](references/badcase-roadmap.md)。
 
@@ -589,6 +655,8 @@ python scripts/prompt_harness.py doctor --project "<test-project>"
 
 - [事件结构](references/event-schema.md)
 - [架构与去重](references/architecture.md)
+- [Adaptive Harness 协议](references/adaptive-harness.md)
+- [完整版本验收矩阵](references/completion-audit.md)
 - [隐私模型](PRIVACY.md)
 - [Badcase 路线图](references/badcase-roadmap.md)
 - [相关会话历史工具](references/related-work.md)

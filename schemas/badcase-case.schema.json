@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/badcase-case.schema.json",
+  "title": "Prompt Harness folded badcase contract",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "case_id",
+    "title",
+    "status",
+    "category",
+    "severity",
+    "scope",
+    "tags",
+    "frequency",
+    "phenomenon",
+    "trigger_reproduction",
+    "guard",
+    "coverage",
+    "harness",
+    "source_candidate_ids",
+    "evidence"
+  ],
+  "properties": {
+    "contract_version": {"const": "2.0.0"},
+    "case_id": {"type": "string", "pattern": "^BC-[0-9]{8}-[0-9A-F]{8}$"},
+    "title": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": ["open", "resolved", "recurred", "deferred", "superseded-by-route-change"]
+    },
+    "severity": {"enum": ["low", "medium", "high", "critical"]},
+    "scope": {"type": "string", "minLength": 1},
+    "tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "frequency": {"type": "string", "pattern": "^(first-seen|repeated-[1-9][0-9]*|high-frequency)$"},
+    "phenomenon": {"type": "string", "minLength": 1},
+    "trigger_reproduction": {"type": "string", "minLength": 1},
+    "guard": {
+      "type": "object",
+      "required": [
+        "type",
+        "verification",
+        "run_policy",
+        "artifact_policy",
+        "blocker_handling",
+        "red_condition",
+        "green_condition",
+        "expected_failure_reason"
+      ],
+      "properties": {
+        "type": {"type": "string", "minLength": 1},
+        "verification": {"type": "string", "minLength": 1},
+        "run_policy": {
+          "enum": [
+            "every-dev-completion",
+            "relevant-only",
+            "manual",
+            "release-only",
+            "goal-final",
+            "disabled-with-reason",
+            "user-defined"
+          ]
+        },
+        "artifact_policy": {
+          "enum": [
+            "cleanup-on-pass-preserve-on-fail",
+            "cleanup-on-pass",
+            "preserve-on-fail",
+            "manual-preserve",
+            "none"
+          ]
+        },
+        "blocker_handling": {
+          "enum": [
+            "credentials",
+            "external-service",
+            "permissions",
+            "resource-limits",
+            "network",
+            "destructive-confirmation",
+            "user-judgment",
+            "none"
+          ]
+        },
+        "red_condition": {"type": "string", "minLength": 1},
+        "green_condition": {"type": "string", "minLength": 1},
+        "expected_failure_reason": {"type": "string", "minLength": 1},
+        "reusable_path": {"type": ["string", "null"]}
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["feature_chain_ids", "task_case_ids"],
+      "properties": {
+        "feature_chain_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^FC-[0-9]{8}-[0-9A-F]{8}$"},
+          "uniqueItems": true
+        },
+        "task_case_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/harness-run-event.schema.json",
+  "title": "Prompt Harness append-only test/replay run event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "run_event_id",
+    "run_id",
+    "action",
+    "recorded_at",
+    "mode",
+    "target_type",
+    "target_id",
+    "expectation"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "harness_run_event"},
+    "run_event_id": {"type": "string", "pattern": "^hre_[0-9a-f]{32}$"},
+    "run_id": {"type": "string", "pattern": "^hrn_[0-9a-f]{32}$"},
+    "action": {"enum": ["started", "completed"]},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "mode": {"type": "string"},
+    "target_type": {"type": "string"},
+    "target_id": {"type": "string"},
+    "expectation": {"enum": ["red", "green"]},
+    "status": {"enum": ["running", "passed", "failed", "blocked"]},
+    "expectation_met": {"type": "boolean"},
+    "returncode": {"type": ["integer", "null"]},
+    "elapsed_ms": {"type": "integer", "minimum": 0},
+    "checkpoints": {"type": "array", "items": {"type": "object"}},
+    "evidence_path": {"type": ["string", "null"]},
+    "evidence_files": {"type": "array", "items": {"type": "string"}}
+  }
+}

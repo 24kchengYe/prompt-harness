@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/harness-snapshot.schema.json",
+  "title": "Prompt Harness sanitized project snapshot",
+  "type": "object",
+  "required": ["schema_version", "record_type", "snapshot_id", "created_at", "project", "case_id", "manifest_sha256", "manifest"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "harness_snapshot"},
+    "snapshot_id": {"type": "string", "pattern": "^snp_[0-9a-f]{32}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "project": {
+      "type": "object",
+      "required": ["id", "root"],
+      "properties": {"id": {"type": "string"}, "root": {"type": "string"}}
+    },
+    "case_id": {"type": "string", "pattern": "^BC-[0-9]{8}-[0-9A-F]{8}$"},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "manifest": {
+      "type": "object",
+      "required": ["manifest_version", "project_id", "case_id", "vcs", "files", "excluded", "evidence", "environment", "materialization"]
+    }
+  },
+  "additionalProperties": false
+}

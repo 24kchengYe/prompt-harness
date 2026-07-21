@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/badcase-decision.schema.json",
+  "title": "Prompt Harness badcase candidate decision",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "decision_id",
+    "candidate_id",
+    "action",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "badcase_decision"},
+    "decision_id": {"type": "string", "pattern": "^bcd_[0-9a-f]{32}$"},
+    "candidate_id": {"type": "string", "pattern": "^bcc_[0-9a-f]{32}$"},
+    "action": {"enum": ["confirmed", "dismissed", "merged"]},
+    "case_id": {"type": ["string", "null"]},
+    "target_case_id": {"type": ["string", "null"]},
+    "reason": {"type": ["string", "null"]},
+    "recorded_at": {"type": "string", "format": "date-time"}
+  }
+}

@@ -96,6 +96,7 @@ class HookLauncherTests(unittest.TestCase):
         result = self.run_hook(base, payload, plugin_root=deleted_old_root)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
         event_files = list((project / ".prompt-harness" / "events").rglob("*.jsonl"))
         self.assertEqual(len(event_files), 1)
         event = json.loads(event_files[0].read_text(encoding="utf-8").strip())
@@ -149,6 +150,7 @@ class HookLauncherTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
         event_files = list((project / ".prompt-harness" / "events").rglob("*.jsonl"))
         self.assertEqual(len(event_files), 1)
         captured = json.loads(event_files[0].read_text(encoding="utf-8").strip())
@@ -184,6 +186,7 @@ class HookLauncherTests(unittest.TestCase):
         result = self.run_hook(base, payload, plugin_root=base / "deleted-plugin")
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
         log = base / "harness-home" / "state" / "plugin-hook-errors.jsonl"
         self.assertTrue(log.is_file())
         diagnostic = log.read_text(encoding="utf-8")

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.12.1 - 2026-07-21
+
+- Emit schema-valid neutral JSON from Codex Prompt Harness hook launchers while keeping capture diagnostics out of hook stdout.
+- Install standalone Codex hooks through the protocol-safe launchers instead of invoking business CLI commands directly.
+- Prune missing or archived selected rollout cursors during incremental reconciliation so one stale path cannot stop project updates.
+- Add regression coverage for strict Hook output parsing and stale source cursor recovery.
+
+## 0.12.0 - 2026-07-18
+
+- Add review-gated feature chains, ordered task cases, Red/Green approval preflights, checkpoint markers, bounded parallel Test Hub runs, compact Markdown, and read-only HTML status views.
+- Add sanitized manifest-only project snapshots and approved model-adapter replay matrices that pin one case/snapshot while excluding correction prompts, historical answers, root causes, fixes, and judge-only fields from model input.
+- Add deterministic outcome assertions, separately approved narrow judge adapters, explicit run attribution, and evidence preservation for task, environment, runtime, policy, judge, and protocol failures.
+- Add proposal-only adaptive compensations with baseline-fail/compensated-pass approval, activation, supersession, probation, recurrence reactivation, and retirement recommendations.
+- Add per-project/case/test execution policies, token/cost/attempt budgets, exact-root subagent bindings, idempotent completion evidence, and a concise regenerated `index/CONTEXT.md`.
+- Run approved completion checks from detached Stop/Goal reconciliation without blocking prompt capture; failures remain visible and cannot suppress independent passes.
+- Expand `doctor`, schemas, Test Hub views, CLI routing, and cross-platform regression coverage for every new append-only ledger.
+
+## 0.11.0 - 2026-07-18
+
+- Add a deterministic, no-model `explicit-user-correction-v1` detector that runs once after automatic reconciliation and creates review-only badcase candidates without asserting failure.
+- Link candidates to the correction prompt, preceding prompt, intervening/linked trace IDs, session, model, and detector signals while keeping prompt/trace ledgers unchanged.
+- Add append-only candidate decisions (`confirmed`, `dismissed`, `merged`) and append-only confirmed-case lifecycle events.
+- Require Red, Green, and expected-failure conditions when confirming a case; keep issue status separate from Harness lifecycle (`active`, `stable`, `probation`, `retired`).
+- Add `badcase-detect`, `badcase-list`, `badcase-confirm`, `badcase-decide`, and `badcase-update` commands.
+- Generate project-wide `index/BADCASES.md` and one compact evidence file per confirmed case, preserving complete prompts/final answers while linking full reasoning/tool/injection/subagent traffic through the session trajectory.
+- Extend `doctor`, catalog metadata, privacy defaults, schemas, documentation, and regression tests for candidate/case integrity.
+- Coalesce automatic ingestion, candidate detection, and dirty projection into at most one index rebuild per sync worker.
+
 ## 0.10.0 - 2026-07-16
 
 - Archive Claude Code and Codex execution facts as append-only typed `agent_trace` events: assistant text, reasoning/thinking, tool calls/results, system/developer injection, runtime system events, and subagent traffic.

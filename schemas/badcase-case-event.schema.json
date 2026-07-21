@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/badcase-case-event.schema.json",
+  "title": "Prompt Harness append-only badcase lifecycle event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "case_event_id",
+    "case_id",
+    "action",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "badcase_case_event"},
+    "case_event_id": {"type": "string", "pattern": "^bce_[0-9a-f]{32}$"},
+    "case_id": {"type": "string", "pattern": "^BC-[0-9]{8}-[0-9A-F]{8}$"},
+    "action": {"enum": ["created", "updated"]},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "source_candidate_id": {"type": ["string", "null"]},
+    "case": {"type": "object"},
+    "patch": {"type": "object"},
+    "note": {"type": ["string", "null"]}
+  }
+}

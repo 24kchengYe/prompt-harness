@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/24kchengYe/prompt-harness/schemas/feature-chain-event.schema.json",
+  "title": "Prompt Harness append-only feature-chain event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "feature_chain_event_id",
+    "chain_id",
+    "action",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "record_type": {"const": "feature_chain_event"},
+    "feature_chain_event_id": {"type": "string", "pattern": "^fce_[0-9a-f]{32}$"},
+    "chain_id": {"type": "string", "pattern": "^FC-[0-9]{8}-[0-9A-F]{8}$"},
+    "action": {
+      "enum": [
+        "created",
+        "checkpoint_attached",
+        "checkpoint_policy_updated",
+        "approved",
+        "policy_updated",
+        "disabled",
+        "retired",
+        "reactivated"
+      ]
+    },
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "chain": {"type": "object"},
+    "checkpoint": {"type": "object"},
+    "red_command": {"$ref": "#/$defs/command"},
+    "green_command": {"$ref": "#/$defs/command"},
+    "approval_run_ids": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^hrn_[0-9a-f]{32}$"}
+    }
+  },
+  "$defs": {
+    "command": {
+      "type": ["object", "null"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "cwd": {"type": "string"},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "env_allow": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      }
+    }
+  }
+}

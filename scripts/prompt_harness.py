@@ -13,12 +13,16 @@ import argparse
 import base64
 import binascii
 import collections
+import concurrent.futures
 import contextlib
 import datetime as dt
 import hashlib
+import html
 import json
+import ntpath
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -38,6 +42,19 @@ LEGACY_MODEL_OUTPUT_RECORD_TYPE = "model_output"
 IMAGE_RECORD_TYPE = "prompt_image"
 EXCLUSION_RECORD_TYPE = "event_exclusion"
 SESSION_BINDING_RECORD_TYPE = "session_project_binding"
+BADCASE_CANDIDATE_RECORD_TYPE = "badcase_candidate"
+BADCASE_DECISION_RECORD_TYPE = "badcase_decision"
+BADCASE_CASE_EVENT_RECORD_TYPE = "badcase_case_event"
+FEATURE_CHAIN_EVENT_RECORD_TYPE = "feature_chain_event"
+HARNESS_RUN_EVENT_RECORD_TYPE = "harness_run_event"
+SNAPSHOT_EVENT_RECORD_TYPE = "harness_snapshot"
+TASK_CASE_EVENT_RECORD_TYPE = "task_case_event"
+ADAPTER_EVENT_RECORD_TYPE = "model_adapter_event"
+JUDGE_EVENT_RECORD_TYPE = "judge_event"
+ATTRIBUTION_EVENT_RECORD_TYPE = "attribution_event"
+COMPENSATION_EVENT_RECORD_TYPE = "compensation_event"
+POLICY_EVENT_RECORD_TYPE = "harness_policy_event"
+SUBAGENT_EVENT_RECORD_TYPE = "subagent_event"
 EXACT_ROOT_EXCLUSION_PREFIX = "cwd_outside_exact_project_root_"
 MAX_IMAGES_PER_EVENT = 20
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -101,7 +118,8 @@ This directory is managed by Prompt Harness.
 - `assets/manifest.jsonl` links those images to immutable prompt `event_id` values.
 - `visualizations/timeline.html` is a rebuildable, local prompt timeline.
 - `state/` contains locks and ingestion state.
-- `badcases/` is reserved for the future evaluation harness.
+- `badcases/` contains append-only cases, tests, snapshots, replay, judge, policy, and lifecycle events.
+- `index/BADCASES.md`, `index/TEST_HUB.md`, `index/CONTEXT.md`, and their subdirectories are rebuildable views.
 
 Prompt bodies are private by default. The nested `.gitignore` prevents the
 ledger from being committed accidentally. Use the Prompt Harness CLI to search,
@@ -118,28 +136,73 @@ reports/
 assets/
 visualizations/
 state/
-badcases/cases/
-badcases/runs/
+badcases/
 """
 
-BADCASE_README = """# Badcase harness (reserved)
+BADCASE_README = """# Badcase harness
 
-The prompt ledger is phase 1. A future badcase record will reference immutable
-prompt `event_id` values and add response traces, failure taxonomies, fixtures,
-model/run metadata, acceptance tests, and regression status without changing
-the v1 prompt-event schema.
-
-Planned layout:
+Badcase records reference immutable prompt and trace event IDs without changing
+the source ledgers. Automatic detection creates reviewable candidates only;
+it never changes prompts, registers tests, or claims that a model failed.
 
 ```
-badcases/cases/<case-id>/
-  case.json
-  analysis.md
-  fixtures/paths.json
-  acceptance.json
-  runs/<model>/<run-id>.jsonl
+badcases/candidates.jsonl   # append-only detector output
+badcases/decisions.jsonl    # confirm, dismiss, and merge decisions
+badcases/case-events.jsonl  # append-only case lifecycle updates
+badcases/feature-chain-events.jsonl # proposed/approved workflow guards
+badcases/task-case-events.jsonl # ordered multi-phase workflow guards
+badcases/snapshot-events.jsonl # sanitized immutable project manifests
+badcases/adapter-events.jsonl # proposed/approved model adapters
+badcases/judge-events.jsonl # judge registry and outcome decisions
+badcases/attribution-events.jsonl # manual attribution overrides
+badcases/compensation-events.jsonl # minimal compensation lifecycle
+badcases/policy-events.jsonl # bounded execution policies
+badcases/subagent-events.jsonl # exact-root binding and completion evidence
+badcases/run-events.jsonl   # append-only dry-run and Test Hub results
+badcases/runs/              # bounded pass/fail execution artifacts
+index/BADCASES.md           # rebuildable project summary
+index/badcase/<case-id>.md  # compact evidence view per confirmed case
+index/test-hub/             # rebuildable Test Hub views
 ```
+
+Confirmed cases require a red condition, green condition, and expected failure
+reason. Full source facts remain in `events/` and `model-events/`; case views
+link to stable IDs and include only the prompt/final-answer evidence needed for
+review.
 """
+
+BADCASE_CORRECTION_PATTERNS: tuple[tuple[str, re.Pattern[str], float], ...] = (
+    (
+        "explicit_correction_zh",
+        re.compile(
+            r"(?:^|[，。！？\s])(不对|不是这样|你漏(?:了|掉)(?:[^，。！？\s]{0,16})?|并没有|搞错了|弄错了)(?:[，。！？\s]|$)"
+        ),
+        0.9,
+    ),
+    (
+        "persistent_failure_zh",
+        re.compile(r"(?:还是|仍然|依然|又).{0,24}(?:不对|不行|不能|没有|没生成|失败|报错|打不开|无法|错误)"),
+        0.85,
+    ),
+    (
+        "missing_result_zh",
+        re.compile(r"(?:怎么|为什么|为啥).{0,24}(?:没有|没|不|还没).{0,24}(?:生成|更新|记录|显示|生效|工作|运行)"),
+        0.75,
+    ),
+    (
+        "ordering_or_scope_zh",
+        re.compile(r"(?:顺序|会话|目录|范围).{0,18}(?:不对|错了|漏了|没有区分|混在一起)"),
+        0.75,
+    ),
+    (
+        "explicit_correction_en",
+        re.compile(
+            r"\b(?:that(?:'s| is) (?:wrong|incorrect|not right)|not what i asked|you missed|you forgot|still (?:fails|broken|wrong|doesn['’]?t work)|didn['’]?t work)\b",
+            re.I,
+        ),
+        0.85,
+    ),
+)
 
 
 def utc_now() -> dt.datetime:
@@ -170,6 +233,8 @@ def normalize_path(value: Any) -> str:
     text = str(value or "").strip()
     if text.startswith("\\\\?\\"):
         text = text[4:]
+    if re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("\\\\"):
+        return ntpath.normcase(ntpath.normpath(text)).replace("\\", "/").rstrip("/").lower()
     try:
         text = str(Path(text).resolve())
     except (OSError, RuntimeError):
@@ -682,8 +747,9 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         "assets/images",
         "visualizations",
         "state",
-        "badcases/cases",
         "badcases/runs",
+        "index/badcase",
+        "index/test-hub",
     ):
         (store / relative).mkdir(parents=True, exist_ok=True)
     config_path = store / "config.json"
@@ -712,7 +778,17 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
                 "redact_obvious_secrets": True,
                 "git_private_by_default": True,
             },
-            "future": {"badcase_schema": "reserved"},
+            "badcases": {
+                "schema_version": "1.0.0",
+                "automatic_detection": "candidate_only",
+                "detector": "explicit-user-correction-v1",
+                "auto_register_tests": False,
+                "completion_tests": {
+                    "enabled": True,
+                    "triggers": ["stop_recovery", "stop", "goal_final"],
+                    "jobs": 2
+                },
+            },
             "auto_sync": {
                 "enabled": True,
                 "platform": "all",
@@ -734,6 +810,22 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         if "store_user_images" not in privacy:
             privacy["store_user_images"] = True
             changed_config = True
+        badcases = config.setdefault("badcases", {})
+        badcase_defaults = {
+            "schema_version": "1.0.0",
+            "automatic_detection": "candidate_only",
+            "detector": "explicit-user-correction-v1",
+            "auto_register_tests": False,
+            "completion_tests": {
+                "enabled": True,
+                "triggers": ["stop_recovery", "stop", "goal_final"],
+                "jobs": 2,
+            },
+        }
+        for key, value in badcase_defaults.items():
+            if key not in badcases:
+                badcases[key] = value
+                changed_config = True
         auto_sync = config.setdefault("auto_sync", {})
         auto_sync_defaults = {
             "enabled": True,
@@ -752,17 +844,37 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
                 changed_config = True
     if changed_config:
         write_json(config_path, config)
-    if not (store / "README.md").exists():
-        atomic_write(store / "README.md", PROJECT_README)
+    store_readme = store / "README.md"
+    if (
+        not store_readme.exists()
+        or "`badcases/` is reserved for the future evaluation harness" in store_readme.read_text(
+            encoding="utf-8", errors="replace"
+        )
+    ):
+        atomic_write(store_readme, PROJECT_README)
     gitignore_path = store / ".gitignore"
     if not gitignore_path.exists():
         atomic_write(gitignore_path, PROJECT_GITIGNORE)
     else:
         gitignore_text = gitignore_path.read_text(encoding="utf-8", errors="replace")
-        if not re.search(r"(?m)^assets/?$", gitignore_text):
-            atomic_write(gitignore_path, gitignore_text.rstrip() + "\nassets/\n")
-    if not (store / "badcases" / "README.md").exists():
-        atomic_write(store / "badcases" / "README.md", BADCASE_README)
+        missing_ignores = [
+            entry
+            for entry in ("assets/", "badcases/")
+            if not re.search(rf"(?m)^{re.escape(entry.rstrip('/'))}/?$", gitignore_text)
+        ]
+        if missing_ignores:
+            atomic_write(
+                gitignore_path,
+                gitignore_text.rstrip() + "\n" + "\n".join(missing_ignores) + "\n",
+            )
+    badcase_readme = store / "badcases" / "README.md"
+    if (
+        not badcase_readme.exists()
+        or badcase_readme.read_text(encoding="utf-8", errors="replace").startswith(
+            "# Badcase harness (reserved)"
+        )
+    ):
+        atomic_write(badcase_readme, BADCASE_README)
     register_project(root, store)
     return store, config
 
@@ -843,6 +955,3672 @@ def iter_model_outputs(store: Path) -> Iterator[dict[str, Any]]:
             if source_key in upgraded_sources:
                 continue
         yield value
+
+
+def iter_agent_traces_in_ranges(
+    store: Path,
+    ranges: dict[tuple[str, str], tuple[str, str]],
+) -> Iterator[dict[str, Any]]:
+    """Stream only v1 trace rows whose session/time can support new candidates."""
+
+    if not ranges:
+        return
+    parsed_ranges = {
+        key: (parse_iso(lower), parse_iso(upper))
+        for key, (lower, upper) in ranges.items()
+    }
+    dated_ranges = [
+        (lower.date(), upper.date())
+        for lower, upper in parsed_ranges.values()
+        if lower and upper
+    ]
+    for path in iter_model_output_files(store):
+        match = re.search(r"model-outputs-(\d{4}-\d{2}-\d{2})\.jsonl$", path.name)
+        if match and dated_ranges:
+            file_day = dt.date.fromisoformat(match.group(1))
+            if not any(lower <= file_day <= upper for lower, upper in dated_ranges):
+                continue
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(value, dict) or value.get("record_type") != MODEL_OUTPUT_RECORD_TYPE:
+                    continue
+                key = (
+                    str(value.get("source", {}).get("platform") or "unknown"),
+                    str(value.get("session", {}).get("id") or "unknown"),
+                )
+                bounds = parsed_ranges.get(key)
+                if not bounds:
+                    continue
+                occurred = parse_iso(value.get("occurred_at"))
+                lower, upper = bounds
+                if occurred and lower and upper and lower <= occurred <= upper:
+                    yield value
+
+
+def badcase_candidate_file(store: Path) -> Path:
+    return store / "badcases" / "candidates.jsonl"
+
+
+def badcase_decision_file(store: Path) -> Path:
+    return store / "badcases" / "decisions.jsonl"
+
+
+def badcase_case_event_file(store: Path) -> Path:
+    return store / "badcases" / "case-events.jsonl"
+
+
+def feature_chain_event_file(store: Path) -> Path:
+    return store / "badcases" / "feature-chain-events.jsonl"
+
+
+def harness_run_event_file(store: Path) -> Path:
+    return store / "badcases" / "run-events.jsonl"
+
+
+def snapshot_event_file(store: Path) -> Path:
+    return store / "badcases" / "snapshot-events.jsonl"
+
+
+def task_case_event_file(store: Path) -> Path:
+    return store / "badcases" / "task-case-events.jsonl"
+
+
+def adapter_event_file(store: Path) -> Path:
+    return store / "badcases" / "adapter-events.jsonl"
+
+
+def judge_event_file(store: Path) -> Path:
+    return store / "badcases" / "judge-events.jsonl"
+
+
+def attribution_event_file(store: Path) -> Path:
+    return store / "badcases" / "attribution-events.jsonl"
+
+
+def compensation_event_file(store: Path) -> Path:
+    return store / "badcases" / "compensation-events.jsonl"
+
+
+def policy_event_file(store: Path) -> Path:
+    return store / "badcases" / "policy-events.jsonl"
+
+
+def subagent_event_file(store: Path) -> Path:
+    return store / "badcases" / "subagent-events.jsonl"
+
+
+def iter_badcase_records(path: Path, record_type: str) -> Iterator[dict[str, Any]]:
+    if not path.exists():
+        return
+    for _, value in read_jsonl(path):
+        if value.get("record_type") == record_type:
+            yield value
+
+
+def iter_badcase_candidates(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(badcase_candidate_file(store), BADCASE_CANDIDATE_RECORD_TYPE)
+
+
+def iter_badcase_decisions(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(badcase_decision_file(store), BADCASE_DECISION_RECORD_TYPE)
+
+
+def iter_badcase_case_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(badcase_case_event_file(store), BADCASE_CASE_EVENT_RECORD_TYPE)
+
+
+def iter_feature_chain_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(feature_chain_event_file(store), FEATURE_CHAIN_EVENT_RECORD_TYPE)
+
+
+def iter_harness_run_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(harness_run_event_file(store), HARNESS_RUN_EVENT_RECORD_TYPE)
+
+
+def iter_snapshot_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(snapshot_event_file(store), SNAPSHOT_EVENT_RECORD_TYPE)
+
+
+def iter_task_case_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(task_case_event_file(store), TASK_CASE_EVENT_RECORD_TYPE)
+
+
+def iter_adapter_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(adapter_event_file(store), ADAPTER_EVENT_RECORD_TYPE)
+
+
+def iter_judge_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(judge_event_file(store), JUDGE_EVENT_RECORD_TYPE)
+
+
+def iter_attribution_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(attribution_event_file(store), ATTRIBUTION_EVENT_RECORD_TYPE)
+
+
+def iter_compensation_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(compensation_event_file(store), COMPENSATION_EVENT_RECORD_TYPE)
+
+
+def iter_policy_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(policy_event_file(store), POLICY_EVENT_RECORD_TYPE)
+
+
+def iter_subagent_events(store: Path) -> Iterator[dict[str, Any]]:
+    yield from iter_badcase_records(subagent_event_file(store), SUBAGENT_EVENT_RECORD_TYPE)
+
+
+def append_unique_badcase_record(
+    store: Path,
+    path: Path,
+    record: dict[str, Any],
+    *,
+    id_field: str,
+) -> bool:
+    record_id = str(record.get(id_field) or "")
+    if not record_id:
+        raise ValueError(f"Missing {id_field}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(store / "state" / "badcase-write.lock"):
+        if path.exists() and any(
+            str(value.get(id_field) or "") == record_id for _, value in read_jsonl(path)
+        ):
+            return False
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        mark_index_dirty(store, f"{record.get('record_type')}_appended")
+    return True
+
+
+def clean_harness_text(value: Any, *, field: str, required: bool = False) -> str | None:
+    cleaned, _ = sanitize_prompt(str(value or ""))
+    cleaned = cleaned.strip()
+    if required and not cleaned:
+        raise ValueError(f"{field} is required")
+    return cleaned or None
+
+
+def active_feature_chains(store: Path) -> dict[str, dict[str, Any]]:
+    chains: dict[str, dict[str, Any]] = {}
+    for event in iter_feature_chain_events(store):
+        chain_id = str(event.get("chain_id") or "")
+        action = str(event.get("action") or "")
+        if action == "created":
+            body = event.get("chain") if isinstance(event.get("chain"), dict) else {}
+            chains[chain_id] = json.loads(json.dumps(body))
+            chains[chain_id]["chain_id"] = chain_id
+            chains[chain_id]["created_at"] = event.get("recorded_at")
+            chains[chain_id]["updated_at"] = event.get("recorded_at")
+            chains[chain_id]["event_ids"] = [event.get("feature_chain_event_id")]
+            continue
+        chain = chains.get(chain_id)
+        if not chain:
+            continue
+        if action == "checkpoint_attached":
+            checkpoint = event.get("checkpoint") if isinstance(event.get("checkpoint"), dict) else {}
+            title = str(checkpoint.get("title") or "")
+            existing = next(
+                (item for item in chain.get("checkpoints", []) if str(item.get("title") or "") == title),
+                None,
+            )
+            if existing:
+                if checkpoint.get("check"):
+                    existing["check"] = checkpoint["check"]
+                case_ids = list(existing.get("case_ids") or [])
+                for case_id in checkpoint.get("case_ids") or []:
+                    if case_id not in case_ids:
+                        case_ids.append(case_id)
+                existing["case_ids"] = case_ids
+                existing.pop("coverage_pending_reason", None)
+            else:
+                chain.setdefault("checkpoints", []).append(json.loads(json.dumps(checkpoint)))
+        elif action == "checkpoint_policy_updated":
+            title = str(event.get("checkpoint_title") or "")
+            for checkpoint in chain.get("checkpoints", []):
+                if str(checkpoint.get("title") or "") == title:
+                    checkpoint["required"] = bool(event.get("required"))
+                    checkpoint["policy_reason"] = event.get("reason")
+                    break
+        elif action == "approved":
+            chain["status"] = "approved"
+            chain["run_policy"] = event.get("run_policy") or chain.get("run_policy")
+            chain["green_command"] = event.get("green_command")
+            chain["red_command"] = event.get("red_command")
+            chain["expected_red_reason"] = event.get("expected_red_reason")
+            chain["approval_run_ids"] = list(event.get("approval_run_ids") or [])
+            chain["approved_at"] = event.get("recorded_at")
+        elif action == "policy_updated":
+            chain["run_policy"] = event.get("run_policy")
+            chain["policy_reason"] = event.get("reason")
+        elif action in {"disabled", "retired", "reactivated"}:
+            chain["status"] = {
+                "disabled": "disabled",
+                "retired": "retired",
+                "reactivated": "approved",
+            }[action]
+            chain["state_reason"] = event.get("reason")
+        chain["updated_at"] = event.get("recorded_at")
+        chain.setdefault("event_ids", []).append(event.get("feature_chain_event_id"))
+    return chains
+
+
+def feature_chain_id(title: str, entry: str) -> str:
+    now = utc_now()
+    material = f"{title}|{entry}|{iso_z(now)}|{uuid.uuid4()}"
+    return f"FC-{now:%Y%m%d}-{sha256_text(material)[:8].upper()}"
+
+
+def feature_chain_checkpoint_id(chain_id: str, title: str) -> str:
+    return f"FCP-{sha256_text(f'{chain_id}|{title}')[:12].upper()}"
+
+
+def create_feature_chain(
+    store: Path,
+    *,
+    title: str,
+    entry: str,
+    exit_check: str,
+    checkpoint_title: str,
+    checkpoint_check: str,
+    case_ids: list[str] | None = None,
+    coverage_pending_reason: str | None = None,
+    run_policy: str = "every-dev-completion",
+    artifact_policy: str = "cleanup-on-pass-preserve-on-fail",
+    blocker_policy: list[str] | None = None,
+) -> dict[str, Any]:
+    cleaned_title = clean_harness_text(title, field="title", required=True)
+    cleaned_entry = clean_harness_text(entry, field="entry", required=True)
+    cleaned_exit = clean_harness_text(exit_check, field="exit_check", required=True)
+    cleaned_checkpoint_title = clean_harness_text(
+        checkpoint_title,
+        field="checkpoint_title",
+        required=True,
+    )
+    cleaned_checkpoint_check = clean_harness_text(
+        checkpoint_check,
+        field="checkpoint_check",
+        required=True,
+    )
+    ids = [str(value).strip() for value in (case_ids or []) if str(value).strip()]
+    existing_cases = active_badcase_cases(store)
+    unknown = [value for value in ids if value not in existing_cases]
+    if unknown:
+        raise ValueError("Unknown badcase(s): " + ", ".join(unknown))
+    pending_reason = clean_harness_text(
+        coverage_pending_reason,
+        field="coverage_pending_reason",
+    )
+    if not ids and not pending_reason:
+        raise ValueError("A proposed chain requires case coverage or a coverage-pending reason")
+    if run_policy not in {
+        "every-dev-completion",
+        "relevant-only",
+        "manual",
+        "release-only",
+        "goal-final",
+    }:
+        raise ValueError(f"Unsupported run policy: {run_policy}")
+    chain_id = feature_chain_id(str(cleaned_title), str(cleaned_entry))
+    checkpoint = {
+        "checkpoint_id": feature_chain_checkpoint_id(chain_id, str(cleaned_checkpoint_title)),
+        "title": cleaned_checkpoint_title,
+        "check": cleaned_checkpoint_check,
+        "case_ids": ids,
+        "required": True,
+    }
+    if pending_reason:
+        checkpoint["coverage_pending_reason"] = pending_reason
+    chain = {
+        "title": cleaned_title,
+        "status": "proposed",
+        "entry": cleaned_entry,
+        "exit_check": cleaned_exit,
+        "run_policy": run_policy,
+        "artifact_policy": artifact_policy,
+        "blocker_policy": list(blocker_policy or []),
+        "checkpoints": [checkpoint],
+        "green_command": None,
+        "red_command": None,
+        "approval_run_ids": [],
+        "confirmation_required": True,
+    }
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": FEATURE_CHAIN_EVENT_RECORD_TYPE,
+        "feature_chain_event_id": "fce_" + sha256_text(f"created|{chain_id}")[:32],
+        "chain_id": chain_id,
+        "action": "created",
+        "recorded_at": iso_z(),
+        "chain": chain,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        feature_chain_event_file(store),
+        event,
+        id_field="feature_chain_event_id",
+    )
+    for case_id in ids:
+        ensure_badcase_feature_chain_coverage(store, case_id=case_id, chain_id=chain_id)
+    return {"changed": changed, "chain_id": chain_id, "chain": {**chain, "chain_id": chain_id}}
+
+
+def attach_feature_chain_case(
+    store: Path,
+    *,
+    chain_id: str,
+    checkpoint_title: str,
+    checkpoint_check: str,
+    case_id: str,
+) -> dict[str, Any]:
+    chain = active_feature_chains(store).get(chain_id)
+    if not chain:
+        raise ValueError(f"Unknown feature chain: {chain_id}")
+    if chain.get("status") in {"retired"}:
+        raise ValueError("Cannot attach coverage to a retired feature chain")
+    if case_id not in active_badcase_cases(store):
+        raise ValueError(f"Unknown badcase: {case_id}")
+    title = clean_harness_text(checkpoint_title, field="checkpoint_title", required=True)
+    check = clean_harness_text(checkpoint_check, field="checkpoint_check", required=True)
+    checkpoint = {
+        "checkpoint_id": feature_chain_checkpoint_id(chain_id, str(title)),
+        "title": title,
+        "check": check,
+        "case_ids": [case_id],
+        "required": True,
+    }
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": FEATURE_CHAIN_EVENT_RECORD_TYPE,
+        "feature_chain_event_id": "fce_"
+        + sha256_text(f"attach|{chain_id}|{title}|{case_id}|{check}")[:32],
+        "chain_id": chain_id,
+        "action": "checkpoint_attached",
+        "recorded_at": iso_z(),
+        "checkpoint": checkpoint,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        feature_chain_event_file(store),
+        event,
+        id_field="feature_chain_event_id",
+    )
+    ensure_badcase_feature_chain_coverage(store, case_id=case_id, chain_id=chain_id)
+    return {"changed": changed, "chain_id": chain_id, "checkpoint": checkpoint}
+
+
+def set_feature_chain_checkpoint_policy(
+    store: Path,
+    *,
+    chain_id: str,
+    checkpoint_title: str,
+    required: bool,
+    reason: str,
+) -> dict[str, Any]:
+    chain = active_feature_chains(store).get(chain_id)
+    if not chain:
+        raise ValueError(f"Unknown feature chain: {chain_id}")
+    if not any(str(item.get("title") or "") == checkpoint_title for item in chain.get("checkpoints", [])):
+        raise ValueError(f"Unknown checkpoint: {checkpoint_title}")
+    cleaned_reason = clean_harness_text(reason, field="reason", required=True)
+    material = f"checkpoint-policy|{chain_id}|{checkpoint_title}|{required}|{cleaned_reason}"
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": FEATURE_CHAIN_EVENT_RECORD_TYPE,
+        "feature_chain_event_id": "fce_" + sha256_text(material)[:32],
+        "chain_id": chain_id,
+        "action": "checkpoint_policy_updated",
+        "recorded_at": iso_z(),
+        "checkpoint_title": checkpoint_title,
+        "required": required,
+        "reason": cleaned_reason,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        feature_chain_event_file(store),
+        event,
+        id_field="feature_chain_event_id",
+    )
+    return {"changed": changed, "feature_chain_event": event}
+
+
+def set_feature_chain_run_policy(
+    store: Path,
+    *,
+    chain_id: str,
+    run_policy: str,
+    reason: str,
+) -> dict[str, Any]:
+    if chain_id not in active_feature_chains(store):
+        raise ValueError(f"Unknown feature chain: {chain_id}")
+    if run_policy not in {"every-dev-completion", "relevant-only", "manual", "release-only", "goal-final"}:
+        raise ValueError(f"Unsupported run policy: {run_policy}")
+    cleaned_reason = clean_harness_text(reason, field="reason", required=True)
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": FEATURE_CHAIN_EVENT_RECORD_TYPE,
+        "feature_chain_event_id": "fce_" + sha256_text(
+            f"run-policy|{chain_id}|{run_policy}|{cleaned_reason}"
+        )[:32],
+        "chain_id": chain_id,
+        "action": "policy_updated",
+        "recorded_at": iso_z(),
+        "run_policy": run_policy,
+        "reason": cleaned_reason,
+    }
+    changed = append_unique_badcase_record(
+        store, feature_chain_event_file(store), event, id_field="feature_chain_event_id"
+    )
+    return {"changed": changed, "feature_chain_event": event}
+
+
+def normalize_command_spec(
+    value: Any,
+    *,
+    root: Path,
+    default_timeout_seconds: int = 300,
+) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("command must be a JSON argv array or command object") from exc
+    if isinstance(value, list):
+        value = {"argv": value}
+    if not isinstance(value, dict):
+        raise ValueError("command must be a JSON argv array or command object")
+    argv = value.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item for item in argv):
+        raise ValueError("command.argv must be a non-empty string array")
+    if len(argv) > 128 or sum(len(item) for item in argv) > 32768:
+        raise ValueError("command argv is too large")
+    for item in argv:
+        sanitized, stats = sanitize_prompt(item)
+        if sanitized != item or stats["secret_redactions"] or stats["attachments_omitted"]:
+            raise ValueError("command argv must not contain secrets or embedded attachment data")
+    cwd_value = str(value.get("cwd") or ".")
+    cwd = (root / cwd_value).resolve() if not Path(cwd_value).is_absolute() else Path(cwd_value).resolve()
+    if not is_within(cwd, root):
+        raise ValueError("command.cwd must remain inside the project root")
+    timeout_seconds = int(value.get("timeout_seconds") or default_timeout_seconds)
+    if timeout_seconds < 1 or timeout_seconds > 3600:
+        raise ValueError("command timeout_seconds must be between 1 and 3600")
+    env_allow = value.get("env_allow") or []
+    if not isinstance(env_allow, list) or not all(
+        isinstance(item, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item)
+        for item in env_allow
+    ):
+        raise ValueError("command.env_allow must be an array of environment variable names")
+    return {
+        "argv": argv,
+        "cwd": os.path.relpath(cwd, root),
+        "timeout_seconds": timeout_seconds,
+        "env_allow": sorted(set(env_allow)),
+    }
+
+
+def harness_run_id(mode: str, target_id: str) -> str:
+    now = utc_now()
+    material = f"{mode}|{target_id}|{iso_z(now)}|{uuid.uuid4()}"
+    return "hrn_" + sha256_text(material)[:32]
+
+
+def append_harness_run_event(
+    store: Path,
+    *,
+    run_id: str,
+    action: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    recorded_at = iso_z()
+    material = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": HARNESS_RUN_EVENT_RECORD_TYPE,
+        "run_event_id": "hre_"
+        + sha256_text(f"{run_id}|{action}|{recorded_at}|{material}|{uuid.uuid4()}")[:32],
+        "run_id": run_id,
+        "action": action,
+        "recorded_at": recorded_at,
+        **body,
+    }
+    append_unique_badcase_record(
+        store,
+        harness_run_event_file(store),
+        event,
+        id_field="run_event_id",
+    )
+    return event
+
+
+def active_harness_runs(store: Path) -> dict[str, dict[str, Any]]:
+    runs: dict[str, dict[str, Any]] = {}
+    for event in iter_harness_run_events(store):
+        run_id = str(event.get("run_id") or "")
+        if event.get("action") == "started":
+            runs[run_id] = {**event, "status": "running"}
+        elif event.get("action") == "completed":
+            prior = runs.get(run_id, {})
+            runs[run_id] = {**prior, **event}
+    return runs
+
+
+HARNESS_ENV_ALLOWLIST = {
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "PATHEXT",
+    "COMSPEC",
+    "LANG",
+    "LC_ALL",
+    "PYTHONIOENCODING",
+}
+
+
+def sanitized_run_output(text: str, *, limit: int = 1024 * 1024) -> tuple[str, bool]:
+    text, _ = omit_embedded_files(text)
+    text, _ = redact_secrets(text)
+    truncated = len(text.encode("utf-8")) > limit
+    if truncated:
+        encoded = text.encode("utf-8")[:limit]
+        text = encoded.decode("utf-8", errors="ignore") + "\n[OUTPUT_TRUNCATED]\n"
+    return text, truncated
+
+
+CHECKPOINT_MARKER = re.compile(r"(?m)^PH_CHECKPOINT:(.+?):(PASS|FAIL)(?::(.*))?\s*$")
+
+
+def evaluate_feature_chain_output(
+    chain: dict[str, Any],
+    *,
+    returncode: int | None,
+    output: str,
+    timed_out: bool,
+) -> dict[str, Any]:
+    checkpoints = chain.get("checkpoints") if isinstance(chain.get("checkpoints"), list) else []
+    expected = {str(item.get("title") or ""): item for item in checkpoints}
+    seen: dict[str, dict[str, Any]] = {}
+    duplicate: set[str] = set()
+    unknown: list[str] = []
+    for match in CHECKPOINT_MARKER.finditer(output):
+        label = match.group(1).strip()
+        state = match.group(2).lower()
+        reason = (match.group(3) or "").strip() or None
+        if label not in expected:
+            unknown.append(label)
+            continue
+        if label in seen:
+            duplicate.add(label)
+        seen[label] = {"label": label, "status": state, "reason": reason}
+    missing = [
+        title
+        for title, item in expected.items()
+        if bool(item.get("required", True)) and title not in seen
+    ]
+    failed = [item for item in seen.values() if item["status"] == "fail"]
+    if timed_out:
+        status, reason = "blocked", "command timed out"
+    elif unknown:
+        status, reason = "failed", "unknown checkpoint marker: " + ", ".join(sorted(set(unknown)))
+    elif duplicate:
+        status, reason = "failed", "duplicate checkpoint marker: " + ", ".join(sorted(duplicate))
+    elif missing:
+        status, reason = "failed", "missing required checkpoint: " + ", ".join(missing)
+    elif failed:
+        first = failed[0]
+        status = "failed"
+        reason = f"checkpoint failed: {first['label']}"
+        if first.get("reason"):
+            reason += f" - {first['reason']}"
+    elif returncode not in {0, None}:
+        status, reason = "failed", f"command exited with code {returncode}"
+    else:
+        status, reason = "passed", "all required checkpoints passed"
+    return {
+        "status": status,
+        "reason": reason,
+        "checkpoints": [seen[key] for key in expected if key in seen],
+        "missing_checkpoints": missing,
+        "unknown_checkpoints": sorted(set(unknown)),
+        "duplicate_checkpoints": sorted(duplicate),
+    }
+
+
+def run_feature_chain_command(
+    store: Path,
+    *,
+    root: Path,
+    chain: dict[str, Any],
+    command: dict[str, Any],
+    mode: str,
+    expectation: str,
+    expected_red_reason: str | None = None,
+    target_type: str = "feature_chain",
+    target_id: str | None = None,
+) -> dict[str, Any]:
+    chain_id = str(target_id or chain.get("chain_id") or "")
+    command = normalize_command_spec(command, root=root)
+    run_id = harness_run_id(mode, chain_id)
+    run_dir = store / "badcases" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    append_harness_run_event(
+        store,
+        run_id=run_id,
+        action="started",
+        body={
+            "mode": mode,
+            "expectation": expectation,
+            "target_type": target_type,
+            "target_id": chain_id,
+            "command": command,
+        },
+    )
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in HARNESS_ENV_ALLOWLIST or name in command.get("env_allow", [])
+    }
+    env.update(
+        {
+            "PROMPT_HARNESS_RUN_ID": run_id,
+            "PROMPT_HARNESS_RUN_DIR": str(run_dir),
+            "PROMPT_HARNESS_CHAIN_ID": chain_id,
+            "PYTHONIOENCODING": "utf-8",
+        }
+    )
+    started = time.monotonic()
+    timed_out = False
+    returncode: int | None = None
+    stdout = ""
+    stderr = ""
+    try:
+        completed = subprocess.run(
+            command["argv"],
+            cwd=(root / command["cwd"]).resolve(),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=int(command["timeout_seconds"]),
+            shell=False,
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout = completed.stdout
+        stderr = completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout = str(exc.stdout or "")
+        stderr = str(exc.stderr or "")
+    except OSError as exc:
+        returncode = 127
+        stderr = f"{type(exc).__name__}: {exc}"
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    stdout, stdout_truncated = sanitized_run_output(stdout)
+    stderr, stderr_truncated = sanitized_run_output(stderr)
+    combined = stdout + ("\n" if stdout and stderr else "") + stderr
+    evaluation = evaluate_feature_chain_output(
+        chain,
+        returncode=returncode,
+        output=combined,
+        timed_out=timed_out,
+    )
+    if expectation == "red":
+        needle = str(expected_red_reason or "").strip().casefold()
+        expectation_met = evaluation["status"] == "failed" and bool(needle) and needle in (
+            evaluation["reason"] + "\n" + combined
+        ).casefold()
+    else:
+        expectation_met = evaluation["status"] == "passed"
+    atomic_write(run_dir / "stdout.txt", stdout)
+    atomic_write(run_dir / "stderr.txt", stderr)
+    evidence_files = sorted(
+        str(path.relative_to(run_dir)).replace("\\", "/")
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    )
+    preserve = not expectation_met
+    output_summary = collapse_blank_lines(combined)[:2000]
+    completed_event = append_harness_run_event(
+        store,
+        run_id=run_id,
+        action="completed",
+        body={
+            "mode": mode,
+            "expectation": expectation,
+            "expectation_met": expectation_met,
+            "target_type": target_type,
+            "target_id": chain_id,
+            "status": evaluation["status"],
+            "reason": evaluation["reason"],
+            "returncode": returncode,
+            "elapsed_ms": elapsed_ms,
+            "checkpoints": evaluation["checkpoints"],
+            "missing_checkpoints": evaluation["missing_checkpoints"],
+            "unknown_checkpoints": evaluation["unknown_checkpoints"],
+            "duplicate_checkpoints": evaluation["duplicate_checkpoints"],
+            "output_sha256": sha256_text(combined),
+            "output_summary": output_summary,
+            "output_truncated": stdout_truncated or stderr_truncated,
+            "evidence_path": str(run_dir) if preserve else None,
+            "evidence_files": evidence_files if preserve else [],
+        },
+    )
+    if not preserve:
+        shutil.rmtree(run_dir)
+    return {**completed_event, "run_id": run_id}
+
+
+def feature_chain_dry_run(
+    store: Path,
+    *,
+    root: Path,
+    chain_id: str,
+    red_command: Any,
+    green_command: Any,
+    expected_red_reason: str,
+    mode: str = "approval_dry_run",
+) -> dict[str, Any]:
+    chain = active_feature_chains(store).get(chain_id)
+    if not chain:
+        raise ValueError(f"Unknown feature chain: {chain_id}")
+    red = run_feature_chain_command(
+        store,
+        root=root,
+        chain=chain,
+        command=normalize_command_spec(red_command, root=root),
+        mode=mode,
+        expectation="red",
+        expected_red_reason=expected_red_reason,
+    )
+    green = run_feature_chain_command(
+        store,
+        root=root,
+        chain=chain,
+        command=normalize_command_spec(green_command, root=root),
+        mode=mode,
+        expectation="green",
+    )
+    return {
+        "passed": bool(red.get("expectation_met") and green.get("expectation_met")),
+        "red": red,
+        "green": green,
+        "run_ids": [red["run_id"], green["run_id"]],
+    }
+
+
+def approve_feature_chain(
+    store: Path,
+    *,
+    root: Path,
+    chain_id: str,
+    red_command: Any,
+    green_command: Any,
+    expected_red_reason: str,
+) -> dict[str, Any]:
+    chain = active_feature_chains(store).get(chain_id)
+    if not chain:
+        raise ValueError(f"Unknown feature chain: {chain_id}")
+    if chain.get("status") == "approved":
+        return {"changed": False, "reason": "already_approved", "chain": chain}
+    if chain.get("status") != "proposed":
+        raise ValueError(f"Feature chain is not approvable from state {chain.get('status')}")
+    checkpoints = chain.get("checkpoints") if isinstance(chain.get("checkpoints"), list) else []
+    if not checkpoints:
+        raise ValueError("Feature chain approval requires at least one checkpoint")
+    if any(not item.get("check") for item in checkpoints):
+        raise ValueError("Every feature-chain checkpoint requires a recurrence check")
+    if not any(item.get("case_ids") for item in checkpoints):
+        raise ValueError("Feature chain approval requires real badcase coverage")
+    duplicate_matches = [
+        item
+        for item in feature_chain_overlap_report(store, min_score=0.65).get("pairs", [])
+        if chain_id in {item.get("left_chain_id"), item.get("right_chain_id")}
+        and (
+            bool(item.get("shared_case_ids"))
+            or (float(item.get("score") or 0) >= 0.9 and len(item.get("shared_terms") or []) >= 3)
+        )
+        and active_feature_chains(store).get(
+            str(
+                item.get("right_chain_id")
+                if item.get("left_chain_id") == chain_id
+                else item.get("left_chain_id")
+            ),
+            {},
+        ).get("status") == "approved"
+    ]
+    if duplicate_matches:
+        return {
+            "changed": False,
+            "reason": "duplicate_feature_chain",
+            "overlap": duplicate_matches,
+        }
+    expected_reason = clean_harness_text(
+        expected_red_reason,
+        field="expected_red_reason",
+        required=True,
+    )
+    normalized_red = normalize_command_spec(red_command, root=root)
+    normalized_green = normalize_command_spec(green_command, root=root)
+    dry_run = feature_chain_dry_run(
+        store,
+        root=root,
+        chain_id=chain_id,
+        red_command=normalized_red,
+        green_command=normalized_green,
+        expected_red_reason=str(expected_reason),
+    )
+    if not dry_run["passed"]:
+        return {"changed": False, "reason": "approval_preflight_failed", "dry_run": dry_run}
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": FEATURE_CHAIN_EVENT_RECORD_TYPE,
+        "feature_chain_event_id": "fce_"
+        + sha256_text(f"approved|{chain_id}|{'|'.join(dry_run['run_ids'])}")[:32],
+        "chain_id": chain_id,
+        "action": "approved",
+        "recorded_at": iso_z(),
+        "run_policy": "every-dev-completion",
+        "red_command": normalized_red,
+        "green_command": normalized_green,
+        "expected_red_reason": expected_reason,
+        "approval_run_ids": dry_run["run_ids"],
+    }
+    changed = append_unique_badcase_record(
+        store,
+        feature_chain_event_file(store),
+        event,
+        id_field="feature_chain_event_id",
+    )
+    return {"changed": changed, "chain_id": chain_id, "dry_run": dry_run}
+
+
+def run_approved_feature_chain(
+    store: Path,
+    *,
+    root: Path,
+    chain: dict[str, Any],
+    mode: str = "dev_complete",
+) -> dict[str, Any]:
+    if chain.get("status") != "approved" or not chain.get("green_command"):
+        raise ValueError(f"Feature chain is not approved: {chain.get('chain_id')}")
+    covered_case_ids = [
+        str(case_id)
+        for checkpoint in chain.get("checkpoints") or []
+        for case_id in checkpoint.get("case_ids") or []
+    ]
+    policy = effective_harness_policy(
+        store,
+        target_type="feature_chain",
+        target_id=str(chain.get("chain_id") or ""),
+        case_id=covered_case_ids[0] if covered_case_ids else None,
+    )
+    command = dict(chain["green_command"])
+    command["timeout_seconds"] = min(int(command.get("timeout_seconds") or 300), policy["timeout_seconds"])
+    return run_feature_chain_command(
+        store,
+        root=root,
+        chain=chain,
+        command=command,
+        mode=mode,
+        expectation="green",
+    )
+
+
+def test_hub_dev_complete(
+    store: Path,
+    *,
+    root: Path,
+    jobs: int = 1,
+    include_policies: set[str] | None = None,
+    selected_target_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    policies = include_policies or {"every-dev-completion"}
+    invalid_policies = policies - {
+        "every-dev-completion", "relevant-only", "manual", "release-only", "goal-final"
+    }
+    if invalid_policies:
+        raise ValueError("Unsupported Test Hub policy: " + ", ".join(sorted(invalid_policies)))
+    selected = selected_target_ids or set()
+    chains = [
+        chain
+        for chain in active_feature_chains(store).values()
+        if chain.get("status") == "approved"
+        and (chain.get("run_policy") in policies or str(chain.get("chain_id") or "") in selected)
+    ]
+    task_cases = [
+        task_case
+        for task_case in active_task_cases(store).values()
+        if task_case.get("status") in {"approved", "active"}
+        and (task_case.get("run_policy") in policies or str(task_case.get("task_case_id") or "") in selected)
+    ]
+    targets: list[tuple[str, dict[str, Any]]] = [
+        ("feature_chain", chain) for chain in chains
+    ] + [("task_case", task_case) for task_case in task_cases]
+    found_ids = {
+        str(value.get("chain_id") or value.get("task_case_id") or "")
+        for _, value in targets
+    }
+    missing_selected = sorted(selected - found_ids)
+    if missing_selected:
+        raise ValueError("Selected Test Hub target is missing or unapproved: " + ", ".join(missing_selected))
+    targets.sort(key=lambda item: str(item[1].get("chain_id") or item[1].get("task_case_id") or ""))
+    jobs = max(1, min(int(jobs), 8, len(targets) or 1))
+    results: list[dict[str, Any]] = []
+    def run_target(target: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        target_type, value = target
+        if target_type == "task_case":
+            return run_approved_task_case(store, root=root, task_case=value)
+        return run_approved_feature_chain(store, root=root, chain=value)
+    if jobs == 1:
+        for target in targets:
+            results.append(run_target(target))
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(run_target, target)
+                for target in targets
+            ]
+            for future in futures:
+                results.append(future.result())
+    results.sort(key=lambda item: str(item.get("target_id") or ""))
+    counts = collections.Counter(str(item.get("status") or "unknown") for item in results)
+    payload = {
+        "schema_version": "1.0.0",
+        "completed_at": iso_z(),
+        "project_root": str(root),
+        "selected_count": len(targets),
+        "feature_chain_count": len(chains),
+        "task_case_count": len(task_cases),
+        "passed": counts.get("passed", 0),
+        "failed": counts.get("failed", 0),
+        "blocked": counts.get("blocked", 0),
+        "results": results,
+    }
+    write_json(store / "index" / "test-hub" / "last-run.json", payload)
+    return payload
+
+
+FEATURE_TERM_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "must",
+    "should",
+    "case",
+    "badcase",
+    "feature",
+    "chain",
+    "用户",
+    "功能",
+    "流程",
+    "检查",
+    "必须",
+    "应该",
+    "相关",
+}
+
+
+def harness_text_terms(text: str) -> set[str]:
+    normalized = str(text or "").casefold()
+    terms = {
+        token
+        for token in re.findall(r"[a-z0-9_][a-z0-9_.-]+", normalized)
+        if len(token) >= 2 and token not in FEATURE_TERM_STOPWORDS
+    }
+    for chunk in re.findall(r"[\u3400-\u9fff]{2,}", normalized):
+        if chunk not in FEATURE_TERM_STOPWORDS:
+            terms.add(chunk)
+        for size in (2, 3):
+            terms.update(
+                chunk[index : index + size]
+                for index in range(max(0, len(chunk) - size + 1))
+                if chunk[index : index + size] not in FEATURE_TERM_STOPWORDS
+            )
+    return terms
+
+
+def badcase_search_text(case: dict[str, Any]) -> str:
+    guard = case.get("guard") if isinstance(case.get("guard"), dict) else {}
+    return " ".join(
+        str(value or "")
+        for value in (
+            case.get("title"),
+            case.get("category"),
+            case.get("scope"),
+            " ".join(case.get("tags") or []),
+            case.get("phenomenon"),
+            case.get("trigger_reproduction"),
+            case.get("root_cause"),
+            guard.get("verification"),
+            guard.get("red_condition"),
+            guard.get("green_condition"),
+        )
+    )
+
+
+def feature_chain_search_text(chain: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            str(chain.get("title") or ""),
+            str(chain.get("entry") or ""),
+            str(chain.get("exit_check") or ""),
+            *[
+                " ".join(
+                    (
+                        str(item.get("title") or ""),
+                        str(item.get("check") or ""),
+                    )
+                )
+                for item in chain.get("checkpoints", [])
+            ],
+        ]
+    )
+
+
+def term_overlap_score(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, min(len(left), len(right)))
+
+
+def feature_chain_overlap_report(store: Path, *, min_score: float = 0.25) -> dict[str, Any]:
+    chains = sorted(active_feature_chains(store).values(), key=lambda item: str(item.get("chain_id") or ""))
+    pairs: list[dict[str, Any]] = []
+    for index, left in enumerate(chains):
+        left_terms = harness_text_terms(feature_chain_search_text(left))
+        left_cases = {
+            str(case_id)
+            for checkpoint in left.get("checkpoints", [])
+            for case_id in checkpoint.get("case_ids", [])
+        }
+        for right in chains[index + 1 :]:
+            right_terms = harness_text_terms(feature_chain_search_text(right))
+            right_cases = {
+                str(case_id)
+                for checkpoint in right.get("checkpoints", [])
+                for case_id in checkpoint.get("case_ids", [])
+            }
+            shared_cases = sorted(left_cases & right_cases)
+            score = max(term_overlap_score(left_terms, right_terms), 1.0 if shared_cases else 0.0)
+            if score < min_score:
+                continue
+            pairs.append(
+                {
+                    "left_chain_id": left.get("chain_id"),
+                    "left_title": left.get("title"),
+                    "right_chain_id": right.get("chain_id"),
+                    "right_title": right.get("title"),
+                    "score": round(score, 4),
+                    "shared_terms": sorted(left_terms & right_terms)[:12],
+                    "shared_case_ids": shared_cases,
+                }
+            )
+    pairs.sort(key=lambda item: (-float(item["score"]), str(item["left_chain_id"]), str(item["right_chain_id"])))
+    return {"chain_count": len(chains), "overlap_count": len(pairs), "pairs": pairs}
+
+
+def feature_chain_coverage_report(store: Path) -> dict[str, Any]:
+    cases = active_badcase_cases(store)
+    chains = active_feature_chains(store)
+    case_to_chains: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
+    for chain_id, chain in chains.items():
+        for checkpoint in chain.get("checkpoints", []):
+            for case_id in checkpoint.get("case_ids", []) or []:
+                case_to_chains[str(case_id)].append(
+                    {
+                        "chain_id": chain_id,
+                        "chain_title": str(chain.get("title") or ""),
+                        "checkpoint": str(checkpoint.get("title") or ""),
+                    }
+                )
+    unassigned = []
+    for case_id, case in sorted(cases.items()):
+        if case_to_chains.get(case_id):
+            continue
+        case_terms = harness_text_terms(badcase_search_text(case))
+        suggestions = []
+        for chain_id, chain in chains.items():
+            chain_terms = harness_text_terms(feature_chain_search_text(chain))
+            score = term_overlap_score(case_terms, chain_terms)
+            if score >= 0.12:
+                suggestions.append(
+                    {
+                        "chain_id": chain_id,
+                        "title": chain.get("title"),
+                        "score": round(score, 4),
+                        "evidence_terms": sorted(case_terms & chain_terms)[:8],
+                    }
+                )
+        suggestions.sort(key=lambda item: (-float(item["score"]), str(item["chain_id"])))
+        unassigned.append(
+            {
+                "case_id": case_id,
+                "title": case.get("title"),
+                "suggested_existing_chains": suggestions[:3],
+            }
+        )
+    return {
+        "case_count": len(cases),
+        "chain_count": len(chains),
+        "covered_case_count": len(case_to_chains),
+        "unassigned_case_count": len(unassigned),
+        "coverage_density": round(len(case_to_chains) / len(chains), 4) if chains else 0.0,
+        "case_to_chains": dict(sorted(case_to_chains.items())),
+        "unassigned": unassigned,
+    }
+
+
+def feature_chain_candidate_groups(
+    store: Path,
+    *,
+    min_cases: int = 2,
+    max_groups: int = 6,
+) -> dict[str, Any]:
+    coverage = feature_chain_coverage_report(store)
+    cases = active_badcase_cases(store)
+    unassigned_ids = [str(item["case_id"]) for item in coverage["unassigned"]]
+    groups: dict[str, list[str]] = collections.defaultdict(list)
+    for case_id in unassigned_ids:
+        case = cases[case_id]
+        labels = [str(item).strip().lstrip("#") for item in case.get("tags") or [] if str(item).strip()]
+        if not labels:
+            labels = [str(case.get("category") or case.get("scope") or "uncategorized")]
+        for label in labels:
+            groups[label.casefold()].append(case_id)
+    candidates = []
+    already_covered: set[str] = set()
+    for label, case_ids in sorted(groups.items(), key=lambda item: (-len(set(item[1])), item[0])):
+        unique = sorted(set(case_ids))
+        new_ids = [value for value in unique if value not in already_covered]
+        if len(unique) < min_cases or not new_ids:
+            continue
+        candidates.append(
+            {
+                "group": label,
+                "case_ids": unique,
+                "case_count": len(unique),
+                "new_case_ids": new_ids,
+                "new_coverage_count": len(new_ids),
+                "suggested_title": label.replace("-", " ").replace("_", " ").strip().title(),
+            }
+        )
+        already_covered.update(unique)
+        if len(candidates) >= max_groups:
+            break
+    return {
+        "unassigned_case_count": len(unassigned_ids),
+        "candidate_group_count": len(candidates),
+        "groups": candidates,
+    }
+
+
+def feature_chain_plan(store: Path, *, query: str) -> dict[str, Any]:
+    cases = active_badcase_cases(store)
+    expanded = str(query or "").strip()
+    case = cases.get(expanded)
+    if case:
+        coverage = case.get("coverage") if isinstance(case.get("coverage"), dict) else {}
+        linked_chain_ids = [
+            str(value)
+            for value in coverage.get("feature_chain_ids") or []
+            if str(value) in active_feature_chains(store)
+        ]
+        if linked_chain_ids:
+            linked = active_feature_chains(store)[linked_chain_ids[0]]
+            checkpoint = next(
+                (
+                    item
+                    for item in linked.get("checkpoints", [])
+                    if query in (item.get("case_ids") or [])
+                ),
+                None,
+            )
+            return {
+                "action": "review-existing-chain",
+                "query": query,
+                "expanded_case_id": query,
+                "match": {
+                    "chain_id": linked.get("chain_id"),
+                    "title": linked.get("title"),
+                    "checkpoint": checkpoint.get("title") if checkpoint else None,
+                    "score": 1.0,
+                    "evidence_terms": ["explicit-case-coverage"],
+                },
+                "alternatives": [],
+                "mutated": False,
+            }
+        expanded = badcase_search_text(case)
+    query_terms = harness_text_terms(expanded)
+    matches = []
+    for chain_id, chain in active_feature_chains(store).items():
+        chain_terms = harness_text_terms(feature_chain_search_text(chain))
+        best_checkpoint = None
+        best_checkpoint_score = 0.0
+        for checkpoint in chain.get("checkpoints", []):
+            score = term_overlap_score(
+                query_terms,
+                harness_text_terms(f"{checkpoint.get('title')} {checkpoint.get('check')}")
+            )
+            if score > best_checkpoint_score:
+                best_checkpoint_score = score
+                best_checkpoint = checkpoint.get("title")
+        score = max(term_overlap_score(query_terms, chain_terms), best_checkpoint_score)
+        if score:
+            matches.append(
+                {
+                    "chain_id": chain_id,
+                    "title": chain.get("title"),
+                    "checkpoint": best_checkpoint,
+                    "score": round(score, 4),
+                    "evidence_terms": sorted(query_terms & chain_terms)[:8],
+                }
+            )
+    matches.sort(key=lambda item: (-float(item["score"]), str(item["chain_id"])))
+    best = matches[0] if matches and float(matches[0]["score"]) >= 0.12 else None
+    if best:
+        return {
+            "action": "review-existing-chain",
+            "query": query,
+            "expanded_case_id": query if case else None,
+            "match": best,
+            "alternatives": matches[1:3],
+            "mutated": False,
+        }
+    return {
+        "action": "propose-new-chain",
+        "query": query,
+        "expanded_case_id": query if case else None,
+        "candidate_groups": feature_chain_candidate_groups(store)["groups"][:3],
+        "mutated": False,
+    }
+
+
+SENSITIVE_SNAPSHOT_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    "credentials",
+    "credentials.json",
+    "secrets.json",
+    "id_rsa",
+    "id_ed25519",
+}
+SENSITIVE_SNAPSHOT_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"}
+SNAPSHOT_EXCLUDED_PARTS = {".git", STORE_NAME, "node_modules", "__pycache__", ".pytest_cache"}
+
+
+def snapshot_path_is_sensitive(relative: Path) -> bool:
+    lowered = relative.name.casefold()
+    return (
+        lowered in SENSITIVE_SNAPSHOT_NAMES
+        or relative.suffix.casefold() in SENSITIVE_SNAPSHOT_SUFFIXES
+        or lowered.startswith(".env.")
+        or any(part in SNAPSHOT_EXCLUDED_PARTS for part in relative.parts)
+    )
+
+
+def hash_file_stream(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def git_read(root: Path, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(
+            ["git", "-C", str(root), *args],
+            127,
+            stdout=b"",
+            stderr=str(exc).encode("utf-8", errors="replace"),
+        )
+
+
+def snapshot_candidate_paths(root: Path) -> tuple[list[Path], dict[str, Any]]:
+    git_dir = git_read(root, ["rev-parse", "--git-dir"])
+    git_available = git_dir.returncode == 0
+    metadata: dict[str, Any] = {"available": git_available, "head": None, "dirty": False}
+    paths: list[Path] = []
+    if git_available:
+        head = git_read(root, ["rev-parse", "HEAD"])
+        metadata["head"] = head.stdout.decode("utf-8", errors="replace").strip() if head.returncode == 0 else None
+        listed = git_read(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        if listed.returncode != 0:
+            raise ValueError("git ls-files failed while creating snapshot")
+        for raw in listed.stdout.split(b"\0"):
+            if not raw:
+                continue
+            relative_text = raw.decode("utf-8", errors="surrogateescape")
+            paths.append(Path(relative_text))
+        status = git_read(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        metadata["dirty"] = bool(status.stdout)
+        metadata["status_sha256"] = hashlib.sha256(status.stdout).hexdigest()
+        worktree_diff = git_read(root, ["diff", "--binary", "HEAD", "--"])
+        staged_diff = git_read(root, ["diff", "--binary", "--cached", "--"])
+        metadata["worktree_diff_sha256"] = hashlib.sha256(worktree_diff.stdout).hexdigest()
+        metadata["staged_diff_sha256"] = hashlib.sha256(staged_diff.stdout).hexdigest()
+    else:
+        for path in root.rglob("*"):
+            if path.is_file() or path.is_symlink():
+                paths.append(path.relative_to(root))
+    unique = sorted({Path(str(path).replace("\\", "/")) for path in paths}, key=lambda item: item.as_posix())
+    if len(unique) > 50000:
+        raise ValueError("snapshot exceeds the 50,000 file safety limit")
+    return unique, metadata
+
+
+def create_project_snapshot(
+    store: Path,
+    *,
+    root: Path,
+    case_id: str,
+    tools: list[str] | None = None,
+    skills: list[str] | None = None,
+    configuration: dict[str, Any] | None = None,
+    budgets: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = root.resolve()
+    case = active_badcase_cases(store).get(case_id)
+    if not case:
+        raise ValueError(f"Unknown badcase: {case_id}")
+    relative_paths, vcs = snapshot_candidate_paths(root)
+    files: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
+    total_bytes = 0
+    for relative in relative_paths:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"snapshot path escapes project root: {relative}")
+        if snapshot_path_is_sensitive(relative):
+            excluded.append({"path": relative.as_posix(), "reason": "sensitive-or-private"})
+            continue
+        absolute = (root / relative).resolve(strict=False)
+        if not is_within(absolute, root):
+            raise ValueError(f"snapshot path escapes project root: {relative}")
+        source = root / relative
+        try:
+            stat_result = source.lstat()
+        except OSError:
+            excluded.append({"path": relative.as_posix(), "reason": "unreadable-or-missing"})
+            continue
+        if source.is_symlink():
+            target = os.readlink(source)
+            files.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": "symlink",
+                    "bytes": len(target.encode("utf-8", errors="replace")),
+                    "sha256": sha256_text(target),
+                }
+            )
+            continue
+        if not source.is_file():
+            continue
+        size = stat_result.st_size
+        total_bytes += size
+        if size > 50 * 1024 * 1024:
+            files.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": "file",
+                    "bytes": size,
+                    "sha256": None,
+                    "hash_omitted": "file-exceeds-50MiB",
+                }
+            )
+            continue
+        files.append(
+            {
+                "path": relative.as_posix(),
+                "kind": "file",
+                "bytes": size,
+                "sha256": hash_file_stream(source),
+                "executable": bool(stat_result.st_mode & 0o111),
+            }
+        )
+    candidates = {
+        str(item.get("candidate_id") or ""): item
+        for item in iter_badcase_candidates(store)
+    }
+    correction_prompt_ids = {
+        str(candidates[candidate_id].get("source_prompt_event_id") or "")
+        for candidate_id in case.get("source_candidate_ids") or []
+        if candidate_id in candidates
+    }
+    evidence = case.get("evidence") if isinstance(case.get("evidence"), dict) else {}
+    task_prompt_ids = [
+        str(value)
+        for value in evidence.get("prompt_event_ids") or []
+        if str(value) not in correction_prompt_ids
+    ]
+    manifest = {
+        "manifest_version": "1.0.0",
+        "project_id": project_id(root),
+        "case_id": case_id,
+        "vcs": vcs,
+        "files": files,
+        "excluded": excluded,
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "evidence": {
+            "task_prompt_event_ids": task_prompt_ids,
+            "correction_prompt_event_ids": sorted(correction_prompt_ids),
+            "trace_event_ids": list(evidence.get("trace_event_ids") or []),
+        },
+        "environment": {
+            "platform": sys.platform,
+            "python": sys.version.split()[0],
+            "tools": sorted(set(tools or [])),
+            "skills": sorted(set(skills or [])),
+            "configuration": configuration or {},
+            "budgets": budgets or {},
+        },
+        "materialization": {
+            "mode": "manifest-only",
+            "source_mutated": False,
+            "private_files_copied": False,
+        },
+    }
+    sanitized_manifest, _ = sanitize_trace_value(manifest)
+    material = json.dumps(sanitized_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    manifest_sha256 = sha256_text(material)
+    snapshot_id = "snp_" + manifest_sha256[:32]
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": SNAPSHOT_EVENT_RECORD_TYPE,
+        "snapshot_id": snapshot_id,
+        "created_at": iso_z(),
+        "project": {
+            "id": project_id(root),
+            "root": str(root),
+        },
+        "case_id": case_id,
+        "manifest_sha256": manifest_sha256,
+        "manifest": sanitized_manifest,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        snapshot_event_file(store),
+        event,
+        id_field="snapshot_id",
+    )
+    return {"changed": changed, "snapshot": event}
+
+
+def snapshots_by_id(store: Path) -> dict[str, dict[str, Any]]:
+    return {
+        str(event.get("snapshot_id") or ""): event
+        for event in iter_snapshot_events(store)
+        if event.get("snapshot_id")
+    }
+
+
+def workflow_entity_id(prefix: str, name: str) -> str:
+    now = utc_now()
+    return f"{prefix}-{now:%Y%m%d}-{sha256_text(f'{name}|{iso_z(now)}|{uuid.uuid4()}')[:8].upper()}"
+
+
+def fold_workflow_events(
+    events: Iterator[dict[str, Any]],
+    *,
+    id_field: str,
+) -> dict[str, dict[str, Any]]:
+    entities: dict[str, dict[str, Any]] = {}
+    for event in events:
+        entity_id = str(event.get(id_field) or "")
+        action = str(event.get("action") or "")
+        if action == "proposed":
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            entities[entity_id] = {
+                **json.loads(json.dumps(payload)),
+                id_field: entity_id,
+                "status": "proposed",
+                "proposed_at": event.get("recorded_at"),
+                "event_ids": [event.get("event_id")],
+            }
+            continue
+        entity = entities.get(entity_id)
+        if not entity:
+            continue
+        if action == "approved":
+            entity["status"] = "approved"
+            entity["approved_at"] = event.get("recorded_at")
+            entity["approval_run_ids"] = list(event.get("approval_run_ids") or [])
+        elif action == "activated":
+            entity["status"] = "active"
+            entity["activated_at"] = event.get("recorded_at")
+        elif action in {"disabled", "retired", "superseded", "probation", "reactivated"}:
+            entity["status"] = "active" if action == "reactivated" else action
+            entity["state_reason"] = event.get("reason")
+            if action == "superseded":
+                entity["superseded_by"] = event.get("superseded_by")
+        elif action == "policy_updated":
+            entity["policy"] = event.get("policy")
+            entity["policy_reason"] = event.get("reason")
+        entity["updated_at"] = event.get("recorded_at")
+        entity.setdefault("event_ids", []).append(event.get("event_id"))
+    return entities
+
+
+def append_workflow_event(
+    store: Path,
+    *,
+    path: Path,
+    record_type: str,
+    entity_id_field: str,
+    entity_id: str,
+    action: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    clean_body, _ = sanitize_trace_value(body or {})
+    recorded_at = iso_z()
+    material = json.dumps(clean_body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": record_type,
+        "event_id": "wfe_" + sha256_text(
+            f"{record_type}|{entity_id}|{action}|{recorded_at}|{material}|{uuid.uuid4()}"
+        )[:32],
+        entity_id_field: entity_id,
+        "action": action,
+        "recorded_at": recorded_at,
+        **clean_body,
+    }
+    append_unique_badcase_record(store, path, event, id_field="event_id")
+    return event
+
+
+def active_model_adapters(store: Path) -> dict[str, dict[str, Any]]:
+    return fold_workflow_events(iter_adapter_events(store), id_field="adapter_id")
+
+
+def active_judges(store: Path) -> dict[str, dict[str, Any]]:
+    return fold_workflow_events(iter_judge_events(store), id_field="judge_id")
+
+
+def active_compensations(store: Path) -> dict[str, dict[str, Any]]:
+    return fold_workflow_events(iter_compensation_events(store), id_field="compensation_id")
+
+
+def active_task_cases(store: Path) -> dict[str, dict[str, Any]]:
+    return fold_workflow_events(iter_task_case_events(store), id_field="task_case_id")
+
+
+def propose_model_adapter(
+    store: Path,
+    *,
+    root: Path,
+    name: str,
+    platform: str,
+    model: str,
+    command: Any,
+) -> dict[str, Any]:
+    adapter_id = workflow_entity_id("MA", name)
+    payload = {
+        "name": clean_harness_text(name, field="name", required=True),
+        "platform": clean_harness_text(platform, field="platform", required=True),
+        "model": clean_harness_text(model, field="model", required=True),
+        "command": normalize_command_spec(command, root=root),
+        "protocol": "prompt-harness-adapter-v1",
+    }
+    event = append_workflow_event(
+        store,
+        path=adapter_event_file(store),
+        record_type=ADAPTER_EVENT_RECORD_TYPE,
+        entity_id_field="adapter_id",
+        entity_id=adapter_id,
+        action="proposed",
+        body={"payload": payload},
+    )
+    return {"changed": True, "adapter_id": adapter_id, "event": event}
+
+
+def adapter_result_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("schema_version") == "1.0.0"
+        and value.get("status") in {"completed", "failed", "blocked"}
+        and isinstance(value.get("answer"), str)
+        and len(value.get("answer", "").encode("utf-8")) <= 2 * 1024 * 1024
+        and isinstance(value.get("metrics", {}), dict)
+    )
+
+
+def run_protocol_command(
+    store: Path,
+    *,
+    root: Path,
+    target_type: str,
+    target_id: str,
+    command: Any,
+    input_manifest: dict[str, Any],
+    mode: str,
+    run_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized = normalize_command_spec(command, root=root)
+    run_id = harness_run_id(mode, target_id)
+    run_dir = store / "badcases" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False)
+    sanitized_input, _ = sanitize_trace_value(input_manifest)
+    input_path = run_dir / "input.json"
+    result_path = run_dir / "result.json"
+    atomic_write(input_path, json.dumps(sanitized_input, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    clean_context, _ = sanitize_trace_value(run_context or {})
+    append_harness_run_event(
+        store,
+        run_id=run_id,
+        action="started",
+        body={
+            "mode": mode,
+            "expectation": "protocol-result",
+            "target_type": target_type,
+            "target_id": target_id,
+            "command": normalized,
+            "input_sha256": sha256_text(json.dumps(sanitized_input, sort_keys=True, ensure_ascii=False)),
+            **clean_context,
+        },
+    )
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in HARNESS_ENV_ALLOWLIST or name in normalized.get("env_allow", [])
+    }
+    env.update(
+        {
+            "PROMPT_HARNESS_RUN_ID": run_id,
+            "PROMPT_HARNESS_RUN_DIR": str(run_dir),
+            "PROMPT_HARNESS_INPUT_PATH": str(input_path),
+            "PROMPT_HARNESS_RESULT_PATH": str(result_path),
+            "PYTHONIOENCODING": "utf-8",
+        }
+    )
+    execution_cwd = run_dir
+    execution_isolation = "private-run-directory"
+    snapshot_data = (
+        sanitized_input.get("snapshot")
+        if isinstance(sanitized_input, dict) and isinstance(sanitized_input.get("snapshot"), dict)
+        else {}
+    )
+    snapshot_id = str(snapshot_data.get("snapshot_id") or "")
+    materialization = active_harness_policies(store).get(("snapshot", snapshot_id)) if snapshot_id else None
+    materialization_policy = (
+        materialization.get("policy") if isinstance(materialization, dict) else {}
+    )
+    if materialization_policy.get("materialization_allowed") and materialization_policy.get("destination_parent"):
+        candidate = Path(str(materialization_policy["destination_parent"])) / snapshot_id
+        if candidate.is_dir() and not is_within(candidate, root):
+            execution_cwd = candidate.resolve()
+            execution_isolation = "approved-materialized-snapshot"
+    started = time.monotonic()
+    timed_out = False
+    returncode: int | None = None
+    stdout = ""
+    stderr = ""
+    try:
+        completed = subprocess.run(
+            normalized["argv"],
+            cwd=execution_cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=int(normalized["timeout_seconds"]),
+            shell=False,
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout, stderr = completed.stdout, completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout, stderr = str(exc.stdout or ""), str(exc.stderr or "")
+    except OSError as exc:
+        returncode = 127
+        stderr = f"{type(exc).__name__}: {exc}"
+    stdout, stdout_truncated = sanitized_run_output(stdout)
+    stderr, stderr_truncated = sanitized_run_output(stderr)
+    atomic_write(run_dir / "stdout.txt", stdout)
+    atomic_write(run_dir / "stderr.txt", stderr)
+    protocol_result: dict[str, Any] | None = None
+    protocol_error = None
+    if not timed_out and returncode == 0:
+        try:
+            loaded = json.loads(result_path.read_text(encoding="utf-8"))
+            cleaned, _ = sanitize_trace_value(loaded)
+            if not adapter_result_valid(cleaned):
+                raise ValueError("result does not match protocol v1")
+            protocol_result = cleaned
+            atomic_write(result_path, json.dumps(cleaned, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            protocol_error = str(exc)
+    if timed_out:
+        status, attribution, reason = "blocked", "environment", "command timed out"
+    elif returncode not in {0, None}:
+        status, attribution, reason = "failed", "tool-runtime", f"command exited with code {returncode}"
+    elif protocol_error:
+        status, attribution, reason = "failed", "adapter-protocol", protocol_error
+    elif protocol_result and protocol_result.get("status") == "blocked":
+        status, attribution, reason = "blocked", "policy-blocker", protocol_result.get("reason") or "adapter blocked"
+    elif protocol_result and protocol_result.get("status") == "failed":
+        status, attribution, reason = "failed", "task", protocol_result.get("reason") or "adapter reported task failure"
+    else:
+        status, attribution, reason = "passed", "task", "protocol result completed"
+    preserve = status != "passed"
+    evidence_files = sorted(
+        str(path.relative_to(run_dir)).replace("\\", "/")
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    )
+    event = append_harness_run_event(
+        store,
+        run_id=run_id,
+        action="completed",
+        body={
+            "mode": mode,
+            "expectation": "protocol-result",
+            "expectation_met": status == "passed",
+            "target_type": target_type,
+            "target_id": target_id,
+            "status": status,
+            "reason": reason,
+            "attribution": attribution,
+            "returncode": returncode,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "result": protocol_result,
+            "output_sha256": sha256_text(stdout + "\n" + stderr),
+            "output_summary": collapse_blank_lines(stdout + "\n" + stderr)[:2000],
+            "output_truncated": stdout_truncated or stderr_truncated,
+            "execution_isolation": execution_isolation,
+            "evidence_path": str(run_dir) if preserve else None,
+            "evidence_files": evidence_files if preserve else [],
+            **clean_context,
+        },
+    )
+    if not preserve:
+        shutil.rmtree(run_dir)
+    return {**event, "run_id": run_id}
+
+
+def approve_model_adapter(store: Path, *, root: Path, adapter_id: str) -> dict[str, Any]:
+    adapter = active_model_adapters(store).get(adapter_id)
+    if not adapter:
+        raise ValueError(f"Unknown model adapter: {adapter_id}")
+    if adapter.get("status") in {"approved", "active"}:
+        return {"changed": False, "reason": "already_approved", "adapter": adapter}
+    if adapter.get("status") != "proposed":
+        raise ValueError(f"Model adapter is not approvable from state {adapter.get('status')}")
+    run = run_protocol_command(
+        store,
+        root=root,
+        target_type="model_adapter",
+        target_id=adapter_id,
+        command=adapter["command"],
+        input_manifest={
+            "protocol": "prompt-harness-adapter-v1",
+            "purpose": "approval-self-test",
+            "task": {"prompt": "Return a deterministic adapter self-test result."},
+        },
+        mode="adapter_approval",
+    )
+    if not run.get("expectation_met"):
+        return {"changed": False, "reason": "approval_preflight_failed", "run": run}
+    event = append_workflow_event(
+        store,
+        path=adapter_event_file(store),
+        record_type=ADAPTER_EVENT_RECORD_TYPE,
+        entity_id_field="adapter_id",
+        entity_id=adapter_id,
+        action="approved",
+        body={"approval_run_ids": [run["run_id"]]},
+    )
+    return {"changed": True, "adapter_id": adapter_id, "event": event, "run": run}
+
+
+def replay_input_manifest(
+    store: Path,
+    *,
+    case: dict[str, Any],
+    snapshot: dict[str, Any],
+    adapter: dict[str, Any],
+    compensation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), dict) else {}
+    evidence = manifest.get("evidence") if isinstance(manifest.get("evidence"), dict) else {}
+    prompt_ids = set(str(value) for value in evidence.get("task_prompt_event_ids") or [])
+    prompts = [
+        {
+            "event_id": event.get("event_id"),
+            "occurred_at": event.get("occurred_at"),
+            "text": event.get("prompt", {}).get("text"),
+        }
+        for event in iter_active_events(store)
+        if str(event.get("event_id") or "") in prompt_ids
+    ]
+    payload = {
+        "protocol": "prompt-harness-adapter-v1",
+        "purpose": "badcase-replay",
+        "case": {
+            "case_id": case.get("case_id"),
+            "task_prompts": prompts,
+        },
+        "snapshot": {
+            "snapshot_id": snapshot.get("snapshot_id"),
+            "manifest_sha256": snapshot.get("manifest_sha256"),
+            "project_id": manifest.get("project_id"),
+            "vcs": manifest.get("vcs"),
+            "files": manifest.get("files"),
+            "environment": manifest.get("environment"),
+        },
+        "target": {
+            "platform": adapter.get("platform"),
+            "model": adapter.get("model"),
+        },
+        "compensation": None,
+    }
+    if compensation:
+        payload["compensation"] = {
+            "compensation_id": compensation.get("compensation_id"),
+            "type": compensation.get("type"),
+            "content": compensation.get("content"),
+        }
+    cleaned, _ = sanitize_trace_value(payload)
+    forbidden = {"root_cause", "fix_method", "acceptance", "expected_failure_reason", "historical_answer"}
+    top_level_keys = set(cleaned.get("case", {})) if isinstance(cleaned, dict) else set()
+    if top_level_keys & forbidden:
+        raise ValueError("replay input contains hidden or historical fields")
+    return cleaned
+
+
+def run_replay_matrix(
+    store: Path,
+    *,
+    root: Path,
+    case_id: str,
+    snapshot_id: str,
+    adapter_ids: list[str],
+    compensation_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    case = active_badcase_cases(store).get(case_id)
+    snapshot = snapshots_by_id(store).get(snapshot_id)
+    if not case or not snapshot or snapshot.get("case_id") != case_id:
+        raise ValueError("replay requires a matching confirmed case and snapshot")
+    adapters = active_model_adapters(store)
+    compensations = active_compensations(store)
+    variants: list[dict[str, Any] | None] = [None]
+    for compensation_id in compensation_ids or []:
+        compensation = compensations.get(compensation_id)
+        if not compensation or compensation.get("status") not in {"approved", "active"}:
+            raise ValueError(f"Compensation is not approved: {compensation_id}")
+        variants.append(compensation)
+    results = []
+    stopped: dict[str, Any] | None = None
+    consumed_tokens = 0
+    consumed_cost = 0.0
+    for adapter_id in adapter_ids:
+        adapter = adapters.get(adapter_id)
+        if not adapter or adapter.get("status") not in {"approved", "active"}:
+            raise ValueError(f"Model adapter is not approved: {adapter_id}")
+        policy = effective_harness_policy(
+            store,
+            target_type="adapter",
+            target_id=adapter_id,
+            case_id=case_id,
+        )
+        for compensation in variants:
+            if len(results) >= policy["max_attempts"]:
+                stopped = {"reason": "max_attempts", "limit": policy["max_attempts"]}
+                break
+            if policy["max_tokens"] and consumed_tokens >= policy["max_tokens"]:
+                stopped = {"reason": "max_tokens", "limit": policy["max_tokens"]}
+                break
+            if policy["max_cost_usd"] and consumed_cost >= policy["max_cost_usd"]:
+                stopped = {"reason": "max_cost_usd", "limit": policy["max_cost_usd"]}
+                break
+            input_manifest = replay_input_manifest(
+                store,
+                case=case,
+                snapshot=snapshot,
+                adapter=adapter,
+                compensation=compensation,
+            )
+            run = run_protocol_command(
+                store,
+                root=root,
+                target_type="model_adapter",
+                target_id=adapter_id,
+                command={
+                    **adapter["command"],
+                    "timeout_seconds": min(
+                        int(adapter["command"].get("timeout_seconds") or 300),
+                        policy["timeout_seconds"],
+                    ),
+                },
+                input_manifest=input_manifest,
+                mode="badcase_replay",
+                run_context={
+                    "case_id": case_id,
+                    "snapshot_id": snapshot_id,
+                    "adapter_id": adapter_id,
+                    "compensation_id": compensation.get("compensation_id") if compensation else None,
+                },
+            )
+            run["case_id"] = case_id
+            run["snapshot_id"] = snapshot_id
+            run["adapter_id"] = adapter_id
+            run["compensation_id"] = compensation.get("compensation_id") if compensation else None
+            results.append(run)
+            metrics = run.get("result", {}).get("metrics", {}) if isinstance(run.get("result"), dict) else {}
+            with contextlib.suppress(TypeError, ValueError):
+                consumed_tokens += max(0, int(metrics.get("tokens") or 0))
+            with contextlib.suppress(TypeError, ValueError):
+                consumed_cost += max(0.0, float(metrics.get("cost_usd") or 0.0))
+        if stopped:
+            break
+    return {
+        "case_id": case_id,
+        "snapshot_id": snapshot_id,
+        "adapter_count": len(adapter_ids),
+        "variant_count": len(variants),
+        "runs": results,
+        "passed": sum(1 for item in results if item.get("status") == "passed"),
+        "failed": sum(1 for item in results if item.get("status") == "failed"),
+        "blocked": sum(1 for item in results if item.get("status") == "blocked"),
+        "budget_stop": stopped,
+        "consumed_tokens": consumed_tokens,
+        "consumed_cost_usd": round(consumed_cost, 8),
+    }
+
+
+ATTRIBUTION_CLASSES = {
+    "task",
+    "environment",
+    "tool-runtime",
+    "judge",
+    "changed-intent",
+    "policy-blocker",
+    "adapter-protocol",
+}
+
+
+def propose_judge_adapter(
+    store: Path,
+    *,
+    root: Path,
+    name: str,
+    command: Any,
+) -> dict[str, Any]:
+    judge_id = workflow_entity_id("JA", name)
+    payload = {
+        "name": clean_harness_text(name, field="name", required=True),
+        "command": normalize_command_spec(command, root=root),
+        "protocol": "prompt-harness-judge-v1",
+        "scope": "outcome-only",
+    }
+    event = append_workflow_event(
+        store,
+        path=judge_event_file(store),
+        record_type=JUDGE_EVENT_RECORD_TYPE,
+        entity_id_field="judge_id",
+        entity_id=judge_id,
+        action="proposed",
+        body={"payload": payload},
+    )
+    return {"changed": True, "judge_id": judge_id, "event": event}
+
+
+def approve_judge_adapter(store: Path, *, root: Path, judge_id: str) -> dict[str, Any]:
+    judge = active_judges(store).get(judge_id)
+    if not judge:
+        raise ValueError(f"Unknown judge adapter: {judge_id}")
+    if judge.get("status") in {"approved", "active"}:
+        return {"changed": False, "reason": "already_approved", "judge": judge}
+    if judge.get("status") != "proposed":
+        raise ValueError(f"Judge adapter is not approvable from state {judge.get('status')}")
+    run = run_protocol_command(
+        store,
+        root=root,
+        target_type="judge",
+        target_id=judge_id,
+        command=judge["command"],
+        input_manifest={
+            "protocol": "prompt-harness-judge-v1",
+            "purpose": "approval-self-test",
+            "candidate": {"answer": "SELF_TEST_PASS"},
+            "oracle": {"green_condition": "Answer is SELF_TEST_PASS"},
+        },
+        mode="judge_approval",
+    )
+    passed = bool(
+        run.get("expectation_met")
+        and isinstance(run.get("result", {}).get("metrics", {}).get("passed"), bool)
+    )
+    if not passed:
+        return {"changed": False, "reason": "approval_preflight_failed", "run": run}
+    event = append_workflow_event(
+        store,
+        path=judge_event_file(store),
+        record_type=JUDGE_EVENT_RECORD_TYPE,
+        entity_id_field="judge_id",
+        entity_id=judge_id,
+        action="approved",
+        body={"approval_run_ids": [run["run_id"]]},
+    )
+    return {"changed": True, "judge_id": judge_id, "event": event, "run": run}
+
+
+def evaluate_replay_outcome(
+    store: Path,
+    *,
+    root: Path,
+    run_id: str,
+    judge_id: str | None = None,
+) -> dict[str, Any]:
+    run = active_harness_runs(store).get(run_id)
+    if not run or run.get("mode") != "badcase_replay" or run.get("action") != "completed":
+        raise ValueError(f"Unknown completed replay run: {run_id}")
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    deterministic = metrics.get("passed")
+    judge_run = None
+    method = "deterministic"
+    if isinstance(deterministic, bool):
+        passed = deterministic
+        reason = str(result.get("reason") or "adapter supplied deterministic assertion")
+        evaluation_attribution = "task"
+    else:
+        if not judge_id:
+            return {
+                "run_id": run_id,
+                "decided": False,
+                "method": "inconclusive",
+                "reason": "no deterministic assertion and no approved judge",
+            }
+        judge = active_judges(store).get(judge_id)
+        if not judge or judge.get("status") not in {"approved", "active"}:
+            raise ValueError(f"Judge is not approved: {judge_id}")
+        case = active_badcase_cases(store).get(str(run.get("case_id") or ""))
+        if not case:
+            raise ValueError("Replay run has no valid case")
+        acceptance = case.get("acceptance") if isinstance(case.get("acceptance"), dict) else {}
+        judge_run = run_protocol_command(
+            store,
+            root=root,
+            target_type="judge",
+            target_id=judge_id,
+            command=judge["command"],
+            input_manifest={
+                "protocol": "prompt-harness-judge-v1",
+                "purpose": "outcome-evaluation",
+                "candidate": {"answer": result.get("answer"), "metrics": metrics},
+                "oracle": {
+                    "red_condition": acceptance.get("red_condition"),
+                    "green_condition": acceptance.get("green_condition"),
+                    "expected_failure_reason": acceptance.get("expected_failure_reason"),
+                },
+            },
+            mode="outcome_judge",
+            run_context={"case_id": run.get("case_id"), "replay_run_id": run_id},
+        )
+        if not judge_run.get("expectation_met"):
+            passed, reason = False, f"judge execution failed: {judge_run.get('reason')}"
+            evaluation_attribution = "judge"
+        else:
+            judge_metrics = judge_run.get("result", {}).get("metrics", {})
+            if not isinstance(judge_metrics.get("passed"), bool):
+                passed, reason = False, "judge result omitted boolean metrics.passed"
+                evaluation_attribution = "judge"
+            else:
+                passed = bool(judge_metrics["passed"])
+                reason = str(judge_run.get("result", {}).get("answer") or "judge decision")
+                evaluation_attribution = "task"
+        method = "approved-judge"
+    evaluation_id = "jev_" + sha256_text(
+        f"{run_id}|{method}|{judge_id or 'deterministic'}|{passed}|{reason}"
+    )[:32]
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": JUDGE_EVENT_RECORD_TYPE,
+        "event_id": evaluation_id,
+        "judge_id": judge_id or "deterministic",
+        "action": "evaluated",
+        "recorded_at": iso_z(),
+        "replay_run_id": run_id,
+        "judge_run_id": judge_run.get("run_id") if judge_run else None,
+        "method": method,
+        "passed": passed,
+        "reason": clean_harness_text(reason, field="reason", required=True),
+        "attribution": evaluation_attribution,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        judge_event_file(store),
+        event,
+        id_field="event_id",
+    )
+    return {"changed": changed, "decided": True, "evaluation": event}
+
+
+def append_attribution_override(
+    store: Path,
+    *,
+    run_id: str,
+    attribution: str,
+    reason: str,
+) -> dict[str, Any]:
+    if attribution not in ATTRIBUTION_CLASSES:
+        raise ValueError(f"Unsupported attribution: {attribution}")
+    if run_id not in active_harness_runs(store):
+        raise ValueError(f"Unknown harness run: {run_id}")
+    cleaned_reason = clean_harness_text(reason, field="reason", required=True)
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": ATTRIBUTION_EVENT_RECORD_TYPE,
+        "event_id": "ate_" + sha256_text(f"{run_id}|{attribution}|{cleaned_reason}")[:32],
+        "run_id": run_id,
+        "action": "overridden",
+        "attribution": attribution,
+        "reason": cleaned_reason,
+        "recorded_at": iso_z(),
+    }
+    changed = append_unique_badcase_record(
+        store,
+        attribution_event_file(store),
+        event,
+        id_field="event_id",
+    )
+    return {"changed": changed, "attribution": event}
+
+
+COMPENSATION_TYPES = {
+    "instruction",
+    "skill",
+    "tool-guard",
+    "workflow-checkpoint",
+    "retry-policy",
+    "human-approval-boundary",
+}
+
+
+def replay_evaluations(store: Path) -> dict[str, dict[str, Any]]:
+    values: dict[str, dict[str, Any]] = {}
+    for event in iter_judge_events(store):
+        if event.get("action") == "evaluated" and event.get("replay_run_id"):
+            values[str(event["replay_run_id"])] = event
+    return values
+
+
+def propose_compensation(
+    store: Path,
+    *,
+    replay_run_id: str,
+    compensation_type: str,
+    content: str,
+    scope: str,
+    rationale: str,
+) -> dict[str, Any]:
+    if compensation_type not in COMPENSATION_TYPES:
+        raise ValueError(f"Unsupported compensation type: {compensation_type}")
+    run = active_harness_runs(store).get(replay_run_id)
+    evaluation = replay_evaluations(store).get(replay_run_id)
+    if not run or run.get("mode") != "badcase_replay":
+        raise ValueError(f"Unknown replay run: {replay_run_id}")
+    if not evaluation or evaluation.get("passed") is not False:
+        raise ValueError("A compensation proposal requires a judged failing replay run")
+    compensation_id = workflow_entity_id("CP", compensation_type)
+    payload = {
+        "type": compensation_type,
+        "content": clean_harness_text(content, field="content", required=True),
+        "scope": clean_harness_text(scope, field="scope", required=True),
+        "rationale": clean_harness_text(rationale, field="rationale", required=True),
+        "source_replay_run_id": replay_run_id,
+        "case_id": run.get("case_id"),
+        "snapshot_id": run.get("snapshot_id"),
+        "adapter_id": run.get("adapter_id") or run.get("target_id"),
+        "smallest_selected_context_only": True,
+    }
+    event = append_workflow_event(
+        store,
+        path=compensation_event_file(store),
+        record_type=COMPENSATION_EVENT_RECORD_TYPE,
+        entity_id_field="compensation_id",
+        entity_id=compensation_id,
+        action="proposed",
+        body={"payload": payload},
+    )
+    return {"changed": True, "compensation_id": compensation_id, "event": event}
+
+
+def replay_result_passed(store: Path, run: dict[str, Any], *, root: Path, judge_id: str | None) -> bool:
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    if isinstance(metrics.get("passed"), bool):
+        evaluation = evaluate_replay_outcome(store, root=root, run_id=str(run["run_id"]))
+        return bool(evaluation.get("evaluation", {}).get("passed"))
+    evaluation = evaluate_replay_outcome(store, root=root, run_id=str(run["run_id"]), judge_id=judge_id)
+    return bool(evaluation.get("evaluation", {}).get("passed"))
+
+
+def approve_compensation(
+    store: Path,
+    *,
+    root: Path,
+    compensation_id: str,
+    judge_id: str | None = None,
+) -> dict[str, Any]:
+    compensation = active_compensations(store).get(compensation_id)
+    if not compensation:
+        raise ValueError(f"Unknown compensation: {compensation_id}")
+    if compensation.get("status") in {"approved", "active", "probation"}:
+        return {"changed": False, "reason": "already_approved", "compensation": compensation}
+    if compensation.get("status") != "proposed":
+        raise ValueError(f"Compensation is not approvable from state {compensation.get('status')}")
+    case_id = str(compensation.get("case_id") or "")
+    snapshot_id = str(compensation.get("snapshot_id") or "")
+    adapter_id = str(compensation.get("adapter_id") or "")
+    adapter = active_model_adapters(store).get(adapter_id)
+    case = active_badcase_cases(store).get(case_id)
+    snapshot = snapshots_by_id(store).get(snapshot_id)
+    if not adapter or adapter.get("status") not in {"approved", "active"} or not case or not snapshot:
+        raise ValueError("Compensation preflight dependencies are missing or unapproved")
+    runs = []
+    for variant in (None, compensation):
+        run = run_protocol_command(
+            store,
+            root=root,
+            target_type="model_adapter",
+            target_id=adapter_id,
+            command=adapter["command"],
+            input_manifest=replay_input_manifest(
+                store,
+                case=case,
+                snapshot=snapshot,
+                adapter=adapter,
+                compensation=variant,
+            ),
+            mode="badcase_replay",
+            run_context={
+                "case_id": case_id,
+                "snapshot_id": snapshot_id,
+                "adapter_id": adapter_id,
+                "compensation_id": variant.get("compensation_id") if variant else None,
+            },
+        )
+        runs.append(run)
+    baseline_passed = replay_result_passed(store, runs[0], root=root, judge_id=judge_id)
+    compensated_passed = replay_result_passed(store, runs[1], root=root, judge_id=judge_id)
+    if baseline_passed or not compensated_passed:
+        return {
+            "changed": False,
+            "reason": "approval_preflight_failed",
+            "baseline_passed": baseline_passed,
+            "compensated_passed": compensated_passed,
+            "run_ids": [item["run_id"] for item in runs],
+        }
+    event = append_workflow_event(
+        store,
+        path=compensation_event_file(store),
+        record_type=COMPENSATION_EVENT_RECORD_TYPE,
+        entity_id_field="compensation_id",
+        entity_id=compensation_id,
+        action="approved",
+        body={"approval_run_ids": [item["run_id"] for item in runs]},
+    )
+    return {"changed": True, "compensation_id": compensation_id, "event": event, "runs": runs}
+
+
+def transition_compensation(
+    store: Path,
+    *,
+    compensation_id: str,
+    action: str,
+    reason: str,
+    superseded_by: str | None = None,
+) -> dict[str, Any]:
+    compensation = active_compensations(store).get(compensation_id)
+    if not compensation:
+        raise ValueError(f"Unknown compensation: {compensation_id}")
+    allowed = {
+        "approved": {"activated", "disabled", "retired", "probation"},
+        "active": {"disabled", "retired", "probation", "superseded"},
+        "probation": {"reactivated", "retired"},
+        "disabled": {"reactivated", "retired"},
+    }
+    if action not in allowed.get(str(compensation.get("status")), set()):
+        raise ValueError(f"Cannot {action} compensation from {compensation.get('status')}")
+    if action == "superseded":
+        replacement = active_compensations(store).get(str(superseded_by or ""))
+        if not replacement or replacement.get("status") not in {"approved", "active", "probation"}:
+            raise ValueError("superseded compensation requires an approved replacement")
+    event = append_workflow_event(
+        store,
+        path=compensation_event_file(store),
+        record_type=COMPENSATION_EVENT_RECORD_TYPE,
+        entity_id_field="compensation_id",
+        entity_id=compensation_id,
+        action=action,
+        body={
+            "reason": clean_harness_text(reason, field="reason", required=True),
+            "superseded_by": superseded_by if action == "superseded" else None,
+        },
+    )
+    return {"changed": True, "compensation_id": compensation_id, "event": event}
+
+
+def compensation_lifecycle_recommendation(
+    store: Path,
+    *,
+    compensation_id: str,
+    required_consecutive_passes: int = 3,
+    distinct_model_minimum: int = 2,
+) -> dict[str, Any]:
+    compensation = active_compensations(store).get(compensation_id)
+    if not compensation:
+        raise ValueError(f"Unknown compensation: {compensation_id}")
+    case_id = str(compensation.get("case_id") or "")
+    evaluations = replay_evaluations(store)
+    probation_at = parse_iso(compensation.get("updated_at")) if compensation.get("status") == "probation" else None
+    uncompensated = [
+        run
+        for run in active_harness_runs(store).values()
+        if run.get("mode") == "badcase_replay"
+        and str(run.get("case_id") or "") == case_id
+        and not run.get("compensation_id")
+        and evaluations.get(str(run.get("run_id") or ""), {}).get("passed") is True
+        and (
+            probation_at is None
+            or (parse_iso(run.get("recorded_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) > probation_at
+        )
+    ]
+    uncompensated.sort(key=lambda item: str(item.get("recorded_at") or ""))
+    tail = uncompensated[-required_consecutive_passes:]
+    models = {
+        str(active_model_adapters(store).get(str(run.get("adapter_id") or run.get("target_id")), {}).get("model") or "")
+        for run in tail
+    }
+    eligible = len(tail) >= required_consecutive_passes and len(models - {""}) >= distinct_model_minimum
+    recurrence = any(
+        evaluation.get("passed") is False
+        and str(active_harness_runs(store).get(run_id, {}).get("case_id") or "") == case_id
+        and (
+            probation_at is None
+            or (parse_iso(evaluation.get("recorded_at")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) > probation_at
+        )
+        for run_id, evaluation in evaluations.items()
+    )
+    if compensation.get("status") == "probation" and recurrence:
+        recommendation = "reactivate"
+    elif eligible and compensation.get("status") in {"active", "approved"}:
+        recommendation = "enter-probation"
+    elif eligible and compensation.get("status") == "probation":
+        recommendation = "retire"
+    else:
+        recommendation = "keep"
+    return {
+        "compensation_id": compensation_id,
+        "recommendation": recommendation,
+        "mutated": False,
+        "uncompensated_consecutive_passes": len(tail),
+        "distinct_models": sorted(models - {""}),
+        "recurrence_seen": recurrence,
+    }
+
+
+def propose_task_case(
+    store: Path,
+    *,
+    root: Path,
+    title: str,
+    phases: list[dict[str, Any]],
+    linked_case_ids: list[str],
+    stop_condition: str,
+    cleanup: str,
+    exclusions: list[str] | None = None,
+    blocker_policy: list[str] | None = None,
+    run_policy: str = "every-dev-completion",
+) -> dict[str, Any]:
+    if not phases:
+        raise ValueError("Task case requires at least one ordered phase")
+    known_cases = active_badcase_cases(store)
+    if not linked_case_ids or any(case_id not in known_cases for case_id in linked_case_ids):
+        raise ValueError("Task case requires valid linked badcases")
+    normalized_phases = []
+    seen: set[str] = set()
+    for index, phase in enumerate(phases, 1):
+        if not isinstance(phase, dict):
+            raise ValueError("Each task phase must be an object")
+        name = str(clean_harness_text(phase.get("name"), field="phase.name", required=True))
+        check = str(clean_harness_text(phase.get("check"), field="phase.check", required=True))
+        if name in seen:
+            raise ValueError(f"Duplicate task phase: {name}")
+        seen.add(name)
+        normalized_phases.append(
+            {
+                "order": index,
+                "name": name,
+                "check": check,
+                "required": bool(phase.get("required", True)),
+                "case_ids": [value for value in linked_case_ids if value in (phase.get("case_ids") or linked_case_ids)],
+            }
+        )
+    task_case_id = workflow_entity_id("TC", title)
+    payload = {
+        "title": clean_harness_text(title, field="title", required=True),
+        "phases": normalized_phases,
+        "linked_case_ids": linked_case_ids,
+        "stop_condition": clean_harness_text(stop_condition, field="stop_condition", required=True),
+        "cleanup": clean_harness_text(cleanup, field="cleanup", required=True),
+        "exclusions": [clean_harness_text(item, field="exclusion", required=True) for item in exclusions or []],
+        "blocker_policy": [clean_harness_text(item, field="blocker", required=True) for item in blocker_policy or []],
+        "run_policy": run_policy,
+    }
+    event = append_workflow_event(
+        store,
+        path=task_case_event_file(store),
+        record_type=TASK_CASE_EVENT_RECORD_TYPE,
+        entity_id_field="task_case_id",
+        entity_id=task_case_id,
+        action="proposed",
+        body={"payload": payload},
+    )
+    for case_id in linked_case_ids:
+        ensure_badcase_task_case_coverage(store, case_id=case_id, task_case_id=task_case_id)
+    return {"changed": True, "task_case_id": task_case_id, "event": event}
+
+
+def task_case_as_checkpoint_chain(task_case: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "chain_id": task_case.get("task_case_id"),
+        "checkpoints": [
+            {
+                "title": phase.get("name"),
+                "check": phase.get("check"),
+                "required": phase.get("required", True),
+                "case_ids": phase.get("case_ids") or [],
+            }
+            for phase in task_case.get("phases") or []
+        ],
+    }
+
+
+def approve_task_case(
+    store: Path,
+    *,
+    root: Path,
+    task_case_id: str,
+    red_command: Any,
+    green_command: Any,
+    expected_red_reason: str,
+) -> dict[str, Any]:
+    task_case = active_task_cases(store).get(task_case_id)
+    if not task_case:
+        raise ValueError(f"Unknown task case: {task_case_id}")
+    if task_case.get("status") in {"approved", "active"}:
+        return {"changed": False, "reason": "already_approved", "task_case": task_case}
+    if task_case.get("status") != "proposed":
+        raise ValueError(f"Task case is not approvable from {task_case.get('status')}")
+    normalized_red = normalize_command_spec(red_command, root=root)
+    normalized_green = normalize_command_spec(green_command, root=root)
+    chain = task_case_as_checkpoint_chain(task_case)
+    red = run_feature_chain_command(
+        store,
+        root=root,
+        chain=chain,
+        command=normalized_red,
+        mode="task_case_approval",
+        expectation="red",
+        expected_red_reason=expected_red_reason,
+        target_type="task_case",
+        target_id=task_case_id,
+    )
+    green = run_feature_chain_command(
+        store,
+        root=root,
+        chain=chain,
+        command=normalized_green,
+        mode="task_case_approval",
+        expectation="green",
+        target_type="task_case",
+        target_id=task_case_id,
+    )
+    if not red.get("expectation_met") or not green.get("expectation_met"):
+        return {"changed": False, "reason": "approval_preflight_failed", "red": red, "green": green}
+    event = append_workflow_event(
+        store,
+        path=task_case_event_file(store),
+        record_type=TASK_CASE_EVENT_RECORD_TYPE,
+        entity_id_field="task_case_id",
+        entity_id=task_case_id,
+        action="approved",
+        body={
+            "approval_run_ids": [red["run_id"], green["run_id"]],
+            "red_command": normalized_red,
+            "green_command": normalized_green,
+            "expected_red_reason": clean_harness_text(expected_red_reason, field="expected_red_reason", required=True),
+        },
+    )
+    # Commands are retained in a policy event so the immutable proposal remains non-executable.
+    policy_event = append_workflow_event(
+        store,
+        path=task_case_event_file(store),
+        record_type=TASK_CASE_EVENT_RECORD_TYPE,
+        entity_id_field="task_case_id",
+        entity_id=task_case_id,
+        action="policy_updated",
+        body={
+            "policy": {"red_command": normalized_red, "green_command": normalized_green},
+            "reason": "approved Red/Green commands",
+        },
+    )
+    return {"changed": True, "task_case_id": task_case_id, "event": event, "policy_event": policy_event}
+
+
+def run_approved_task_case(
+    store: Path,
+    *,
+    root: Path,
+    task_case: dict[str, Any],
+    mode: str = "dev_complete",
+) -> dict[str, Any]:
+    policy = task_case.get("policy") if isinstance(task_case.get("policy"), dict) else {}
+    if task_case.get("status") not in {"approved", "active"} or not policy.get("green_command"):
+        raise ValueError(f"Task case is not approved: {task_case.get('task_case_id')}")
+    case_ids = [str(value) for value in task_case.get("linked_case_ids") or []]
+    execution_policy = effective_harness_policy(
+        store,
+        target_type="task_case",
+        target_id=str(task_case.get("task_case_id") or ""),
+        case_id=case_ids[0] if case_ids else None,
+    )
+    command = dict(policy["green_command"])
+    command["timeout_seconds"] = min(
+        int(command.get("timeout_seconds") or 300), execution_policy["timeout_seconds"]
+    )
+    return run_feature_chain_command(
+        store,
+        root=root,
+        chain=task_case_as_checkpoint_chain(task_case),
+        command=command,
+        mode=mode,
+        expectation="green",
+        target_type="task_case",
+        target_id=str(task_case.get("task_case_id") or ""),
+    )
+
+
+POLICY_DEFAULTS = {
+    "timeout_seconds": 300,
+    "max_attempts": 8,
+    "parallelism": 1,
+    "max_tokens": 0,
+    "max_cost_usd": 0.0,
+    "required_consecutive_passes": 3,
+    "distinct_model_minimum": 2,
+    "probation_window_days": 14,
+    "recurrence_behavior": "reactivate",
+}
+
+
+def validate_harness_policy(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("policy must be an object")
+    policy = {**POLICY_DEFAULTS, **value}
+    integer_bounds = {
+        "timeout_seconds": (1, 3600),
+        "max_attempts": (1, 100),
+        "parallelism": (1, 8),
+        "max_tokens": (0, 1000000000),
+        "required_consecutive_passes": (1, 100),
+        "distinct_model_minimum": (1, 100),
+        "probation_window_days": (1, 3650),
+    }
+    for field, (lower, upper) in integer_bounds.items():
+        try:
+            policy[field] = int(policy[field])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"policy.{field} must be an integer") from exc
+        if not lower <= policy[field] <= upper:
+            raise ValueError(f"policy.{field} must be between {lower} and {upper}")
+    try:
+        policy["max_cost_usd"] = float(policy["max_cost_usd"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("policy.max_cost_usd must be numeric") from exc
+    if policy["max_cost_usd"] < 0:
+        raise ValueError("policy.max_cost_usd cannot be negative")
+    if policy["recurrence_behavior"] not in {"reactivate", "review", "keep-retired"}:
+        raise ValueError("policy.recurrence_behavior is invalid")
+    return policy
+
+
+def set_harness_policy(
+    store: Path,
+    *,
+    target_type: str,
+    target_id: str,
+    policy: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    if target_type not in {"project", "badcase", "feature_chain", "task_case", "adapter", "snapshot"}:
+        raise ValueError(f"Unsupported policy target: {target_type}")
+    if target_type == "badcase" and target_id not in active_badcase_cases(store):
+        raise ValueError(f"Unknown badcase: {target_id}")
+    if target_type == "feature_chain" and target_id not in active_feature_chains(store):
+        raise ValueError(f"Unknown feature chain: {target_id}")
+    if target_type == "task_case" and target_id not in active_task_cases(store):
+        raise ValueError(f"Unknown task case: {target_id}")
+    if target_type == "adapter" and target_id not in active_model_adapters(store):
+        raise ValueError(f"Unknown adapter: {target_id}")
+    if target_type == "snapshot" and target_id not in snapshots_by_id(store):
+        raise ValueError(f"Unknown snapshot: {target_id}")
+    normalized = validate_harness_policy(policy)
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": POLICY_EVENT_RECORD_TYPE,
+        "event_id": "poe_" + sha256_text(
+            f"{target_type}|{target_id}|{json.dumps(normalized, sort_keys=True)}|{reason}"
+        )[:32],
+        "target_type": target_type,
+        "target_id": target_id,
+        "action": "set",
+        "policy": normalized,
+        "reason": clean_harness_text(reason, field="reason", required=True),
+        "recorded_at": iso_z(),
+    }
+    changed = append_unique_badcase_record(store, policy_event_file(store), event, id_field="event_id")
+    return {"changed": changed, "policy_event": event}
+
+
+def approve_snapshot_materialization(
+    store: Path,
+    *,
+    root: Path,
+    snapshot_id: str,
+    destination_parent: Path,
+    reason: str,
+) -> dict[str, Any]:
+    root = root.resolve()
+    destination_parent = destination_parent.expanduser().resolve()
+    if is_within(destination_parent, root):
+        raise ValueError("materialized workspaces must live outside the source project tree")
+    if not destination_parent.is_dir():
+        raise ValueError("materialization destination parent must already exist")
+    policy = validate_harness_policy(
+        {
+            "materialization_allowed": True,
+            "destination_parent": str(destination_parent),
+            "max_attempts": 1,
+        }
+    )
+    return set_harness_policy(
+        store,
+        target_type="snapshot",
+        target_id=snapshot_id,
+        policy=policy,
+        reason=reason,
+    )
+
+
+def materialize_project_snapshot(
+    store: Path,
+    *,
+    root: Path,
+    snapshot_id: str,
+) -> dict[str, Any]:
+    snapshot = snapshots_by_id(store).get(snapshot_id)
+    if not snapshot:
+        raise ValueError(f"Unknown snapshot: {snapshot_id}")
+    policy_event = active_harness_policies(store).get(("snapshot", snapshot_id))
+    policy = policy_event.get("policy") if isinstance(policy_event, dict) else {}
+    if not policy.get("materialization_allowed") or not policy.get("destination_parent"):
+        raise ValueError("snapshot materialization requires an explicit approved policy")
+    destination_parent = Path(str(policy["destination_parent"])).expanduser().resolve()
+    destination = destination_parent / snapshot_id
+    if destination.exists():
+        raise ValueError(f"materialized destination already exists: {destination}")
+    root = root.resolve()
+    if is_within(destination, root) or is_within(root, destination):
+        raise ValueError("materialized destination must remain outside the source project tree")
+    manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), dict) else {}
+    copied = 0
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+        for entry in manifest.get("files") or []:
+            relative = Path(str(entry.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts or snapshot_path_is_sensitive(relative):
+                raise ValueError(f"unsafe materialization path: {relative}")
+            source = root / relative
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if entry.get("kind") == "symlink":
+                resolved = source.resolve(strict=True)
+                if not is_within(resolved, root):
+                    raise ValueError(f"symlink escapes source project: {relative}")
+                link_target = os.path.relpath(destination / resolved.relative_to(root), target.parent)
+                target.symlink_to(link_target, target_is_directory=resolved.is_dir())
+            else:
+                expected = entry.get("sha256")
+                if expected and hash_file_stream(source) != expected:
+                    raise ValueError(f"source changed since snapshot: {relative}")
+                shutil.copy2(source, target)
+            copied += 1
+        metadata = {
+            "schema_version": "1.0.0",
+            "snapshot_id": snapshot_id,
+            "manifest_sha256": snapshot.get("manifest_sha256"),
+            "materialized_at": iso_z(),
+            "source_root": str(root),
+            "file_count": copied,
+        }
+        atomic_write(destination / "PROMPT_HARNESS_SNAPSHOT.json", json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
+    return {"snapshot_id": snapshot_id, "destination": str(destination), "file_count": copied}
+
+
+def active_harness_policies(store: Path) -> dict[tuple[str, str], dict[str, Any]]:
+    policies: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in iter_policy_events(store):
+        if event.get("action") == "set":
+            policies[(str(event.get("target_type") or ""), str(event.get("target_id") or ""))] = event
+    return policies
+
+
+def effective_harness_policy(
+    store: Path,
+    *,
+    target_type: str,
+    target_id: str,
+    case_id: str | None = None,
+) -> dict[str, Any]:
+    events = active_harness_policies(store)
+    policy = dict(POLICY_DEFAULTS)
+    for key in (("project", project_id(store.parent)), ("project", "default")):
+        if key in events:
+            policy.update(events[key]["policy"])
+    if case_id and ("badcase", case_id) in events:
+        policy.update(events[("badcase", case_id)]["policy"])
+    if (target_type, target_id) in events:
+        policy.update(events[(target_type, target_id)]["policy"])
+    return validate_harness_policy(policy)
+
+
+def transition_feature_chain(
+    store: Path,
+    *,
+    chain_id: str,
+    action: str,
+    reason: str,
+) -> dict[str, Any]:
+    chain = active_feature_chains(store).get(chain_id)
+    if not chain:
+        raise ValueError(f"Unknown feature chain: {chain_id}")
+    allowed = {
+        "approved": {"disabled", "retired"},
+        "disabled": {"reactivated", "retired"},
+    }
+    if action not in allowed.get(str(chain.get("status")), set()):
+        raise ValueError(f"Cannot {action} feature chain from {chain.get('status')}")
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": FEATURE_CHAIN_EVENT_RECORD_TYPE,
+        "feature_chain_event_id": "fce_" + sha256_text(f"{chain_id}|{action}|{reason}")[:32],
+        "chain_id": chain_id,
+        "action": action,
+        "recorded_at": iso_z(),
+        "reason": clean_harness_text(reason, field="reason", required=True),
+    }
+    changed = append_unique_badcase_record(
+        store, feature_chain_event_file(store), event, id_field="feature_chain_event_id"
+    )
+    return {"changed": changed, "feature_chain_event": event}
+
+
+def transition_workflow_entity(
+    store: Path,
+    *,
+    entity_type: str,
+    entity_id: str,
+    action: str,
+    reason: str,
+) -> dict[str, Any]:
+    registries = {
+        "task_case": (active_task_cases, task_case_event_file, TASK_CASE_EVENT_RECORD_TYPE, "task_case_id"),
+        "adapter": (active_model_adapters, adapter_event_file, ADAPTER_EVENT_RECORD_TYPE, "adapter_id"),
+        "judge": (active_judges, judge_event_file, JUDGE_EVENT_RECORD_TYPE, "judge_id"),
+    }
+    if entity_type not in registries:
+        raise ValueError(f"Unsupported workflow entity: {entity_type}")
+    getter, path_getter, record_type, id_field = registries[entity_type]
+    entity = getter(store).get(entity_id)
+    if not entity:
+        raise ValueError(f"Unknown {entity_type}: {entity_id}")
+    allowed = {
+        "approved": {"disabled", "retired"},
+        "active": {"disabled", "retired"},
+        "disabled": {"reactivated", "retired"},
+    }
+    if action not in allowed.get(str(entity.get("status")), set()):
+        raise ValueError(f"Cannot {action} {entity_type} from {entity.get('status')}")
+    event = append_workflow_event(
+        store,
+        path=path_getter(store),
+        record_type=record_type,
+        entity_id_field=id_field,
+        entity_id=entity_id,
+        action=action,
+        body={"reason": clean_harness_text(reason, field="reason", required=True)},
+    )
+    return {"changed": True, id_field: entity_id, "event": event}
+
+
+def local_project_path(value: str | Path) -> Path:
+    text = str(value)
+    if re.match(r"^[a-z][a-z0-9+.-]*://", text, re.I):
+        raise ValueError("remote project paths cannot be bound as local subagent roots")
+    path = Path(text).expanduser().resolve()
+    if not path.is_dir():
+        raise ValueError(f"local project root does not exist: {path}")
+    return path
+
+
+def bind_subagent(
+    store: Path,
+    *,
+    root: Path,
+    platform: str,
+    session_id: str,
+    agent_id: str,
+    child_root: str | Path,
+    parent_session_id: str | None = None,
+) -> dict[str, Any]:
+    root = root.resolve()
+    child = local_project_path(child_root)
+    if child != root:
+        raise ValueError("subagent child root must exactly match the current project root")
+    binding_id = "sab_" + sha256_text(
+        f"{platform}|{session_id}|{agent_id}|{normalize_path(child)}"
+    )[:32]
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": SUBAGENT_EVENT_RECORD_TYPE,
+        "event_id": "sae_" + sha256_text(f"bound|{binding_id}")[:32],
+        "binding_id": binding_id,
+        "action": "bound",
+        "recorded_at": iso_z(),
+        "platform": clean_harness_text(platform, field="platform", required=True),
+        "session_id": clean_harness_text(session_id, field="session_id", required=True),
+        "agent_id": clean_harness_text(agent_id, field="agent_id", required=True),
+        "parent_session_id": clean_harness_text(parent_session_id, field="parent_session_id"),
+        "project_root": str(child),
+    }
+    changed = append_unique_badcase_record(store, subagent_event_file(store), event, id_field="event_id")
+    return {"changed": changed, "binding": event}
+
+
+def record_subagent_completion(
+    store: Path,
+    *,
+    binding_id: str,
+    evidence_ids: list[str],
+    summary: str,
+) -> dict[str, Any]:
+    binding = next(
+        (
+            event
+            for event in iter_subagent_events(store)
+            if event.get("action") == "bound" and event.get("binding_id") == binding_id
+        ),
+        None,
+    )
+    if not binding:
+        raise ValueError(f"Unknown subagent binding: {binding_id}")
+    known_evidence = {
+        str(event.get("event_id") or "") for event in iter_events(store)
+    } | {
+        str(event.get("trace_event_id") or event.get("model_output_id") or "")
+        for event in iter_model_outputs(store)
+    } | set(active_harness_runs(store))
+    missing = [value for value in evidence_ids if value not in known_evidence]
+    if missing:
+        raise ValueError("Unknown completion evidence: " + ", ".join(missing))
+    normalized_ids = sorted(set(evidence_ids))
+    completion_key = sha256_text(f"{binding_id}|{'|'.join(normalized_ids)}")
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": SUBAGENT_EVENT_RECORD_TYPE,
+        "event_id": "sae_" + completion_key[:32],
+        "binding_id": binding_id,
+        "action": "completed",
+        "recorded_at": iso_z(),
+        "evidence_ids": normalized_ids,
+        "summary": clean_harness_text(summary, field="summary", required=True),
+    }
+    changed = append_unique_badcase_record(store, subagent_event_file(store), event, id_field="event_id")
+    return {"changed": changed, "completion": event}
+
+
+def render_context_view(
+    store: Path,
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sessions: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for event in events:
+        sessions[(str(event.get("source", {}).get("platform") or "unknown"), str(event.get("session", {}).get("id") or "unknown"))].append(event)
+    ordered = sorted(
+        sessions.items(),
+        key=lambda item: event_order_key(max(item[1], key=event_order_key)),
+        reverse=True,
+    )
+    active_key, active_events = ordered[0] if ordered else (("unknown", "unknown"), [])
+    active_prompt = active_events[-1].get("prompt", {}).get("text") if active_events else None
+    constraints = []
+    constraint_pattern = re.compile(r"(?:必须|不要|不能|确保|只需要|must|never|do not|only)", re.I)
+    for event in events:
+        text_value = str(event.get("prompt", {}).get("text") or "")
+        if constraint_pattern.search(text_value):
+            constraints.append(
+                {"event_id": event.get("event_id"), "text": collapse_blank_lines(text_value)[:300]}
+            )
+    constraints = constraints[-8:]
+    cases = active_badcase_cases(store)
+    open_cases = [
+        {"case_id": case_id, "title": case.get("title"), "status": case.get("status")}
+        for case_id, case in cases.items()
+        if case.get("status") in {"open", "recurred"}
+    ]
+    chains = active_feature_chains(store)
+    task_cases = active_task_cases(store)
+    lines = [
+        "# Harness context",
+        "",
+        "> Rebuildable navigation only. The transcript remains authoritative.",
+        "",
+        "## Active task",
+        "",
+        f"- Platform: `{active_key[0]}`",
+        f"- Session: `{active_key[1]}`",
+        f"- Latest prompt: {collapse_blank_lines(str(active_prompt or 'none'))[:500]}",
+        "",
+        "## Parked / resume candidates",
+        "",
+    ]
+    for key, session_events in ordered[1:6]:
+        latest = session_events[-1]
+        lines.append(
+            f"- `{key[0]}:{key[1]}` · {collapse_blank_lines(str(latest.get('prompt', {}).get('text') or ''))[:180]}"
+        )
+    if len(ordered) <= 1:
+        lines.append("- none")
+    lines.extend(["", "## Durable user constraints", ""])
+    for item in constraints:
+        lines.append(f"- `{item['event_id']}` · {item['text']}")
+    if not constraints:
+        lines.append("- none detected")
+    lines.extend(["", "## Open or recurred badcases", ""])
+    for item in open_cases:
+        lines.append(f"- `{item['case_id']}` · `{item['status']}` · {item['title']}")
+    if not open_cases:
+        lines.append("- none")
+    lines.extend(["", "## Approved route checkpoints", ""])
+    for chain in chains.values():
+        if chain.get("status") == "approved":
+            lines.append(f"- `{chain.get('chain_id')}` · {chain.get('title')} · `{chain.get('run_policy')}`")
+    for task_case in task_cases.values():
+        if task_case.get("status") in {"approved", "active"}:
+            lines.append(f"- `{task_case.get('task_case_id')}` · {task_case.get('title')} · `{task_case.get('run_policy')}`")
+    if not any(value.get("status") in {"approved", "active"} for value in list(chains.values()) + list(task_cases.values())):
+        lines.append("- none")
+    lines.extend(["", "## Next step", "", "- Continue from the latest active-session prompt; run approved completion checks before claiming completion.", ""])
+    atomic_write(store / "index" / "CONTEXT.md", "\n".join(lines))
+    return {
+        "active_session": {"platform": active_key[0], "session_id": active_key[1]},
+        "parked_session_count": max(0, len(ordered) - 1),
+        "constraint_count": len(constraints),
+        "open_case_count": len(open_cases),
+    }
+
+
+def badcase_candidate_decisions(store: Path) -> dict[str, dict[str, Any]]:
+    decisions: dict[str, dict[str, Any]] = {}
+    for decision in iter_badcase_decisions(store):
+        candidate_id = str(decision.get("candidate_id") or "")
+        if candidate_id:
+            decisions[candidate_id] = decision
+    return decisions
+
+
+def badcase_candidate_state(
+    candidate: dict[str, Any],
+    decisions: dict[str, dict[str, Any]],
+) -> str:
+    decision = decisions.get(str(candidate.get("candidate_id") or ""))
+    return str(decision.get("action") or "pending") if decision else "pending"
+
+
+def active_badcase_cases(store: Path) -> dict[str, dict[str, Any]]:
+    cases: dict[str, dict[str, Any]] = {}
+    for event in iter_badcase_case_events(store):
+        case_id = str(event.get("case_id") or "")
+        if not case_id:
+            continue
+        if event.get("action") == "created":
+            body = event.get("case") if isinstance(event.get("case"), dict) else {}
+            cases[case_id] = json.loads(json.dumps(body))
+            cases[case_id]["case_id"] = case_id
+            cases[case_id]["created_at"] = event.get("recorded_at")
+            cases[case_id]["updated_at"] = event.get("recorded_at")
+            cases[case_id]["event_ids"] = [event.get("case_event_id")]
+            continue
+        if event.get("action") == "updated" and case_id in cases:
+            patch = event.get("patch") if isinstance(event.get("patch"), dict) else {}
+            for key, value in patch.items():
+                if isinstance(value, dict) and isinstance(cases[case_id].get(key), dict):
+                    cases[case_id][key].update(value)
+                else:
+                    cases[case_id][key] = value
+            cases[case_id]["updated_at"] = event.get("recorded_at")
+            cases[case_id].setdefault("event_ids", []).append(event.get("case_event_id"))
+    return cases
+
+
+def correction_signals(text: str) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for name, pattern, weight in BADCASE_CORRECTION_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            signals.append(
+                {
+                    "name": name,
+                    "weight": weight,
+                    "matched_sha256": sha256_text(match.group(0)),
+                }
+            )
+    return signals
+
+
+def badcase_title_from_prompt(text: str) -> str:
+    first = next((line.strip() for line in collapse_blank_lines(text).splitlines() if line.strip()), "")
+    first = re.sub(r"\s+", " ", first)
+    return first if len(first) <= 100 else first[:97].rstrip() + "..."
+
+
+def build_badcase_candidate_record(
+    *,
+    key: tuple[str, str],
+    event: dict[str, Any],
+    previous: dict[str, Any] | None,
+    signals: list[dict[str, Any]],
+    candidate_id: str,
+    relevant_traces: list[dict[str, Any]],
+) -> dict[str, Any]:
+    text = str(event.get("prompt", {}).get("text") or "")
+    source_prompt_id = str(event.get("event_id") or "")
+    previous_id = str(previous.get("event_id") or "") if previous else ""
+    lower = str(previous.get("occurred_at") or "") if previous else ""
+    upper = str(event.get("occurred_at") or "")
+    trace_ids = [
+        str(item.get("trace_event_id") or item.get("model_output_id") or "")
+        for item in relevant_traces
+        if item.get("trace_event_id") or item.get("model_output_id")
+    ]
+    model_names = sorted(
+        {
+            str(item.get("context", {}).get("model") or "")
+            for item in relevant_traces
+            if item.get("context", {}).get("model")
+        }
+    )
+    score = min(
+        0.99,
+        max(float(item["weight"]) for item in signals) + 0.03 * (len(signals) - 1),
+    )
+    fingerprint = sha256_text(f"explicit-user-correction-v1|{source_prompt_id}")
+    return {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_CANDIDATE_RECORD_TYPE,
+        "candidate_id": candidate_id,
+        "detected_at": iso_z(),
+        "fingerprint": fingerprint,
+        "detector": {
+            "name": "explicit-user-correction",
+            "version": "1",
+            "score": score,
+            "signals": signals,
+            "asserts_failure": False,
+        },
+        "project": event.get("project", {}),
+        "session": {
+            "platform": key[0],
+            "id": key[1],
+            "turn_id": event.get("session", {}).get("turn_id"),
+            "models": model_names,
+        },
+        "source_prompt_event_id": source_prompt_id,
+        "evidence": {
+            "prompt_event_ids": [value for value in (previous_id, source_prompt_id) if value],
+            "trace_event_ids": trace_ids[:500],
+            "trace_event_count": len(trace_ids),
+            "trace_ids_truncated": len(trace_ids) > 500,
+            "from": lower or upper,
+            "to": upper,
+        },
+        "proposal": {
+            "title": badcase_title_from_prompt(text),
+            "category": "user_correction",
+            "severity": "medium",
+            "phenomenon": "User explicitly corrected or challenged the preceding agent result.",
+        },
+    }
+
+
+def detect_badcase_candidates(
+    store: Path,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Create high-precision review candidates from explicit user corrections.
+
+    Detection is deliberately conservative and deterministic. A candidate is
+    evidence for review, never an assertion that the model or harness failed.
+    """
+
+    prompts_by_session: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for event in sorted(iter_active_events(store), key=event_order_key):
+        current_session = str(event.get("session", {}).get("id") or "unknown")
+        if session_id and current_session != session_id:
+            continue
+        key = (str(event.get("source", {}).get("platform") or "unknown"), current_session)
+        prompts_by_session[key].append(event)
+    known = {str(item.get("candidate_id") or "") for item in iter_badcase_candidates(store)}
+    pending: list[tuple[tuple[str, str], int, dict[str, Any], list[dict[str, Any]], str]] = []
+    skipped = 0
+    for key, prompts in prompts_by_session.items():
+        for index, event in enumerate(prompts):
+            text = str(event.get("prompt", {}).get("text") or "")
+            signals = correction_signals(text)
+            if not signals:
+                continue
+            source_prompt_id = str(event.get("event_id") or "")
+            candidate_id = "bcc_" + sha256_text(
+                f"explicit-user-correction-v1|{source_prompt_id}"
+            )[:32]
+            if candidate_id in known:
+                skipped += 1
+                continue
+            pending.append((key, index, event, signals, candidate_id))
+
+    # model-events can be hundreds of megabytes. Do not open them at all when
+    # every correction-shaped prompt already has a stable candidate.
+    if not pending:
+        return {"added": 0, "skipped": skipped, "candidate_ids": [], "trace_scan": False}
+    pending_ranges: dict[tuple[str, str], tuple[str, str]] = {}
+    for key, index, event, _, _ in pending:
+        previous = prompts_by_session[key][index - 1] if index else event
+        lower = str(previous.get("occurred_at") or event.get("occurred_at") or "")
+        upper = str(event.get("occurred_at") or lower)
+        prior = pending_ranges.get(key)
+        pending_ranges[key] = (
+            min(prior[0], lower) if prior else lower,
+            max(prior[1], upper) if prior else upper,
+        )
+    traces_by_session: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for trace in iter_agent_traces_in_ranges(store, pending_ranges):
+        key = (
+            str(trace.get("source", {}).get("platform") or "unknown"),
+            str(trace.get("session", {}).get("id") or "unknown"),
+        )
+        traces_by_session[key].append(trace)
+    for traces in traces_by_session.values():
+        traces.sort(key=model_output_order_key)
+
+    added: list[str] = []
+    for key, index, event, signals, candidate_id in pending:
+        prompts = prompts_by_session[key]
+        previous = prompts[index - 1] if index else None
+        previous_id = str(previous.get("event_id") or "") if previous else ""
+        previous_turn_id = str(previous.get("session", {}).get("turn_id") or "") if previous else ""
+        lower = str(previous.get("occurred_at") or "") if previous else ""
+        upper = str(event.get("occurred_at") or "")
+        relevant_traces = []
+        for trace in traces_by_session.get(key, []):
+            occurred_at = str(trace.get("occurred_at") or "")
+            trace_turn_id = str(trace.get("session", {}).get("turn_id") or "")
+            linked_prompt_id = str(trace.get("links", {}).get("prompt_event_id") or "")
+            linked = bool(
+                (previous_turn_id and trace_turn_id == previous_turn_id)
+                or (previous_id and linked_prompt_id == previous_id)
+            )
+            if linked or (lower and lower <= occurred_at <= upper):
+                relevant_traces.append(trace)
+        record = build_badcase_candidate_record(
+            key=key,
+            event=event,
+            previous=previous,
+            signals=signals,
+            candidate_id=candidate_id,
+            relevant_traces=relevant_traces,
+        )
+        if append_unique_badcase_record(
+            store,
+            badcase_candidate_file(store),
+            record,
+            id_field="candidate_id",
+        ):
+            known.add(candidate_id)
+            added.append(candidate_id)
+    return {
+        "added": len(added),
+        "skipped": skipped,
+        "candidate_ids": added,
+        "trace_scan": True,
+    }
+
+
+def badcase_case_id(candidate: dict[str, Any]) -> str:
+    observed = parse_iso(candidate.get("evidence", {}).get("to")) or utc_now()
+    suffix = sha256_text(str(candidate.get("candidate_id") or ""))[:8].upper()
+    return f"BC-{observed:%Y%m%d}-{suffix}"
+
+
+def confirm_badcase_candidate(
+    store: Path,
+    *,
+    candidate_id: str,
+    title: str | None,
+    phenomenon: str | None,
+    red_condition: str,
+    green_condition: str,
+    expected_failure_reason: str,
+    category: str,
+    severity: str,
+    guard_type: str,
+    verification: str | None,
+    root_cause: str | None,
+    fix_method: str | None,
+    scope: str | None = None,
+    tags: list[str] | None = None,
+    frequency: str = "first-seen",
+    trigger_reproduction: str | None = None,
+    run_policy: str = "manual",
+    artifact_policy: str = "none",
+    blocker_handling: str = "none",
+    reusable_guard_path: str | None = None,
+    test_chain_issue: str = "none",
+) -> dict[str, Any]:
+    candidates = {str(item.get("candidate_id") or ""): item for item in iter_badcase_candidates(store)}
+    candidate = candidates.get(candidate_id)
+    if not candidate:
+        raise ValueError(f"Unknown badcase candidate: {candidate_id}")
+    existing_decision = badcase_candidate_decisions(store).get(candidate_id)
+    if existing_decision:
+        return {"changed": False, "reason": "already_decided", "decision": existing_decision}
+    case_id = badcase_case_id(candidate)
+    now = iso_z()
+    cleaned: dict[str, str | None] = {}
+    for key, value in {
+        "title": title or candidate.get("proposal", {}).get("title"),
+        "phenomenon": phenomenon or candidate.get("proposal", {}).get("phenomenon"),
+        "red_condition": red_condition,
+        "green_condition": green_condition,
+        "expected_failure_reason": expected_failure_reason,
+        "verification": verification,
+        "root_cause": root_cause,
+        "fix_method": fix_method,
+        "category": category,
+        "guard_type": guard_type,
+        "scope": scope or category,
+        "trigger_reproduction": trigger_reproduction or "See linked prompt and trajectory evidence.",
+        "frequency": frequency,
+        "run_policy": run_policy,
+        "artifact_policy": artifact_policy,
+        "blocker_handling": blocker_handling,
+        "reusable_guard_path": reusable_guard_path,
+        "test_chain_issue": test_chain_issue,
+    }.items():
+        sanitized, _ = sanitize_prompt(str(value or ""))
+        cleaned[key] = sanitized or None
+    required_contract = {
+        "title": cleaned["title"],
+        "red condition": cleaned["red_condition"],
+        "green condition": cleaned["green_condition"],
+        "expected failure reason": cleaned["expected_failure_reason"],
+    }
+    missing = [name for name, value in required_contract.items() if not value]
+    if missing:
+        raise ValueError("Badcase confirmation requires " + ", ".join(missing))
+    cleaned["title"] = badcase_title_from_prompt(str(cleaned["title"] or ""))
+    cleaned_tags = []
+    for value in tags or []:
+        tag = clean_harness_text(value, field="tag")
+        if tag and tag not in cleaned_tags:
+            cleaned_tags.append(tag)
+    if cleaned["run_policy"] not in {
+        "every-dev-completion",
+        "relevant-only",
+        "manual",
+        "release-only",
+        "goal-final",
+        "disabled-with-reason",
+        "user-defined",
+    }:
+        raise ValueError(f"Unsupported run policy: {cleaned['run_policy']}")
+    if cleaned["artifact_policy"] not in {
+        "cleanup-on-pass-preserve-on-fail",
+        "cleanup-on-pass",
+        "preserve-on-fail",
+        "manual-preserve",
+        "none",
+    }:
+        raise ValueError(f"Unsupported artifact policy: {cleaned['artifact_policy']}")
+    if cleaned["blocker_handling"] not in {
+        "credentials",
+        "external-service",
+        "permissions",
+        "resource-limits",
+        "network",
+        "destructive-confirmation",
+        "user-judgment",
+        "none",
+    }:
+        raise ValueError(f"Unsupported blocker handling: {cleaned['blocker_handling']}")
+    if cleaned["test_chain_issue"] not in {
+        "false-positive",
+        "false-negative",
+        "wrong-granularity",
+        "missing-phase",
+        "wrong-assertion",
+        "unrealistic-setup",
+        "missing-cleanup",
+        "unclear-localization",
+        "none",
+    }:
+        raise ValueError(f"Unsupported test-chain issue: {cleaned['test_chain_issue']}")
+    if not re.fullmatch(r"first-seen|repeated-[1-9][0-9]*|high-frequency", str(cleaned["frequency"])):
+        raise ValueError(f"Unsupported frequency: {cleaned['frequency']}")
+    case = {
+        "contract_version": "2.0.0",
+        "title": cleaned["title"],
+        "status": "open",
+        "category": cleaned["category"] or "agent_behavior",
+        "severity": severity,
+        "scope": cleaned["scope"],
+        "tags": cleaned_tags,
+        "frequency": cleaned["frequency"] or "first-seen",
+        "first_observed_at": candidate.get("evidence", {}).get("to"),
+        "last_checked_at": None,
+        "phenomenon": cleaned["phenomenon"],
+        "trigger_reproduction": cleaned["trigger_reproduction"],
+        "root_cause": cleaned["root_cause"] or "unknown",
+        "fix_method": cleaned["fix_method"],
+        "acceptance": {
+            "guard_type": cleaned["guard_type"] or "manual",
+            "verification": cleaned["verification"],
+            "red_condition": cleaned["red_condition"],
+            "green_condition": cleaned["green_condition"],
+            "expected_failure_reason": cleaned["expected_failure_reason"],
+        },
+        "guard": {
+            "type": cleaned["guard_type"] or "manual",
+            "verification": cleaned["verification"],
+            "run_policy": cleaned["run_policy"] or "manual",
+            "artifact_policy": cleaned["artifact_policy"] or "none",
+            "blocker_handling": cleaned["blocker_handling"] or "none",
+            "reusable_path": cleaned["reusable_guard_path"],
+            "red_condition": cleaned["red_condition"],
+            "green_condition": cleaned["green_condition"],
+            "expected_failure_reason": cleaned["expected_failure_reason"],
+        },
+        "coverage": {
+            "feature_chain_ids": [],
+            "task_case_ids": [],
+        },
+        "test_chain_issue": cleaned["test_chain_issue"] or "none",
+        "recurrence_analysis": None,
+        "route_change_note": None,
+        "harness": {
+            "lifecycle": "active",
+            "compensation": None,
+            "auto_apply": False,
+            "replay_ready": False,
+        },
+        "source_candidate_ids": [candidate_id],
+        "evidence": candidate.get("evidence", {}),
+        "session": candidate.get("session", {}),
+    }
+    case_event = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_CASE_EVENT_RECORD_TYPE,
+        "case_event_id": "bce_" + sha256_text(f"created|{case_id}|{candidate_id}")[:32],
+        "case_id": case_id,
+        "action": "created",
+        "recorded_at": now,
+        "source_candidate_id": candidate_id,
+        "case": case,
+    }
+    append_unique_badcase_record(
+        store,
+        badcase_case_event_file(store),
+        case_event,
+        id_field="case_event_id",
+    )
+    decision = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_DECISION_RECORD_TYPE,
+        "decision_id": "bcd_" + sha256_text(f"confirm|{candidate_id}|{case_id}")[:32],
+        "candidate_id": candidate_id,
+        "action": "confirmed",
+        "case_id": case_id,
+        "target_case_id": None,
+        "reason": None,
+        "recorded_at": now,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        badcase_decision_file(store),
+        decision,
+        id_field="decision_id",
+    )
+    return {"changed": changed, "case_id": case_id, "decision": decision}
+
+
+def decide_badcase_candidate(
+    store: Path,
+    *,
+    candidate_id: str,
+    action: str,
+    reason: str,
+    target_case_id: str | None = None,
+) -> dict[str, Any]:
+    candidates = {str(item.get("candidate_id") or ""): item for item in iter_badcase_candidates(store)}
+    if candidate_id not in candidates:
+        raise ValueError(f"Unknown badcase candidate: {candidate_id}")
+    prior = badcase_candidate_decisions(store).get(candidate_id)
+    if prior:
+        if prior.get("action") == "merged" and prior.get("target_case_id"):
+            ensure_badcase_candidate_merged(
+                store,
+                candidate_id=candidate_id,
+                target_case_id=str(prior["target_case_id"]),
+                reason=str(prior.get("reason") or "recovered merge decision"),
+            )
+        return {"changed": False, "reason": "already_decided", "decision": prior}
+    if action == "merged" and target_case_id not in active_badcase_cases(store):
+        raise ValueError(f"Unknown target badcase: {target_case_id}")
+    cleaned_reason, _ = sanitize_prompt(reason)
+    decision = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_DECISION_RECORD_TYPE,
+        "decision_id": "bcd_" + sha256_text(
+            f"{action}|{candidate_id}|{target_case_id or ''}|{cleaned_reason}"
+        )[:32],
+        "candidate_id": candidate_id,
+        "action": action,
+        "case_id": None,
+        "target_case_id": target_case_id,
+        "reason": cleaned_reason,
+        "recorded_at": iso_z(),
+    }
+    changed = append_unique_badcase_record(
+        store,
+        badcase_decision_file(store),
+        decision,
+        id_field="decision_id",
+    )
+    if changed and action == "merged" and target_case_id:
+        ensure_badcase_candidate_merged(
+            store,
+            candidate_id=candidate_id,
+            target_case_id=target_case_id,
+            reason=cleaned_reason,
+        )
+    return {"changed": changed, "decision": decision}
+
+
+def ensure_badcase_candidate_merged(
+    store: Path,
+    *,
+    candidate_id: str,
+    target_case_id: str,
+    reason: str,
+) -> bool:
+    current = active_badcase_cases(store).get(target_case_id)
+    if not current:
+        raise ValueError(f"Unknown target badcase: {target_case_id}")
+    source_ids = list(current.get("source_candidate_ids") or [])
+    if candidate_id in source_ids:
+        return False
+    source_ids.append(candidate_id)
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_CASE_EVENT_RECORD_TYPE,
+        "case_event_id": "bce_" + sha256_text(
+            f"merge|{target_case_id}|{candidate_id}"
+        )[:32],
+        "case_id": target_case_id,
+        "action": "updated",
+        "recorded_at": iso_z(),
+        "note": f"Merged candidate {candidate_id}: {reason}",
+        "patch": {"source_candidate_ids": source_ids},
+    }
+    return append_unique_badcase_record(
+        store,
+        badcase_case_event_file(store),
+        event,
+        id_field="case_event_id",
+    )
+
+
+def ensure_badcase_feature_chain_coverage(
+    store: Path,
+    *,
+    case_id: str,
+    chain_id: str,
+) -> bool:
+    current = active_badcase_cases(store).get(case_id)
+    if not current:
+        raise ValueError(f"Unknown badcase: {case_id}")
+    coverage = current.get("coverage") if isinstance(current.get("coverage"), dict) else {}
+    chain_ids = list(coverage.get("feature_chain_ids") or [])
+    if chain_id in chain_ids:
+        return False
+    chain_ids.append(chain_id)
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_CASE_EVENT_RECORD_TYPE,
+        "case_event_id": "bce_" + sha256_text(f"feature-chain|{case_id}|{chain_id}")[:32],
+        "case_id": case_id,
+        "action": "updated",
+        "recorded_at": iso_z(),
+        "note": f"Covered by feature chain {chain_id}",
+        "patch": {"coverage": {"feature_chain_ids": chain_ids}},
+    }
+    return append_unique_badcase_record(
+        store,
+        badcase_case_event_file(store),
+        event,
+        id_field="case_event_id",
+    )
+
+
+def ensure_badcase_task_case_coverage(store: Path, *, case_id: str, task_case_id: str) -> bool:
+    current = active_badcase_cases(store).get(case_id)
+    if not current:
+        raise ValueError(f"Unknown badcase: {case_id}")
+    coverage = current.get("coverage") if isinstance(current.get("coverage"), dict) else {}
+    task_case_ids = list(coverage.get("task_case_ids") or [])
+    if task_case_id in task_case_ids:
+        return False
+    task_case_ids.append(task_case_id)
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_CASE_EVENT_RECORD_TYPE,
+        "case_event_id": "bce_" + sha256_text(f"task-case|{case_id}|{task_case_id}")[:32],
+        "case_id": case_id,
+        "action": "updated",
+        "recorded_at": iso_z(),
+        "note": f"Covered by task case {task_case_id}",
+        "patch": {"coverage": {"task_case_ids": task_case_ids}},
+    }
+    return append_unique_badcase_record(
+        store, badcase_case_event_file(store), event, id_field="case_event_id"
+    )
+
+
+def update_badcase_case(
+    store: Path,
+    *,
+    case_id: str,
+    patch: dict[str, Any],
+    note: str,
+) -> dict[str, Any]:
+    if case_id not in active_badcase_cases(store):
+        raise ValueError(f"Unknown badcase: {case_id}")
+    cleaned_note, _ = sanitize_prompt(note)
+    now = iso_z()
+    material = json.dumps(patch, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    event = {
+        "schema_version": "1.0.0",
+        "record_type": BADCASE_CASE_EVENT_RECORD_TYPE,
+        "case_event_id": "bce_" + sha256_text(f"updated|{case_id}|{now}|{material}|{uuid.uuid4()}")[:32],
+        "case_id": case_id,
+        "action": "updated",
+        "recorded_at": now,
+        "note": cleaned_note,
+        "patch": patch,
+    }
+    changed = append_unique_badcase_record(
+        store,
+        badcase_case_event_file(store),
+        event,
+        id_field="case_event_id",
+    )
+    return {"changed": changed, "case_event": event}
 
 
 def event_supersession_file(store: Path) -> Path:
@@ -3895,6 +7673,11 @@ def incremental_backfill_project(
             preserved_unselected[key] = cursor
             continue
         path = Path(str(cursor["path"]))
+        # Rollouts may be archived or deleted after this cursor was written.
+        # Prune a missing selected source; discovery will add a moved copy under
+        # its new canonical path when one still exists.
+        if not path.is_file():
+            continue
         source_session_id = str(cursor.get("session_id") or path.stem)
         if not transcript_source_belongs_to_root(
             path,
@@ -3909,6 +7692,8 @@ def incremental_backfill_project(
 
     for value in source_paths:
         path = Path(value).expanduser()
+        if not path.is_file():
+            continue
         kind = infer_source_platform(path, source_platform)
         if kind == "unknown" or (platform != "all" and kind != platform):
             continue
@@ -4609,7 +8394,7 @@ def auto_sync_project(
                                 platform=platform,
                                 claude_home=claude_home,
                                 codex_home=codex_home,
-                                rebuild_index=rebuild,
+                                rebuild_index=False,
                             )
                             extra_sources: dict[str, tuple[Path, str, str]] = {}
                             known_after_full = read_source_cursors(store).get("sources") or {}
@@ -4651,7 +8436,7 @@ def auto_sync_project(
                                 source_paths=paths,
                                 claude_home=claude_home,
                                 codex_home=codex_home,
-                                rebuild_index=rebuild,
+                                rebuild_index=False,
                             )
                     results.append(result)
                     pending_requests = pop_pending_sync(store)
@@ -4660,6 +8445,38 @@ def auto_sync_project(
                 else:
                     for request in pending_requests:
                         mark_pending_sync(store, request)
+                badcase_config = (
+                    config.get("badcases") if isinstance(config.get("badcases"), dict) else {}
+                )
+                detection_result = {"added": 0, "skipped": 0, "candidate_ids": []}
+                if badcase_config.get("automatic_detection") == "candidate_only":
+                    detection_result = detect_badcase_candidates(store)
+                completion_result = None
+                completion_config = (
+                    badcase_config.get("completion_tests")
+                    if isinstance(badcase_config.get("completion_tests"), dict)
+                    else {}
+                )
+                completion_triggers = set(completion_config.get("triggers") or [])
+                if bool(completion_config.get("enabled", True)) and trigger in completion_triggers:
+                    try:
+                        completion_result = test_hub_dev_complete(
+                            store,
+                            root=root,
+                            jobs=max(1, min(int(completion_config.get("jobs") or 2), 8)),
+                        )
+                    except Exception as exc:
+                        completion_result = {
+                            "status": "failed-to-run",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                index_rebuilt = bool(rebuild and index_is_dirty(store))
+                if index_rebuilt:
+                    rebuild_index_for_store(store)
+                if results:
+                    results[-1]["index_rebuilt"] = index_rebuilt
+                    results[-1]["badcase_candidates_added"] = int(detection_result.get("added") or 0)
+                    results[-1]["completion_tests"] = completion_result
             except Exception as exc:
                 failed = {
                     **running,
@@ -5117,6 +8934,399 @@ def rebuild_session_metadata_for_store(store: Path, events: list[dict[str, Any]]
                 "updated_at": iso_z(),
             },
         )
+
+
+def render_badcase_views(
+    store: Path,
+    events: list[dict[str, Any]],
+    model_outputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidates = sorted(
+        iter_badcase_candidates(store),
+        key=lambda item: (str(item.get("detected_at") or ""), str(item.get("candidate_id") or "")),
+    )
+    candidate_by_id = {str(item.get("candidate_id") or ""): item for item in candidates}
+    decisions = badcase_candidate_decisions(store)
+    cases = active_badcase_cases(store)
+    prompt_by_id = {str(item.get("event_id") or ""): item for item in events}
+    trace_by_id = {
+        str(item.get("trace_event_id") or item.get("model_output_id") or ""): item
+        for item in model_outputs
+    }
+    state_counts = collections.Counter(
+        badcase_candidate_state(candidate, decisions) for candidate in candidates
+    )
+    case_status_counts = collections.Counter(str(case.get("status") or "unknown") for case in cases.values())
+    harness_counts = collections.Counter(
+        str(case.get("harness", {}).get("lifecycle") or "unknown") for case in cases.values()
+    )
+
+    lines = [
+        "# Badcases",
+        "",
+        f"- Candidates: `{len(candidates)}`",
+        f"- Pending review: `{state_counts.get('pending', 0)}`",
+        f"- Confirmed cases: `{len(cases)}`",
+        f"- Active harness cases: `{harness_counts.get('active', 0)}`",
+        "",
+        "> Automatic detection creates candidates only. A candidate is not proof that a model failed, and no test or prompt compensation is applied automatically.",
+        "",
+        "## Confirmed cases",
+        "",
+        "| Case | Status | Harness | Severity | Category | Title | Evidence |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    case_dir = store / "index" / "badcase"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    expected_paths: set[Path] = set()
+    for case_id, case in sorted(cases.items(), key=lambda pair: (str(pair[1].get("first_observed_at") or ""), pair[0])):
+        path = case_dir / f"{case_id}.md"
+        expected_paths.add(path)
+        title = str(case.get("title") or case_id).replace("|", "\\|")
+        lines.append(
+            f"| `{case_id}` | `{case.get('status') or 'unknown'}` | "
+            f"`{case.get('harness', {}).get('lifecycle') or 'unknown'}` | "
+            f"`{case.get('severity') or 'unknown'}` | `{case.get('category') or 'unknown'}` | "
+            f"{title} | [open](badcase/{urllib.parse.quote(path.name)}) |"
+        )
+
+        source_candidate_ids = [str(value) for value in case.get("source_candidate_ids") or []]
+        source_candidates = [candidate_by_id[value] for value in source_candidate_ids if value in candidate_by_id]
+        prompt_ids: list[str] = []
+        trace_ids: list[str] = []
+        for candidate in source_candidates:
+            for value in candidate.get("evidence", {}).get("prompt_event_ids") or []:
+                if value and value not in prompt_ids:
+                    prompt_ids.append(str(value))
+            for value in candidate.get("evidence", {}).get("trace_event_ids") or []:
+                if value and value not in trace_ids:
+                    trace_ids.append(str(value))
+        evidence_prompts = [prompt_by_id[value] for value in prompt_ids if value in prompt_by_id]
+        evidence_traces = [trace_by_id[value] for value in trace_ids if value in trace_by_id]
+        trace_counts = collections.Counter(str(item.get("event_type") or "unknown") for item in evidence_traces)
+        final_answers = [
+            item
+            for item in evidence_traces
+            if str(item.get("event_type") or "") == "assistant_text"
+            and str(item.get("context", {}).get("phase") or "") == "final_answer"
+        ]
+        manifest = read_json_object(store / "state" / "session-index-manifest.json")
+        session_manifest = manifest.get("sessions") if isinstance(manifest.get("sessions"), dict) else {}
+        trajectory_links: list[str] = []
+        for candidate in source_candidates:
+            session = candidate.get("session") if isinstance(candidate.get("session"), dict) else {}
+            key = f"{session.get('platform') or 'unknown'}:{session.get('id') or 'unknown'}"
+            entry = session_manifest.get(key) if isinstance(session_manifest.get(key), dict) else {}
+            filename = str(entry.get("filename") or "")
+            if filename:
+                link = f"../trajectory/{urllib.parse.quote(filename)}"
+                if link not in trajectory_links:
+                    trajectory_links.append(link)
+        acceptance = case.get("acceptance") if isinstance(case.get("acceptance"), dict) else {}
+        guard = case.get("guard") if isinstance(case.get("guard"), dict) else {}
+        coverage = case.get("coverage") if isinstance(case.get("coverage"), dict) else {}
+        detail = [
+            f"# {case_id} · {case.get('title') or 'Untitled badcase'}",
+            "",
+            f"- Status: `{case.get('status') or 'unknown'}`",
+            f"- Harness lifecycle: `{case.get('harness', {}).get('lifecycle') or 'unknown'}`",
+            f"- Category: `{case.get('category') or 'unknown'}`",
+            f"- Severity: `{case.get('severity') or 'unknown'}`",
+            f"- Scope: {case.get('scope') or 'unspecified'}",
+            f"- Tags: `{', '.join(case.get('tags') or []) or 'none'}`",
+            f"- Frequency: `{case.get('frequency') or 'unknown'}`",
+            f"- First observed: `{case.get('first_observed_at') or 'unknown'}`",
+            f"- Last checked: `{case.get('last_checked_at') or 'never'}`",
+            f"- Source candidates: `{', '.join(source_candidate_ids) or 'none'}`",
+            "",
+            "## Failure contract",
+            "",
+            f"- Phenomenon: {case.get('phenomenon') or 'unspecified'}",
+            f"- Trigger / reproduction: {case.get('trigger_reproduction') or 'not recorded'}",
+            f"- Root cause: {case.get('root_cause') or 'unknown'}",
+            f"- Fix method: {case.get('fix_method') or 'not recorded'}",
+            f"- Guard type: `{acceptance.get('guard_type') or 'unspecified'}`",
+            f"- Verification: {acceptance.get('verification') or 'not recorded'}",
+            f"- Red condition: {acceptance.get('red_condition') or 'missing'}",
+            f"- Green condition: {acceptance.get('green_condition') or 'missing'}",
+            f"- Expected failure reason: {acceptance.get('expected_failure_reason') or 'missing'}",
+            f"- Run policy: `{guard.get('run_policy') or 'manual'}`",
+            f"- Artifact policy: `{guard.get('artifact_policy') or 'none'}`",
+            f"- Blocker handling: `{guard.get('blocker_handling') or 'none'}`",
+            f"- Reusable guard path: `{guard.get('reusable_path') or 'none'}`",
+            f"- Test-chain issue: `{case.get('test_chain_issue') or 'none'}`",
+            f"- Feature-chain coverage: `{', '.join(coverage.get('feature_chain_ids') or []) or 'none'}`",
+            f"- Task-case coverage: `{', '.join(coverage.get('task_case_ids') or []) or 'none'}`",
+            "",
+            "## Evidence map",
+            "",
+            f"- Prompt events: `{len(evidence_prompts)}`",
+            f"- Trace events referenced: `{len(evidence_traces)}`",
+            f"- Trace categories: `{', '.join(f'{name}={count}' for name, count in sorted(trace_counts.items())) or 'none'}`",
+        ]
+        for number, link in enumerate(trajectory_links, 1):
+            detail.append(f"- Full session trajectory {number}: [open]({link})")
+        detail.extend(
+            [
+                "",
+                "> This compact evidence view includes complete referenced human prompts and final answers. Reasoning, tool traffic, injections, and subagent bodies remain in the linked trajectory and canonical trace ledger.",
+                "",
+            ]
+        )
+        for number, prompt in enumerate(sorted(evidence_prompts, key=event_order_key), 1):
+            detail.extend(
+                [
+                    f"### Evidence prompt {number}",
+                    "",
+                    f"- Event ID: `{prompt.get('event_id')}`",
+                    f"- Time: `{prompt.get('occurred_at')}`",
+                    f"- Turn: `{prompt.get('session', {}).get('turn_id') or 'none'}`",
+                    "",
+                    fenced(str(prompt.get("prompt", {}).get("text") or "")),
+                    "",
+                ]
+            )
+        for number, answer in enumerate(sorted(final_answers, key=model_output_order_key), 1):
+            content = answer.get("content") if isinstance(answer.get("content"), dict) else answer.get("output", {})
+            detail.extend(
+                [
+                    f"### Evidence final answer {number}",
+                    "",
+                    f"- Trace event ID: `{answer.get('trace_event_id') or answer.get('model_output_id')}`",
+                    f"- Time: `{answer.get('occurred_at')}`",
+                    f"- Turn: `{answer.get('session', {}).get('turn_id') or 'none'}`",
+                    "",
+                    fenced(str(content.get("text") or "")),
+                    "",
+                ]
+            )
+        atomic_write(path, "\n".join(detail))
+    if not cases:
+        lines.extend(["| _No confirmed cases_ | | | | | | |"])
+    lines.extend(
+        [
+            "",
+            "## Candidate review queue",
+            "",
+            "| Candidate | State | Score | Platform | Session | Source prompt | Proposed title |",
+            "|---|---|---:|---|---|---|---|",
+        ]
+    )
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        state = badcase_candidate_state(candidate, decisions)
+        proposal = candidate.get("proposal") if isinstance(candidate.get("proposal"), dict) else {}
+        session = candidate.get("session") if isinstance(candidate.get("session"), dict) else {}
+        title = str(proposal.get("title") or "untitled").replace("|", "\\|")
+        lines.append(
+            f"| `{candidate_id}` | `{state}` | {float(candidate.get('detector', {}).get('score') or 0):.2f} | "
+            f"`{session.get('platform') or 'unknown'}` | `{session.get('id') or 'unknown'}` | "
+            f"`{candidate.get('source_prompt_event_id') or 'unknown'}` | {title} |"
+        )
+    if not candidates:
+        lines.extend(["| _No candidates_ | | | | | | |"])
+    lines.append("")
+    atomic_write(store / "index" / "BADCASES.md", "\n".join(lines))
+    for stale in case_dir.glob("*.md"):
+        if stale not in expected_paths:
+            stale.unlink()
+    return {
+        "candidate_count": len(candidates),
+        "candidate_state_counts": dict(sorted(state_counts.items())),
+        "case_count": len(cases),
+        "case_status_counts": dict(sorted(case_status_counts.items())),
+        "harness_lifecycle_counts": dict(sorted(harness_counts.items())),
+    }
+
+
+def render_test_hub_views(store: Path) -> dict[str, Any]:
+    chains = sorted(
+        active_feature_chains(store).values(),
+        key=lambda item: (str(item.get("created_at") or ""), str(item.get("chain_id") or "")),
+    )
+    runs = active_harness_runs(store)
+    cases = active_badcase_cases(store)
+    task_cases = sorted(active_task_cases(store).values(), key=lambda item: str(item.get("task_case_id") or ""))
+    adapters = active_model_adapters(store)
+    judges = active_judges(store)
+    compensations = active_compensations(store)
+    snapshots = snapshots_by_id(store)
+    status_counts = collections.Counter(str(item.get("status") or "unknown") for item in chains)
+    covered_case_ids = {
+        str(case_id)
+        for chain in chains
+        for checkpoint in chain.get("checkpoints", [])
+        for case_id in checkpoint.get("case_ids", [])
+    }
+    last_run = read_json_object(store / "index" / "test-hub" / "last-run.json")
+    lines = [
+        "# Test Hub",
+        "",
+        f"- Feature chains: `{len(chains)}`",
+        f"- Task cases: `{len(task_cases)}`",
+        f"- Model adapters: `{len(adapters)}`",
+        f"- Judges: `{len(judges)}`",
+        f"- Compensations: `{len(compensations)}`",
+        f"- Snapshots: `{len(snapshots)}`",
+        f"- Approved: `{status_counts.get('approved', 0)}`",
+        f"- Proposed: `{status_counts.get('proposed', 0)}`",
+        f"- Confirmed cases covered: `{len(covered_case_ids)}` / `{len(cases)}`",
+        f"- Harness runs: `{len(runs)}`",
+        "",
+        "> Feature chains remain proposals until both a Red reproduction and Green pass complete the approval preflight.",
+        "",
+        "## Feature chains",
+        "",
+        "| Chain | State | Policy | Checkpoints | Cases | Title |",
+        "|---|---|---|---:|---:|---|",
+    ]
+    for chain in chains:
+        checkpoints = chain.get("checkpoints") if isinstance(chain.get("checkpoints"), list) else []
+        case_ids = {
+            str(case_id)
+            for checkpoint in checkpoints
+            for case_id in checkpoint.get("case_ids", [])
+        }
+        title_cell = str(chain.get("title") or "").replace("|", "\\|")
+        lines.append(
+            f"| `{chain.get('chain_id')}` | `{chain.get('status')}` | `{chain.get('run_policy')}` | "
+            f"{len(checkpoints)} | {len(case_ids)} | {title_cell} |"
+        )
+    if not chains:
+        lines.append("| _No feature chains_ | | | | | |")
+    for chain in chains:
+        lines.extend(
+            [
+                "",
+                f"### {chain.get('chain_id')} · {chain.get('title')}",
+                "",
+                f"- Entry: {chain.get('entry')}",
+                f"- Exit check: {chain.get('exit_check')}",
+                f"- Status: `{chain.get('status')}`",
+                f"- Run policy: `{chain.get('run_policy')}`",
+                "",
+                "| Checkpoint | Required | Cases | Recurrence check |",
+                "|---|---|---|---|",
+            ]
+        )
+        for checkpoint in chain.get("checkpoints", []):
+            checkpoint_title_cell = str(checkpoint.get("title") or "").replace("|", "\\|")
+            checkpoint_check_cell = str(checkpoint.get("check") or "").replace("|", "\\|")
+            lines.append(
+                f"| {checkpoint_title_cell} | "
+                f"`{'required' if checkpoint.get('required', True) else 'optional'}` | "
+                f"`{', '.join(checkpoint.get('case_ids') or []) or 'pending'}` | "
+                f"{checkpoint_check_cell} |"
+            )
+    lines.extend(["", "## Task cases", "", "| Task case | State | Policy | Phases | Cases | Title |", "|---|---|---|---:|---:|---|"])
+    for task_case in task_cases:
+        task_title_cell = str(task_case.get("title") or "").replace("|", "\\|")
+        lines.append(
+            f"| `{task_case.get('task_case_id')}` | `{task_case.get('status')}` | `{task_case.get('run_policy')}` | "
+            f"{len(task_case.get('phases') or [])} | {len(task_case.get('linked_case_ids') or [])} | "
+            f"{task_title_cell} |"
+        )
+    if not task_cases:
+        lines.append("| _No task cases_ | | | | | |")
+    lines.extend(["", "## Replay and adaptive layer", ""])
+    lines.append(
+        f"- Approved adapters: `{sum(1 for value in adapters.values() if value.get('status') == 'approved')}` / `{len(adapters)}`"
+    )
+    lines.append(
+        f"- Approved judges: `{sum(1 for value in judges.values() if value.get('status') == 'approved')}` / `{len(judges)}`"
+    )
+    lines.append(
+        f"- Active or approved compensations: `{sum(1 for value in compensations.values() if value.get('status') in {'approved', 'active', 'probation'})}` / `{len(compensations)}`"
+    )
+    lines.extend(["", "## Last completion run", ""])
+    if last_run:
+        lines.extend(
+            [
+                f"- Completed: `{last_run.get('completed_at') or 'unknown'}`",
+                f"- Selected: `{last_run.get('selected_count', 0)}`",
+                f"- Passed: `{last_run.get('passed', 0)}`",
+                f"- Failed: `{last_run.get('failed', 0)}`",
+                f"- Blocked: `{last_run.get('blocked', 0)}`",
+                "",
+                "| Chain | Status | Reason | Evidence |",
+                "|---|---|---|---|",
+            ]
+        )
+        for result in last_run.get("results") or []:
+            evidence = str(result.get("evidence_path") or "cleaned")
+            reason_cell = str(result.get("reason") or "").replace("|", "\\|")
+            lines.append(
+                f"| `{result.get('target_id')}` | `{result.get('status')}` | "
+                f"{reason_cell} | `{evidence}` |"
+            )
+    else:
+        lines.append("_No Test Hub completion run has been recorded._")
+    lines.append("")
+    atomic_write(store / "index" / "TEST_HUB.md", "\n".join(lines))
+
+    cards: list[str] = []
+    for chain in chains:
+        checkpoint_items = "".join(
+            "<li><strong>"
+            + html.escape(str(item.get("title") or ""))
+            + "</strong> · "
+            + ("required" if item.get("required", True) else "optional")
+            + " · "
+            + html.escape(str(item.get("check") or ""))
+            + "</li>"
+            for item in chain.get("checkpoints", [])
+        )
+        cards.append(
+            "<article><h2>"
+            + html.escape(str(chain.get("title") or "Untitled"))
+            + "</h2><p><code>"
+            + html.escape(str(chain.get("chain_id") or ""))
+            + "</code> · "
+            + html.escape(str(chain.get("status") or "unknown"))
+            + " · "
+            + html.escape(str(chain.get("run_policy") or "unknown"))
+            + "</p><p><b>Entry:</b> "
+            + html.escape(str(chain.get("entry") or ""))
+            + "</p><p><b>Exit:</b> "
+            + html.escape(str(chain.get("exit_check") or ""))
+            + "</p><ol>"
+            + checkpoint_items
+            + "</ol></article>"
+        )
+    html_doc = """<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prompt Harness Test Hub</title>
+<style>body{font:15px system-ui;margin:0;background:#f5f7f8;color:#172026}main{max-width:1100px;margin:auto;padding:28px}header,article{background:white;border:1px solid #dfe5e8;border-radius:12px;padding:18px;margin-bottom:14px}h1,h2{margin-top:0}code{background:#eef2f4;padding:2px 5px;border-radius:4px}.meta{display:flex;gap:18px;flex-wrap:wrap}</style>
+<main><header><h1>Prompt Harness Test Hub</h1><div class="meta">""" + "".join(
+        f"<span>{html.escape(label)}: <b>{value}</b></span>"
+        for label, value in (
+            ("chains", len(chains)),
+            ("approved", status_counts.get("approved", 0)),
+            ("covered cases", len(covered_case_ids)),
+            ("last passed", last_run.get("passed", 0) if last_run else 0),
+            ("last failed", last_run.get("failed", 0) if last_run else 0),
+            ("last blocked", last_run.get("blocked", 0) if last_run else 0),
+        )
+    ) + "</div></header>" + "".join(cards) + "</main></html>\n"
+    atomic_write(store / "index" / "test-hub" / "index.html", html_doc)
+    return {
+        "feature_chain_count": len(chains),
+        "task_case_count": len(task_cases),
+        "adapter_count": len(adapters),
+        "judge_count": len(judges),
+        "compensation_count": len(compensations),
+        "snapshot_count": len(snapshots),
+        "feature_chain_status_counts": dict(sorted(status_counts.items())),
+        "covered_case_count": len(covered_case_ids),
+        "unassigned_case_count": len(set(cases) - covered_case_ids),
+        "run_count": len(runs),
+        "last_run": {
+            key: last_run.get(key)
+            for key in ("completed_at", "selected_count", "passed", "failed", "blocked")
+        }
+        if last_run
+        else None,
+    }
 
 
 def rebuild_index_for_store(store: Path) -> dict[str, Any]:
@@ -5657,6 +9867,10 @@ def rebuild_index_for_store(store: Path) -> dict[str, Any]:
             "events": event_views,
         },
     )
+    catalog["badcases"] = render_badcase_views(store, events, model_outputs)
+    catalog["test_hub"] = render_test_hub_views(store)
+    catalog["context"] = render_context_view(store, events)
+    write_json(store / "index" / "catalog.json", catalog)
     clear_index_dirty(store)
     return catalog
 
@@ -6029,11 +10243,541 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
                 )
         if not is_within(output_event.get("project", {}).get("root"), root):
             errors.append(f"project root mismatch in {output_id}")
+    badcase_candidate_ids: set[str] = set()
+    badcase_candidate_count = 0
+    for candidate in iter_badcase_candidates(store):
+        badcase_candidate_count += 1
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if not re.fullmatch(r"bcc_[0-9a-f]{32}", candidate_id):
+            errors.append(f"invalid badcase candidate_id {candidate_id or '<missing>'}")
+        elif candidate_id in badcase_candidate_ids:
+            errors.append(f"duplicate badcase candidate_id {candidate_id}")
+        badcase_candidate_ids.add(candidate_id)
+        source_prompt_id = str(candidate.get("source_prompt_event_id") or "")
+        if source_prompt_id not in ids:
+            errors.append(f"badcase candidate {candidate_id} references missing source prompt {source_prompt_id}")
+        expected_fingerprint = sha256_text(f"explicit-user-correction-v1|{source_prompt_id}")
+        expected_candidate_id = "bcc_" + expected_fingerprint[:32]
+        if candidate.get("fingerprint") != expected_fingerprint:
+            errors.append(f"badcase candidate {candidate_id} fingerprint mismatch")
+        if candidate_id != expected_candidate_id:
+            errors.append(f"badcase candidate {candidate_id} identity mismatch")
+        evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
+        for prompt_id in evidence.get("prompt_event_ids") or []:
+            if str(prompt_id) not in ids:
+                errors.append(f"badcase candidate {candidate_id} references missing prompt {prompt_id}")
+        for trace_id in evidence.get("trace_event_ids") or []:
+            if str(trace_id) not in model_output_ids:
+                errors.append(f"badcase candidate {candidate_id} references missing trace {trace_id}")
+        if candidate.get("detector", {}).get("asserts_failure") is not False:
+            errors.append(f"badcase candidate {candidate_id} must not assert failure")
+        if not is_within(candidate.get("project", {}).get("root"), root):
+            errors.append(f"project root mismatch in badcase candidate {candidate_id}")
+
+    badcase_decision_ids: set[str] = set()
+    decided_candidate_ids: set[str] = set()
+    decisions = list(iter_badcase_decisions(store))
+    for decision in decisions:
+        decision_id = str(decision.get("decision_id") or "")
+        candidate_id = str(decision.get("candidate_id") or "")
+        if not re.fullmatch(r"bcd_[0-9a-f]{32}", decision_id):
+            errors.append(f"invalid badcase decision_id {decision_id or '<missing>'}")
+        elif decision_id in badcase_decision_ids:
+            errors.append(f"duplicate badcase decision_id {decision_id}")
+        badcase_decision_ids.add(decision_id)
+        if candidate_id not in badcase_candidate_ids:
+            errors.append(f"badcase decision {decision_id} references missing candidate {candidate_id}")
+        if candidate_id in decided_candidate_ids:
+            errors.append(f"multiple badcase decisions reference candidate {candidate_id}")
+        decided_candidate_ids.add(candidate_id)
+        if decision.get("action") not in {"confirmed", "dismissed", "merged"}:
+            errors.append(f"badcase decision {decision_id} has invalid action")
+
+    case_event_ids: set[str] = set()
+    created_case_ids: set[str] = set()
+    case_event_count = 0
+    for case_event in iter_badcase_case_events(store):
+        case_event_count += 1
+        event_id = str(case_event.get("case_event_id") or "")
+        if not re.fullmatch(r"bce_[0-9a-f]{32}", event_id):
+            errors.append(f"invalid badcase case_event_id {event_id or '<missing>'}")
+        elif event_id in case_event_ids:
+            errors.append(f"duplicate badcase case_event_id {event_id}")
+        case_event_ids.add(event_id)
+        if not re.fullmatch(r"BC-\d{8}-[0-9A-F]{8}", str(case_event.get("case_id") or "")):
+            errors.append(f"badcase case event {event_id} has invalid case_id")
+        if case_event.get("action") not in {"created", "updated"}:
+            errors.append(f"badcase case event {event_id} has invalid action")
+        case_id = str(case_event.get("case_id") or "")
+        if case_event.get("action") == "created":
+            if case_id in created_case_ids:
+                errors.append(f"badcase {case_id} has multiple created events")
+            created_case_ids.add(case_id)
+        elif case_id not in created_case_ids:
+            errors.append(f"badcase update {event_id} appears before its created event")
+
+    badcase_cases = active_badcase_cases(store)
+    for case_id, case in badcase_cases.items():
+        acceptance = case.get("acceptance") if isinstance(case.get("acceptance"), dict) else {}
+        for field in ("red_condition", "green_condition", "expected_failure_reason"):
+            if not acceptance.get(field):
+                errors.append(f"badcase {case_id} is missing acceptance.{field}")
+        if case.get("status") not in {
+            "open",
+            "resolved",
+            "recurred",
+            "deferred",
+            "superseded-by-route-change",
+        }:
+            errors.append(f"badcase {case_id} has invalid status")
+        if case.get("harness", {}).get("lifecycle") not in {
+            "active",
+            "stable",
+            "probation",
+            "retired",
+        }:
+            errors.append(f"badcase {case_id} has invalid harness lifecycle")
+        if case.get("status") == "resolved" and not case.get("last_checked_at"):
+            errors.append(f"resolved badcase {case_id} requires last_checked_at")
+        if case.get("status") == "recurred" and (
+            not case.get("last_checked_at") or not case.get("recurrence_analysis")
+        ):
+            errors.append(f"recurred badcase {case_id} requires checked recurrence analysis")
+        if case.get("status") == "superseded-by-route-change" and not case.get("route_change_note"):
+            errors.append(f"route-superseded badcase {case_id} requires route_change_note")
+        for candidate_id in case.get("source_candidate_ids") or []:
+            if str(candidate_id) not in badcase_candidate_ids:
+                errors.append(f"badcase {case_id} references missing candidate {candidate_id}")
+        if trace_value_matches_patterns(case, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in badcase {case_id}")
+        if case.get("contract_version") == "2.0.0":
+            guard = case.get("guard") if isinstance(case.get("guard"), dict) else {}
+            for field in ("scope", "trigger_reproduction", "frequency"):
+                if not case.get(field):
+                    errors.append(f"badcase {case_id} is missing {field}")
+            for field in (
+                "type",
+                "verification",
+                "run_policy",
+                "artifact_policy",
+                "blocker_handling",
+                "red_condition",
+                "green_condition",
+                "expected_failure_reason",
+            ):
+                if not guard.get(field):
+                    errors.append(f"badcase {case_id} is missing guard.{field}")
+            if not isinstance(case.get("tags"), list):
+                errors.append(f"badcase {case_id} tags must be an array")
+            if not isinstance(case.get("coverage"), dict):
+                errors.append(f"badcase {case_id} coverage must be an object")
+            if guard.get("red_condition") != acceptance.get("red_condition"):
+                errors.append(f"badcase {case_id} Red condition compatibility mismatch")
+            if guard.get("green_condition") != acceptance.get("green_condition"):
+                errors.append(f"badcase {case_id} Green condition compatibility mismatch")
+    for decision in decisions:
+        if decision.get("action") == "confirmed" and str(decision.get("case_id") or "") not in badcase_cases:
+            errors.append(f"badcase decision {decision.get('decision_id')} references missing confirmed case")
+        if decision.get("action") == "merged" and str(decision.get("target_case_id") or "") not in badcase_cases:
+            errors.append(f"badcase decision {decision.get('decision_id')} references missing merge target")
+
+    feature_chain_event_ids: set[str] = set()
+    created_feature_chain_ids: set[str] = set()
+    feature_chain_event_count = 0
+    for event in iter_feature_chain_events(store):
+        feature_chain_event_count += 1
+        event_id = str(event.get("feature_chain_event_id") or "")
+        chain_id = str(event.get("chain_id") or "")
+        action = str(event.get("action") or "")
+        if not re.fullmatch(r"fce_[0-9a-f]{32}", event_id):
+            errors.append(f"invalid feature_chain_event_id {event_id or '<missing>'}")
+        elif event_id in feature_chain_event_ids:
+            errors.append(f"duplicate feature_chain_event_id {event_id}")
+        feature_chain_event_ids.add(event_id)
+        if not re.fullmatch(r"FC-\d{8}-[0-9A-F]{8}", chain_id):
+            errors.append(f"feature-chain event {event_id} has invalid chain_id")
+        if action not in {
+            "created",
+            "checkpoint_attached",
+            "checkpoint_policy_updated",
+            "approved",
+            "policy_updated",
+            "disabled",
+            "retired",
+            "reactivated",
+        }:
+            errors.append(f"feature-chain event {event_id} has invalid action")
+        if action == "created":
+            if chain_id in created_feature_chain_ids:
+                errors.append(f"feature chain {chain_id} has multiple created events")
+            created_feature_chain_ids.add(chain_id)
+        elif chain_id not in created_feature_chain_ids:
+            errors.append(f"feature-chain event {event_id} appears before creation")
+        if trace_value_matches_patterns(event, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in feature-chain event {event_id}")
+
+    run_event_ids: set[str] = set()
+    started_run_ids: set[str] = set()
+    completed_run_ids: set[str] = set()
+    run_event_count = 0
+    for event in iter_harness_run_events(store):
+        run_event_count += 1
+        event_id = str(event.get("run_event_id") or "")
+        run_id = str(event.get("run_id") or "")
+        action = str(event.get("action") or "")
+        if not re.fullmatch(r"hre_[0-9a-f]{32}", event_id):
+            errors.append(f"invalid harness run_event_id {event_id or '<missing>'}")
+        elif event_id in run_event_ids:
+            errors.append(f"duplicate harness run_event_id {event_id}")
+        run_event_ids.add(event_id)
+        if not re.fullmatch(r"hrn_[0-9a-f]{32}", run_id):
+            errors.append(f"harness run event {event_id} has invalid run_id")
+        if action == "started":
+            if run_id in started_run_ids:
+                errors.append(f"harness run {run_id} has multiple started events")
+            started_run_ids.add(run_id)
+        elif action == "completed":
+            if run_id not in started_run_ids:
+                errors.append(f"harness run {run_id} completed before it started")
+            if run_id in completed_run_ids:
+                errors.append(f"harness run {run_id} has multiple completed events")
+            completed_run_ids.add(run_id)
+        else:
+            errors.append(f"harness run event {event_id} has invalid action")
+        if trace_value_matches_patterns(event, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in harness run event {event_id}")
+
+    feature_chains = active_feature_chains(store)
+    harness_runs = active_harness_runs(store)
+    for chain_id, chain in feature_chains.items():
+        if chain.get("status") not in {"proposed", "approved", "disabled", "retired"}:
+            errors.append(f"feature chain {chain_id} has invalid status")
+        checkpoints = chain.get("checkpoints") if isinstance(chain.get("checkpoints"), list) else []
+        if not checkpoints:
+            errors.append(f"feature chain {chain_id} has no checkpoints")
+        checkpoint_titles: set[str] = set()
+        has_case_coverage = False
+        for checkpoint in checkpoints:
+            title = str(checkpoint.get("title") or "")
+            if not title or not checkpoint.get("check"):
+                errors.append(f"feature chain {chain_id} has an incomplete checkpoint")
+            if title in checkpoint_titles:
+                errors.append(f"feature chain {chain_id} has duplicate checkpoint title {title}")
+            checkpoint_titles.add(title)
+            if not isinstance(checkpoint.get("required", True), bool):
+                errors.append(f"feature chain {chain_id} checkpoint {title} has invalid required policy")
+            if checkpoint.get("required") is False and not checkpoint.get("policy_reason"):
+                errors.append(f"feature chain {chain_id} optional checkpoint {title} lacks a reason")
+            for case_id in checkpoint.get("case_ids") or []:
+                has_case_coverage = True
+                if str(case_id) not in badcase_cases:
+                    errors.append(f"feature chain {chain_id} references missing badcase {case_id}")
+                else:
+                    coverage = badcase_cases[str(case_id)].get("coverage")
+                    coverage = coverage if isinstance(coverage, dict) else {}
+                    if chain_id not in (coverage.get("feature_chain_ids") or []):
+                        errors.append(
+                            f"feature chain {chain_id} coverage is missing from badcase {case_id}"
+                        )
+        if chain.get("status") == "approved":
+            if not has_case_coverage:
+                errors.append(f"approved feature chain {chain_id} has no real badcase coverage")
+            for command_name in ("red_command", "green_command"):
+                try:
+                    normalize_command_spec(chain.get(command_name), root=root)
+                except ValueError as exc:
+                    errors.append(f"approved feature chain {chain_id} has invalid {command_name}: {exc}")
+            approval_runs = list(chain.get("approval_run_ids") or [])
+            if len(approval_runs) != 2:
+                errors.append(f"approved feature chain {chain_id} lacks Red/Green approval runs")
+            for run_id in approval_runs:
+                run = harness_runs.get(str(run_id))
+                if not run or run.get("action") != "completed" or not run.get("expectation_met"):
+                    errors.append(f"feature chain {chain_id} has invalid approval run {run_id}")
+    for case_id, case in badcase_cases.items():
+        coverage = case.get("coverage") if isinstance(case.get("coverage"), dict) else {}
+        for chain_id in coverage.get("feature_chain_ids") or []:
+            chain = feature_chains.get(str(chain_id))
+            if not chain:
+                errors.append(f"badcase {case_id} references missing feature chain {chain_id}")
+                continue
+            linked = any(
+                case_id in (checkpoint.get("case_ids") or [])
+                for checkpoint in chain.get("checkpoints", [])
+            )
+            if not linked:
+                errors.append(f"badcase {case_id} has stale feature-chain coverage {chain_id}")
+    for run_id, run in harness_runs.items():
+        if str(run.get("target_type") or "") == "feature_chain" and str(run.get("target_id") or "") not in feature_chains:
+            errors.append(f"harness run {run_id} references missing feature chain {run.get('target_id')}")
+        expectation = str(run.get("expectation") or "")
+        if expectation not in {"red", "green", "protocol-result"}:
+            errors.append(f"harness run {run_id} has invalid expectation")
+        evidence_path = run.get("evidence_path")
+        if run.get("action") == "completed" and not run.get("expectation_met"):
+            if not evidence_path:
+                errors.append(f"failed harness expectation {run_id} has no preserved evidence")
+            elif not is_within(evidence_path, store / "badcases" / "runs"):
+                errors.append(f"harness run {run_id} evidence escapes badcases/runs")
+            elif not Path(str(evidence_path)).is_dir():
+                errors.append(f"harness run {run_id} preserved evidence is missing")
+    snapshot_ids: set[str] = set()
+    snapshot_count = 0
+    for snapshot in iter_snapshot_events(store):
+        snapshot_count += 1
+        snapshot_id = str(snapshot.get("snapshot_id") or "")
+        if not re.fullmatch(r"snp_[0-9a-f]{32}", snapshot_id):
+            errors.append(f"invalid snapshot_id {snapshot_id or '<missing>'}")
+        elif snapshot_id in snapshot_ids:
+            errors.append(f"duplicate snapshot_id {snapshot_id}")
+        snapshot_ids.add(snapshot_id)
+        manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), dict) else {}
+        material = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        expected_hash = sha256_text(material)
+        if snapshot.get("manifest_sha256") != expected_hash:
+            errors.append(f"snapshot {snapshot_id} manifest hash mismatch")
+        if snapshot_id != "snp_" + expected_hash[:32]:
+            errors.append(f"snapshot {snapshot_id} identity mismatch")
+        case_id = str(snapshot.get("case_id") or "")
+        if case_id not in badcase_cases:
+            errors.append(f"snapshot {snapshot_id} references missing badcase {case_id}")
+        if snapshot.get("project", {}).get("id") != project_id(root):
+            errors.append(f"snapshot {snapshot_id} project id mismatch")
+        if normalize_path(snapshot.get("project", {}).get("root")) != normalize_path(root):
+            errors.append(f"snapshot {snapshot_id} project root mismatch")
+        for file_entry in manifest.get("files") or []:
+            relative = Path(str(file_entry.get("path") or ""))
+            if relative.is_absolute() or ".." in relative.parts:
+                errors.append(f"snapshot {snapshot_id} contains escaping path {relative}")
+            if snapshot_path_is_sensitive(relative):
+                errors.append(f"snapshot {snapshot_id} includes sensitive path {relative}")
+        if trace_value_matches_patterns(snapshot, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in snapshot {snapshot_id}")
+    model_adapters = active_model_adapters(store)
+    adapter_event_ids: set[str] = set()
+    proposed_adapter_ids: set[str] = set()
+    for event in iter_adapter_events(store):
+        event_id = str(event.get("event_id") or "")
+        adapter_id = str(event.get("adapter_id") or "")
+        if not re.fullmatch(r"wfe_[0-9a-f]{32}", event_id) or event_id in adapter_event_ids:
+            errors.append(f"invalid or duplicate model adapter event_id {event_id or '<missing>'}")
+        adapter_event_ids.add(event_id)
+        if not re.fullmatch(r"MA-\d{8}-[0-9A-F]{8}", adapter_id):
+            errors.append(f"model adapter event {event_id} has invalid adapter_id")
+        if event.get("action") == "proposed":
+            proposed_adapter_ids.add(adapter_id)
+        elif adapter_id not in proposed_adapter_ids:
+            errors.append(f"model adapter event {event_id} appears before proposal")
+        if event.get("action") not in {"proposed", "approved", "disabled", "retired", "reactivated"}:
+            errors.append(f"model adapter event {event_id} has invalid action")
+        if trace_value_matches_patterns(event, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in model adapter event {event_id}")
+    for adapter_id, adapter in model_adapters.items():
+        if adapter.get("status") not in {"proposed", "approved", "disabled", "retired", "active"}:
+            errors.append(f"model adapter {adapter_id} has invalid status")
+        try:
+            normalize_command_spec(adapter.get("command"), root=root)
+        except ValueError as exc:
+            errors.append(f"model adapter {adapter_id} has invalid command: {exc}")
+        if adapter.get("status") in {"approved", "active"}:
+            approval_runs = adapter.get("approval_run_ids") or []
+            if len(approval_runs) != 1:
+                errors.append(f"approved model adapter {adapter_id} lacks one self-test run")
+            elif not harness_runs.get(str(approval_runs[0]), {}).get("expectation_met"):
+                errors.append(f"approved model adapter {adapter_id} has invalid self-test run")
+    for run_id, run in harness_runs.items():
+        if run.get("target_type") == "model_adapter" and str(run.get("target_id") or "") not in model_adapters:
+            errors.append(f"harness run {run_id} references missing model adapter {run.get('target_id')}")
+    task_cases = active_task_cases(store)
+    task_event_ids: set[str] = set()
+    proposed_task_ids: set[str] = set()
+    for event in iter_task_case_events(store):
+        event_id = str(event.get("event_id") or "")
+        task_case_id = str(event.get("task_case_id") or "")
+        if not re.fullmatch(r"wfe_[0-9a-f]{32}", event_id) or event_id in task_event_ids:
+            errors.append(f"invalid or duplicate task-case event_id {event_id or '<missing>'}")
+        task_event_ids.add(event_id)
+        if not re.fullmatch(r"TC-\d{8}-[0-9A-F]{8}", task_case_id):
+            errors.append(f"task-case event {event_id} has invalid task_case_id")
+        if event.get("action") == "proposed":
+            proposed_task_ids.add(task_case_id)
+        elif task_case_id not in proposed_task_ids:
+            errors.append(f"task-case event {event_id} appears before proposal")
+        if event.get("action") not in {"proposed", "approved", "policy_updated", "disabled", "retired", "reactivated"}:
+            errors.append(f"task-case event {event_id} has invalid action")
+    for task_case_id, task_case in task_cases.items():
+        if task_case.get("status") not in {"proposed", "approved", "active", "disabled", "retired"}:
+            errors.append(f"task case {task_case_id} has invalid status")
+        phases = task_case.get("phases") if isinstance(task_case.get("phases"), list) else []
+        if not phases or [item.get("order") for item in phases] != list(range(1, len(phases) + 1)):
+            errors.append(f"task case {task_case_id} has invalid phase order")
+        if not task_case.get("stop_condition") or not task_case.get("cleanup"):
+            errors.append(f"task case {task_case_id} lacks stop condition or cleanup")
+        for case_id in task_case.get("linked_case_ids") or []:
+            case = badcase_cases.get(str(case_id))
+            if not case:
+                errors.append(f"task case {task_case_id} references missing badcase {case_id}")
+            elif task_case_id not in (case.get("coverage", {}).get("task_case_ids") or []):
+                errors.append(f"task case {task_case_id} coverage is missing from badcase {case_id}")
+        if task_case.get("status") in {"approved", "active"}:
+            approval_runs = task_case.get("approval_run_ids") or []
+            if len(approval_runs) != 2 or any(not harness_runs.get(str(value), {}).get("expectation_met") for value in approval_runs):
+                errors.append(f"approved task case {task_case_id} lacks valid Red/Green runs")
+            policy = task_case.get("policy") if isinstance(task_case.get("policy"), dict) else {}
+            try:
+                normalize_command_spec(policy.get("green_command"), root=root)
+            except ValueError as exc:
+                errors.append(f"approved task case {task_case_id} has invalid green command: {exc}")
+        if trace_value_matches_patterns(task_case, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in task case {task_case_id}")
+    judges = active_judges(store)
+    judge_event_ids: set[str] = set()
+    proposed_judge_ids: set[str] = set()
+    for event in iter_judge_events(store):
+        event_id = str(event.get("event_id") or "")
+        action = str(event.get("action") or "")
+        judge_id = str(event.get("judge_id") or "")
+        expected_pattern = r"jev_[0-9a-f]{32}" if action == "evaluated" else r"wfe_[0-9a-f]{32}"
+        if not re.fullmatch(expected_pattern, event_id) or event_id in judge_event_ids:
+            errors.append(f"invalid or duplicate judge event_id {event_id or '<missing>'}")
+        judge_event_ids.add(event_id)
+        if action == "proposed":
+            proposed_judge_ids.add(judge_id)
+        elif action == "evaluated":
+            if str(event.get("replay_run_id") or "") not in harness_runs:
+                errors.append(f"judge evaluation {event_id} references missing replay run")
+            if not isinstance(event.get("passed"), bool):
+                errors.append(f"judge evaluation {event_id} lacks boolean decision")
+        elif judge_id not in proposed_judge_ids:
+            errors.append(f"judge event {event_id} appears before proposal")
+        if action not in {"proposed", "approved", "evaluated", "disabled", "retired", "reactivated"}:
+            errors.append(f"judge event {event_id} has invalid action")
+    for judge_id, judge in judges.items():
+        if judge.get("status") not in {"proposed", "approved", "active", "disabled", "retired"}:
+            errors.append(f"judge {judge_id} has invalid status")
+        try:
+            normalize_command_spec(judge.get("command"), root=root)
+        except ValueError as exc:
+            errors.append(f"judge {judge_id} has invalid command: {exc}")
+        if judge.get("status") in {"approved", "active"}:
+            approval_runs = judge.get("approval_run_ids") or []
+            if len(approval_runs) != 1 or not harness_runs.get(str(approval_runs[0]), {}).get("expectation_met"):
+                errors.append(f"approved judge {judge_id} lacks valid self-test")
+        if trace_value_matches_patterns(judge, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in judge {judge_id}")
+    compensations = active_compensations(store)
+    proposed_compensation_ids: set[str] = set()
+    compensation_event_ids: set[str] = set()
+    for event in iter_compensation_events(store):
+        event_id = str(event.get("event_id") or "")
+        compensation_id = str(event.get("compensation_id") or "")
+        action = str(event.get("action") or "")
+        if not re.fullmatch(r"wfe_[0-9a-f]{32}", event_id) or event_id in compensation_event_ids:
+            errors.append(f"invalid or duplicate compensation event_id {event_id or '<missing>'}")
+        compensation_event_ids.add(event_id)
+        if not re.fullmatch(r"CP-\d{8}-[0-9A-F]{8}", compensation_id):
+            errors.append(f"compensation event {event_id} has invalid compensation_id")
+        if action == "proposed":
+            proposed_compensation_ids.add(compensation_id)
+        elif compensation_id not in proposed_compensation_ids:
+            errors.append(f"compensation event {event_id} appears before proposal")
+        if action not in {"proposed", "approved", "activated", "disabled", "retired", "superseded", "probation", "reactivated"}:
+            errors.append(f"compensation event {event_id} has invalid action")
+    for compensation_id, compensation in compensations.items():
+        if compensation.get("status") not in {
+            "proposed", "approved", "active", "probation", "disabled", "retired", "superseded"
+        }:
+            errors.append(f"compensation {compensation_id} has invalid status")
+        if compensation.get("type") not in COMPENSATION_TYPES:
+            errors.append(f"compensation {compensation_id} has invalid type")
+        if str(compensation.get("case_id") or "") not in badcase_cases:
+            errors.append(f"compensation {compensation_id} references missing badcase")
+        if str(compensation.get("source_replay_run_id") or "") not in harness_runs:
+            errors.append(f"compensation {compensation_id} references missing source run")
+        if compensation.get("status") in {"approved", "active", "probation"}:
+            approval_runs = compensation.get("approval_run_ids") or []
+            if len(approval_runs) != 2:
+                errors.append(f"approved compensation {compensation_id} lacks baseline/compensated runs")
+        if compensation.get("status") == "superseded" and str(compensation.get("superseded_by") or "") not in compensations:
+            errors.append(f"superseded compensation {compensation_id} lacks replacement")
+        if trace_value_matches_patterns(compensation, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in compensation {compensation_id}")
+    attribution_event_ids: set[str] = set()
+    for event in iter_attribution_events(store):
+        event_id = str(event.get("event_id") or "")
+        if not re.fullmatch(r"ate_[0-9a-f]{32}", event_id) or event_id in attribution_event_ids:
+            errors.append(f"invalid or duplicate attribution event_id {event_id or '<missing>'}")
+        attribution_event_ids.add(event_id)
+        if str(event.get("run_id") or "") not in harness_runs:
+            errors.append(f"attribution {event_id} references missing run")
+        if event.get("attribution") not in ATTRIBUTION_CLASSES:
+            errors.append(f"attribution {event_id} has invalid class")
+        if trace_value_matches_patterns(event, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in attribution {event_id}")
+    policy_event_ids: set[str] = set()
+    for event in iter_policy_events(store):
+        event_id = str(event.get("event_id") or "")
+        if not re.fullmatch(r"poe_[0-9a-f]{32}", event_id) or event_id in policy_event_ids:
+            errors.append(f"invalid or duplicate policy event_id {event_id or '<missing>'}")
+        policy_event_ids.add(event_id)
+        try:
+            validate_harness_policy(event.get("policy"))
+        except ValueError as exc:
+            errors.append(f"policy event {event_id} is invalid: {exc}")
+        target_type = str(event.get("target_type") or "")
+        target_id = str(event.get("target_id") or "")
+        targets = {
+            "badcase": badcase_cases,
+            "feature_chain": feature_chains,
+            "task_case": task_cases,
+            "adapter": model_adapters,
+            "snapshot": snapshots_by_id(store),
+        }
+        if target_type in targets and target_id not in targets[target_type]:
+            errors.append(f"policy event {event_id} references missing {target_type} {target_id}")
+        if trace_value_matches_patterns(event, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in policy event {event_id}")
+    subagent_event_ids: set[str] = set()
+    subagent_bindings: set[str] = set()
+    for event in iter_subagent_events(store):
+        event_id = str(event.get("event_id") or "")
+        binding_id = str(event.get("binding_id") or "")
+        if not re.fullmatch(r"sae_[0-9a-f]{32}", event_id) or event_id in subagent_event_ids:
+            errors.append(f"invalid or duplicate subagent event_id {event_id or '<missing>'}")
+        subagent_event_ids.add(event_id)
+        if event.get("action") == "bound":
+            subagent_bindings.add(binding_id)
+            if normalize_path(event.get("project_root")) != normalize_path(root):
+                errors.append(f"subagent binding {binding_id} has wrong project root")
+        elif event.get("action") == "completed":
+            if binding_id not in subagent_bindings:
+                errors.append(f"subagent completion {event_id} appears before binding")
+            known_completion_evidence = ids | model_output_ids | set(harness_runs)
+            for evidence_id in event.get("evidence_ids") or []:
+                if str(evidence_id) not in known_completion_evidence:
+                    errors.append(f"subagent completion {event_id} references missing evidence {evidence_id}")
+        else:
+            errors.append(f"subagent event {event_id} has invalid action")
+        if trace_value_matches_patterns(event, SECRET_PATTERNS):
+            errors.append(f"obvious secret pattern remains in subagent event {event_id}")
+    for run_id, run in harness_runs.items():
+        if run.get("target_type") == "task_case" and str(run.get("target_id") or "") not in task_cases:
+            errors.append(f"harness run {run_id} references missing task case")
+        if run.get("target_type") == "judge" and str(run.get("target_id") or "") not in judges:
+            errors.append(f"harness run {run_id} references missing judge")
+        if run.get("mode") == "badcase_replay":
+            if str(run.get("case_id") or "") not in badcase_cases:
+                errors.append(f"replay run {run_id} references missing badcase")
+            if str(run.get("snapshot_id") or "") not in snapshots_by_id(store):
+                errors.append(f"replay run {run_id} references missing snapshot")
     if not index_is_dirty(store):
         required_indexes = (
             "PROMPTS.md",
             "MODELOUT.md",
             "TRAJECTORY.md",
+            "BADCASES.md",
+            "TEST_HUB.md",
+            "CONTEXT.md",
         )
         for name in required_indexes:
             if not (store / "index" / name).is_file():
@@ -6048,6 +10792,11 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
             session_view_names[directory] = {path.name for path in folder.glob("*.md")}
         if len({frozenset(names) for names in session_view_names.values()}) > 1:
             errors.append("per-session prompt/modelout/trajectory filenames do not match")
+        badcase_view_names = {path.stem for path in (store / "index" / "badcase").glob("*.md")}
+        if badcase_view_names != set(badcase_cases):
+            errors.append("per-case badcase views do not match confirmed cases")
+        if not (store / "index" / "test-hub" / "index.html").is_file():
+            errors.append("derived Test Hub HTML is missing")
     config_path = store / "config.json"
     if not config_path.exists():
         errors.append("config.json is missing")
@@ -6057,6 +10806,8 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         ignored = (store / ".gitignore").read_text(encoding="utf-8", errors="replace")
         if not re.search(r"(?m)^assets/?$", ignored):
             warnings.append("assets/ is not ignored by the nested .gitignore")
+        if not re.search(r"(?m)^badcases/?$", ignored):
+            warnings.append("badcases/ is not ignored by the nested .gitignore")
     misses = store / "state" / "hook-misses.jsonl"
     if misses.exists():
         miss_count = sum(1 for _ in read_jsonl(misses))
@@ -6105,6 +10856,21 @@ def doctor_store(store: Path, root: Path) -> dict[str, Any]:
         "image_file_count": len(image_hashes),
         "model_output_count": model_output_count,
         "linked_model_output_count": linked_model_output_count,
+        "badcase_candidate_count": badcase_candidate_count,
+        "badcase_case_event_count": case_event_count,
+        "badcase_case_count": len(badcase_cases),
+        "feature_chain_event_count": feature_chain_event_count,
+        "feature_chain_count": len(feature_chains),
+        "harness_run_event_count": run_event_count,
+        "harness_run_count": len(harness_runs),
+        "snapshot_count": snapshot_count,
+        "model_adapter_count": len(model_adapters),
+        "task_case_count": len(task_cases),
+        "judge_count": len(judges),
+        "compensation_count": len(compensations),
+        "attribution_event_count": len(attribution_event_ids),
+        "policy_event_count": len(policy_event_ids),
+        "subagent_event_count": len(subagent_event_ids),
         "active_session_binding_count": len(project_bindings),
         "auto_sync": {
             "status": auto_sync_state.get("status") or "never_run",
@@ -6144,6 +10910,722 @@ def init_command(args: argparse.Namespace) -> int:
         return 2
     store, config = init_store(root)
     print(json.dumps({"store": str(store), "config": config}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def badcase_detect_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    result = detect_badcase_candidates(store, session_id=args.session_id)
+    if result.get("added") or index_is_dirty(store):
+        rebuild_index_for_store(store)
+    result["index"] = str(store / "index" / "BADCASES.md")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def badcase_list_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    decisions = badcase_candidate_decisions(store)
+    candidates = []
+    for candidate in iter_badcase_candidates(store):
+        state = badcase_candidate_state(candidate, decisions)
+        if args.state != "all" and state != args.state:
+            continue
+        candidates.append({**candidate, "review_state": state, "decision": decisions.get(candidate.get("candidate_id"))})
+    payload = {
+        "project": str(root),
+        "candidates": candidates,
+        "cases": list(active_badcase_cases(store).values()),
+        "index": str(store / "index" / "BADCASES.md"),
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def badcase_confirm_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = confirm_badcase_candidate(
+            store,
+            candidate_id=args.candidate_id,
+            title=args.title,
+            phenomenon=args.phenomenon,
+            red_condition=args.red,
+            green_condition=args.green,
+            expected_failure_reason=args.expected_failure,
+            category=args.category,
+            severity=args.severity,
+            guard_type=args.guard_type,
+            verification=args.verification,
+            root_cause=args.root_cause,
+            fix_method=args.fix_method,
+            scope=args.scope,
+            tags=[item.strip() for item in (args.tags or "").split(",") if item.strip()],
+            frequency=args.frequency,
+            trigger_reproduction=args.trigger_reproduction,
+            run_policy=args.run_policy,
+            artifact_policy=args.artifact_policy,
+            blocker_handling=args.blocker_handling,
+            reusable_guard_path=args.reusable_guard_path,
+            test_chain_issue=args.test_chain_issue,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    result["index"] = str(store / "index" / "BADCASES.md")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def badcase_decide_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = decide_badcase_candidate(
+            store,
+            candidate_id=args.candidate_id,
+            action=args.action,
+            reason=args.reason,
+            target_case_id=args.target_case_id,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    result["index"] = str(store / "index" / "BADCASES.md")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def badcase_update_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    patch: dict[str, Any] = {}
+    if args.status:
+        patch["status"] = args.status
+    if args.harness_lifecycle:
+        patch["harness"] = {"lifecycle": args.harness_lifecycle}
+    if args.last_checked_at:
+        parsed = parse_iso(args.last_checked_at)
+        if not parsed:
+            print(json.dumps({"status": "error", "error": "--last-checked-at must be ISO-8601"}))
+            return 2
+        patch["last_checked_at"] = iso_z(parsed)
+    if args.recurrence_analysis:
+        patch["recurrence_analysis"] = clean_harness_text(
+            args.recurrence_analysis, field="recurrence_analysis", required=True
+        )
+    if args.route_change_note:
+        patch["route_change_note"] = clean_harness_text(
+            args.route_change_note, field="route_change_note", required=True
+        )
+    if not patch:
+        print(json.dumps({"status": "error", "error": "no update field supplied"}))
+        return 2
+    try:
+        result = update_badcase_case(
+            store,
+            case_id=args.case_id,
+            patch=patch,
+            note=args.note,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    result["index"] = str(store / "index" / "BADCASES.md")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def json_cli_value(value: str) -> Any:
+    if value.startswith("@"):
+        path = Path(value[1:]).expanduser().resolve()
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read JSON argument file {path}: {exc}") from exc
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Expected JSON or @path-to-json") from exc
+
+
+def feature_chain_propose_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = create_feature_chain(
+            store,
+            title=args.title,
+            entry=args.entry,
+            exit_check=args.exit_check,
+            checkpoint_title=args.checkpoint_title,
+            checkpoint_check=args.checkpoint_check,
+            case_ids=[item.strip() for item in (args.case_ids or "").split(",") if item.strip()],
+            coverage_pending_reason=args.coverage_pending_reason,
+            run_policy=args.run_policy,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_attach_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = attach_feature_chain_case(
+            store,
+            chain_id=args.chain_id,
+            checkpoint_title=args.checkpoint_title,
+            checkpoint_check=args.checkpoint_check,
+            case_id=args.case_id,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_set_checkpoint_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = set_feature_chain_checkpoint_policy(
+            store,
+            chain_id=args.chain_id,
+            checkpoint_title=args.checkpoint_title,
+            required=args.required == "required",
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_set_policy_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = set_feature_chain_run_policy(
+            store,
+            chain_id=args.chain_id,
+            run_policy=args.run_policy,
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_dry_run_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = feature_chain_dry_run(
+            store,
+            root=root,
+            chain_id=args.chain_id,
+            red_command=json_cli_value(args.red_command_json),
+            green_command=json_cli_value(args.green_command_json),
+            expected_red_reason=args.expected_red_reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["passed"] else 1
+
+
+def feature_chain_approve_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = approve_feature_chain(
+            store,
+            root=root,
+            chain_id=args.chain_id,
+            red_command=json_cli_value(args.red_command_json),
+            green_command=json_cli_value(args.green_command_json),
+            expected_red_reason=args.expected_red_reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("reason") == "approval_preflight_failed" else 0
+
+
+def feature_chain_list_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    chains = list(active_feature_chains(store).values())
+    cases = active_badcase_cases(store)
+    covered = {
+        str(case_id)
+        for chain in chains
+        for checkpoint in chain.get("checkpoints", [])
+        for case_id in checkpoint.get("case_ids", [])
+    }
+    payload = {
+        "project": str(root),
+        "chain_count": len(chains),
+        "approved_count": sum(1 for item in chains if item.get("status") == "approved"),
+        "covered_case_count": len(covered),
+        "unassigned_case_ids": sorted(set(cases) - covered),
+        "chains": chains,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_plan_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    print(json.dumps(feature_chain_plan(store, query=args.query), ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_coverage_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    print(json.dumps(feature_chain_coverage_report(store), ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_overlap_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    print(
+        json.dumps(
+            feature_chain_overlap_report(store, min_score=args.min_score),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def feature_chain_candidates_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    print(
+        json.dumps(
+            feature_chain_candidate_groups(
+                store,
+                min_cases=args.min_cases,
+                max_groups=args.max_groups,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def test_hub_run_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = test_hub_dev_complete(
+            store,
+            root=root,
+            jobs=args.jobs,
+            include_policies={item.strip() for item in args.include_policies.split(",") if item.strip()},
+            selected_target_ids={item.strip() for item in (args.target_ids or "").split(",") if item.strip()},
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result["failed"]:
+        return 1
+    if result["blocked"]:
+        return 2
+    return 0
+
+
+def snapshot_create_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = create_project_snapshot(
+            store,
+            root=root,
+            case_id=args.case_id,
+            tools=[item.strip() for item in (args.tools or "").split(",") if item.strip()],
+            skills=[item.strip() for item in (args.skills or "").split(",") if item.strip()],
+            configuration=json_cli_value(args.configuration_json) if args.configuration_json else {},
+            budgets=json_cli_value(args.budgets_json) if args.budgets_json else {},
+        )
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def adapter_propose_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = propose_model_adapter(
+            store,
+            root=root,
+            name=args.name,
+            platform=args.platform,
+            model=args.model,
+            command=json_cli_value(args.command_json),
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def adapter_approve_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = approve_model_adapter(store, root=root, adapter_id=args.adapter_id)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("reason") == "approval_preflight_failed" else 0
+
+
+def adapter_list_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    adapters = active_model_adapters(store)
+    print(json.dumps({"adapter_count": len(adapters), "adapters": list(adapters.values())}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def replay_matrix_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = run_replay_matrix(
+            store,
+            root=root,
+            case_id=args.case_id,
+            snapshot_id=args.snapshot_id,
+            adapter_ids=[item.strip() for item in args.adapter_ids.split(",") if item.strip()],
+            compensation_ids=[item.strip() for item in (args.compensation_ids or "").split(",") if item.strip()],
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["failed"] else (2 if result["blocked"] else 0)
+
+
+def judge_propose_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = propose_judge_adapter(store, root=root, name=args.name, command=json_cli_value(args.command_json))
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def judge_approve_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = approve_judge_adapter(store, root=root, judge_id=args.judge_id)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("reason") == "approval_preflight_failed" else 0
+
+
+def judge_evaluate_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = evaluate_replay_outcome(store, root=root, run_id=args.run_id, judge_id=args.judge_id)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not result.get("decided"):
+        return 2
+    return 0 if result.get("evaluation", {}).get("passed") else 1
+
+
+def attribution_override_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = append_attribution_override(store, run_id=args.run_id, attribution=args.attribution, reason=args.reason)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def compensation_propose_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = propose_compensation(
+            store,
+            replay_run_id=args.run_id,
+            compensation_type=args.type,
+            content=args.content,
+            scope=args.scope,
+            rationale=args.rationale,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def compensation_approve_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = approve_compensation(store, root=root, compensation_id=args.compensation_id, judge_id=args.judge_id)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("reason") == "approval_preflight_failed" else 0
+
+
+def compensation_transition_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = transition_compensation(
+            store,
+            compensation_id=args.compensation_id,
+            action=args.action,
+            reason=args.reason,
+            superseded_by=args.superseded_by,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def compensation_recommend_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = compensation_lifecycle_recommendation(
+            store,
+            compensation_id=args.compensation_id,
+            required_consecutive_passes=args.required_consecutive_passes,
+            distinct_model_minimum=args.distinct_model_minimum,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def task_case_propose_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        phases = json_cli_value(args.phases_json)
+        if not isinstance(phases, list):
+            raise ValueError("--phases-json must contain an array")
+        result = propose_task_case(
+            store,
+            root=root,
+            title=args.title,
+            phases=phases,
+            linked_case_ids=[item.strip() for item in args.case_ids.split(",") if item.strip()],
+            stop_condition=args.stop_condition,
+            cleanup=args.cleanup,
+            exclusions=[item.strip() for item in (args.exclusions or "").split(",") if item.strip()],
+            blocker_policy=[item.strip() for item in (args.blockers or "").split(",") if item.strip()],
+            run_policy=args.run_policy,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def task_case_approve_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = approve_task_case(
+            store,
+            root=root,
+            task_case_id=args.task_case_id,
+            red_command=json_cli_value(args.red_command_json),
+            green_command=json_cli_value(args.green_command_json),
+            expected_red_reason=args.expected_red_reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result.get("reason") == "approval_preflight_failed" else 0
+
+
+def policy_set_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        policy = json_cli_value(args.policy_json)
+        result = set_harness_policy(
+            store,
+            target_type=args.target_type,
+            target_id=args.target_id,
+            policy=policy,
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def feature_chain_transition_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = transition_feature_chain(store, chain_id=args.chain_id, action=args.action, reason=args.reason)
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def subagent_bind_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = bind_subagent(
+            store,
+            root=root,
+            platform=args.platform,
+            session_id=args.session_id,
+            agent_id=args.agent_id,
+            child_root=args.child_root,
+            parent_session_id=args.parent_session_id,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def subagent_complete_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = record_subagent_completion(
+            store,
+            binding_id=args.binding_id,
+            evidence_ids=[item.strip() for item in args.evidence_ids.split(",") if item.strip()],
+            summary=args.summary,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def snapshot_materialization_approve_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = approve_snapshot_materialization(
+            store,
+            root=root,
+            snapshot_id=args.snapshot_id,
+            destination_parent=args.destination_parent,
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def snapshot_materialize_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = materialize_project_snapshot(store, root=root, snapshot_id=args.snapshot_id)
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def workflow_transition_command(args: argparse.Namespace) -> int:
+    root = find_project_root(Path(args.project or os.getcwd()), Path(args.project) if args.project else None)
+    store, _ = init_store(root)
+    try:
+        result = transition_workflow_entity(
+            store,
+            entity_type=args.entity_type,
+            entity_id=args.entity_id,
+            action=args.action,
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    rebuild_index_for_store(store)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -6260,6 +11742,449 @@ def parser() -> argparse.ArgumentParser:
 
     projects = sub.add_parser("list-projects", help="list known project prompt stores")
     projects.set_defaults(func=list_projects)
+
+    badcase_detect = sub.add_parser(
+        "badcase-detect",
+        help="create review-only badcase candidates from explicit user corrections",
+    )
+    badcase_detect.add_argument("--project", type=Path)
+    badcase_detect.add_argument("--session-id")
+    badcase_detect.set_defaults(func=badcase_detect_command)
+
+    badcase_list = sub.add_parser("badcase-list", help="list badcase candidates and confirmed cases")
+    badcase_list.add_argument("--project", type=Path)
+    badcase_list.add_argument(
+        "--state",
+        choices=("all", "pending", "confirmed", "dismissed", "merged"),
+        default="all",
+    )
+    badcase_list.set_defaults(func=badcase_list_command)
+
+    badcase_confirm = sub.add_parser(
+        "badcase-confirm",
+        help="confirm a candidate and create a case with a red/green failure contract",
+    )
+    badcase_confirm.add_argument("--project", type=Path)
+    badcase_confirm.add_argument("--candidate-id", required=True)
+    badcase_confirm.add_argument("--title")
+    badcase_confirm.add_argument("--phenomenon")
+    badcase_confirm.add_argument("--red", required=True)
+    badcase_confirm.add_argument("--green", required=True)
+    badcase_confirm.add_argument("--expected-failure", required=True)
+    badcase_confirm.add_argument("--category", default="agent_behavior")
+    badcase_confirm.add_argument(
+        "--severity",
+        choices=("low", "medium", "high", "critical"),
+        default="medium",
+    )
+    badcase_confirm.add_argument("--guard-type", default="manual")
+    badcase_confirm.add_argument("--verification")
+    badcase_confirm.add_argument("--root-cause")
+    badcase_confirm.add_argument("--fix-method")
+    badcase_confirm.add_argument("--scope")
+    badcase_confirm.add_argument("--tags", help="comma-separated case tags")
+    badcase_confirm.add_argument(
+        "--frequency",
+        default="first-seen",
+        help="first-seen, repeated-N, or high-frequency",
+    )
+    badcase_confirm.add_argument("--trigger-reproduction")
+    badcase_confirm.add_argument(
+        "--run-policy",
+        choices=(
+            "every-dev-completion",
+            "relevant-only",
+            "manual",
+            "release-only",
+            "goal-final",
+            "disabled-with-reason",
+            "user-defined",
+        ),
+        default="manual",
+    )
+    badcase_confirm.add_argument(
+        "--artifact-policy",
+        choices=(
+            "cleanup-on-pass-preserve-on-fail",
+            "cleanup-on-pass",
+            "preserve-on-fail",
+            "manual-preserve",
+            "none",
+        ),
+        default="none",
+    )
+    badcase_confirm.add_argument(
+        "--blocker-handling",
+        choices=(
+            "credentials",
+            "external-service",
+            "permissions",
+            "resource-limits",
+            "network",
+            "destructive-confirmation",
+            "user-judgment",
+            "none",
+        ),
+        default="none",
+    )
+    badcase_confirm.add_argument("--reusable-guard-path")
+    badcase_confirm.add_argument(
+        "--test-chain-issue",
+        choices=(
+            "false-positive",
+            "false-negative",
+            "wrong-granularity",
+            "missing-phase",
+            "wrong-assertion",
+            "unrealistic-setup",
+            "missing-cleanup",
+            "unclear-localization",
+            "none",
+        ),
+        default="none",
+    )
+    badcase_confirm.set_defaults(func=badcase_confirm_command)
+
+    badcase_decide = sub.add_parser(
+        "badcase-decide",
+        help="dismiss a candidate or merge it into an existing case",
+    )
+    badcase_decide.add_argument("--project", type=Path)
+    badcase_decide.add_argument("--candidate-id", required=True)
+    badcase_decide.add_argument("--action", choices=("dismissed", "merged"), required=True)
+    badcase_decide.add_argument("--reason", required=True)
+    badcase_decide.add_argument("--target-case-id")
+    badcase_decide.set_defaults(func=badcase_decide_command)
+
+    badcase_update = sub.add_parser(
+        "badcase-update",
+        help="append a confirmed case status or harness lifecycle update",
+    )
+    badcase_update.add_argument("--project", type=Path)
+    badcase_update.add_argument("--case-id", required=True)
+    badcase_update.add_argument(
+        "--status",
+        choices=("open", "resolved", "recurred", "deferred", "superseded-by-route-change"),
+    )
+    badcase_update.add_argument(
+        "--harness-lifecycle",
+        choices=("active", "stable", "probation", "retired"),
+    )
+    badcase_update.add_argument("--last-checked-at")
+    badcase_update.add_argument("--recurrence-analysis")
+    badcase_update.add_argument("--route-change-note")
+    badcase_update.add_argument("--note", required=True)
+    badcase_update.set_defaults(func=badcase_update_command)
+
+    chain_propose = sub.add_parser(
+        "feature-chain-propose",
+        help="record a non-executable feature-chain proposal with badcase coverage",
+    )
+    chain_propose.add_argument("--project", type=Path)
+    chain_propose.add_argument("--title", required=True)
+    chain_propose.add_argument("--entry", required=True)
+    chain_propose.add_argument("--exit-check", required=True)
+    chain_propose.add_argument("--checkpoint-title", required=True)
+    chain_propose.add_argument("--checkpoint-check", required=True)
+    chain_propose.add_argument("--case-ids")
+    chain_propose.add_argument("--coverage-pending-reason")
+    chain_propose.add_argument(
+        "--run-policy",
+        choices=("every-dev-completion", "relevant-only", "manual", "release-only", "goal-final"),
+        default="every-dev-completion",
+    )
+    chain_propose.set_defaults(func=feature_chain_propose_command)
+
+    chain_attach = sub.add_parser(
+        "feature-chain-attach",
+        help="attach a confirmed badcase to a feature-chain checkpoint",
+    )
+    chain_attach.add_argument("--project", type=Path)
+    chain_attach.add_argument("--chain-id", required=True)
+    chain_attach.add_argument("--checkpoint-title", required=True)
+    chain_attach.add_argument("--checkpoint-check", required=True)
+    chain_attach.add_argument("--case-id", required=True)
+    chain_attach.set_defaults(func=feature_chain_attach_command)
+
+    chain_checkpoint = sub.add_parser(
+        "feature-chain-set-checkpoint",
+        help="set a checkpoint required/optional policy with an audit reason",
+    )
+    chain_checkpoint.add_argument("--project", type=Path)
+    chain_checkpoint.add_argument("--chain-id", required=True)
+    chain_checkpoint.add_argument("--checkpoint-title", required=True)
+    chain_checkpoint.add_argument("--required", choices=("required", "optional"), required=True)
+    chain_checkpoint.add_argument("--reason", required=True)
+    chain_checkpoint.set_defaults(func=feature_chain_set_checkpoint_command)
+
+    chain_policy = sub.add_parser(
+        "feature-chain-set-policy",
+        help="change a feature-chain scheduling policy with an audit reason",
+    )
+    chain_policy.add_argument("--project", type=Path)
+    chain_policy.add_argument("--chain-id", required=True)
+    chain_policy.add_argument(
+        "--run-policy",
+        choices=("every-dev-completion", "relevant-only", "manual", "release-only", "goal-final"),
+        required=True,
+    )
+    chain_policy.add_argument("--reason", required=True)
+    chain_policy.set_defaults(func=feature_chain_set_policy_command)
+
+    for name, help_text, command in (
+        (
+            "feature-chain-dry-run",
+            "run Red and Green preflight without approving the feature chain",
+            feature_chain_dry_run_command,
+        ),
+        (
+            "feature-chain-approve",
+            "approve a proposed feature chain only after Red and Green preflight",
+            feature_chain_approve_command,
+        ),
+    ):
+        chain_gate = sub.add_parser(name, help=help_text)
+        chain_gate.add_argument("--project", type=Path)
+        chain_gate.add_argument("--chain-id", required=True)
+        chain_gate.add_argument(
+            "--red-command-json",
+            required=True,
+            help="JSON argv/object or @path; must reproduce the old symptom",
+        )
+        chain_gate.add_argument(
+            "--green-command-json",
+            required=True,
+            help="JSON argv/object or @path; must pass all required checkpoints",
+        )
+        chain_gate.add_argument("--expected-red-reason", required=True)
+        chain_gate.set_defaults(func=command)
+
+    chain_list = sub.add_parser(
+        "feature-chain-list",
+        help="list feature-chain states and badcase coverage",
+    )
+    chain_list.add_argument("--project", type=Path)
+    chain_list.set_defaults(func=feature_chain_list_command)
+
+    chain_plan = sub.add_parser(
+        "feature-chain-plan",
+        help="read-only plan to reuse an existing chain or propose a new workflow",
+    )
+    chain_plan.add_argument("--project", type=Path)
+    chain_plan.add_argument("--query", required=True)
+    chain_plan.set_defaults(func=feature_chain_plan_command)
+
+    chain_coverage = sub.add_parser(
+        "feature-chain-coverage",
+        help="audit confirmed badcase coverage without mutating the registry",
+    )
+    chain_coverage.add_argument("--project", type=Path)
+    chain_coverage.set_defaults(func=feature_chain_coverage_command)
+
+    chain_overlap = sub.add_parser(
+        "feature-chain-overlap",
+        help="find likely duplicate workflow chains before approval",
+    )
+    chain_overlap.add_argument("--project", type=Path)
+    chain_overlap.add_argument("--min-score", type=float, default=0.25)
+    chain_overlap.set_defaults(func=feature_chain_overlap_command)
+
+    chain_candidates = sub.add_parser(
+        "feature-chain-candidates",
+        help="group unassigned badcases into read-only workflow candidates",
+    )
+    chain_candidates.add_argument("--project", type=Path)
+    chain_candidates.add_argument("--min-cases", type=int, default=2)
+    chain_candidates.add_argument("--max-groups", type=int, default=6)
+    chain_candidates.set_defaults(func=feature_chain_candidates_command)
+
+    hub_run = sub.add_parser(
+        "dev-complete",
+        help="run approved every-dev-completion feature chains through Test Hub",
+    )
+    hub_run.add_argument("--project", type=Path)
+    hub_run.add_argument("--jobs", type=int, default=1)
+    hub_run.add_argument(
+        "--include-policies",
+        default="every-dev-completion",
+        help="comma-separated scheduled policies",
+    )
+    hub_run.add_argument(
+        "--target-ids",
+        help="comma-separated approved relevant/manual targets to include explicitly",
+    )
+    hub_run.set_defaults(func=test_hub_run_command)
+
+    snapshot_create = sub.add_parser(
+        "snapshot-create",
+        help="create a sanitized immutable manifest for one confirmed badcase",
+    )
+    snapshot_create.add_argument("--project", type=Path)
+    snapshot_create.add_argument("--case-id", required=True)
+    snapshot_create.add_argument("--tools", help="comma-separated tool identifiers")
+    snapshot_create.add_argument("--skills", help="comma-separated skill identifiers")
+    snapshot_create.add_argument("--configuration-json", help="JSON object or @path")
+    snapshot_create.add_argument("--budgets-json", help="JSON object or @path")
+    snapshot_create.set_defaults(func=snapshot_create_command)
+
+    adapter_propose = sub.add_parser(
+        "adapter-propose",
+        help="propose a model adapter without executing or approving it",
+    )
+    adapter_propose.add_argument("--project", type=Path)
+    adapter_propose.add_argument("--name", required=True)
+    adapter_propose.add_argument("--platform", required=True)
+    adapter_propose.add_argument("--model", required=True)
+    adapter_propose.add_argument("--command-json", required=True, help="JSON argv/object or @path")
+    adapter_propose.set_defaults(func=adapter_propose_command)
+
+    adapter_approve = sub.add_parser(
+        "adapter-approve",
+        help="approve a proposed model adapter only after protocol self-test",
+    )
+    adapter_approve.add_argument("--project", type=Path)
+    adapter_approve.add_argument("--adapter-id", required=True)
+    adapter_approve.set_defaults(func=adapter_approve_command)
+
+    adapter_list = sub.add_parser("adapter-list", help="list model adapter states")
+    adapter_list.add_argument("--project", type=Path)
+    adapter_list.set_defaults(func=adapter_list_command)
+
+    replay_matrix = sub.add_parser(
+        "replay-matrix",
+        help="run approved adapters against the same case and immutable snapshot",
+    )
+    replay_matrix.add_argument("--project", type=Path)
+    replay_matrix.add_argument("--case-id", required=True)
+    replay_matrix.add_argument("--snapshot-id", required=True)
+    replay_matrix.add_argument("--adapter-ids", required=True, help="comma-separated approved adapters")
+    replay_matrix.add_argument("--compensation-ids", help="comma-separated approved compensations")
+    replay_matrix.set_defaults(func=replay_matrix_command)
+
+    judge_propose = sub.add_parser("judge-propose", help="propose a narrow outcome judge adapter")
+    judge_propose.add_argument("--project", type=Path)
+    judge_propose.add_argument("--name", required=True)
+    judge_propose.add_argument("--command-json", required=True)
+    judge_propose.set_defaults(func=judge_propose_command)
+
+    judge_approve = sub.add_parser("judge-approve", help="approve a judge after protocol self-test")
+    judge_approve.add_argument("--project", type=Path)
+    judge_approve.add_argument("--judge-id", required=True)
+    judge_approve.set_defaults(func=judge_approve_command)
+
+    judge_evaluate = sub.add_parser("judge-evaluate", help="evaluate a replay with assertions or an approved judge")
+    judge_evaluate.add_argument("--project", type=Path)
+    judge_evaluate.add_argument("--run-id", required=True)
+    judge_evaluate.add_argument("--judge-id")
+    judge_evaluate.set_defaults(func=judge_evaluate_command)
+
+    attribution = sub.add_parser("attribution-override", help="append a manual run attribution without rewriting facts")
+    attribution.add_argument("--project", type=Path)
+    attribution.add_argument("--run-id", required=True)
+    attribution.add_argument("--attribution", choices=sorted(ATTRIBUTION_CLASSES), required=True)
+    attribution.add_argument("--reason", required=True)
+    attribution.set_defaults(func=attribution_override_command)
+
+    compensation_propose = sub.add_parser("compensation-propose", help="propose a minimal compensation from a judged failure")
+    compensation_propose.add_argument("--project", type=Path)
+    compensation_propose.add_argument("--run-id", required=True)
+    compensation_propose.add_argument("--type", choices=sorted(COMPENSATION_TYPES), required=True)
+    compensation_propose.add_argument("--content", required=True)
+    compensation_propose.add_argument("--scope", required=True)
+    compensation_propose.add_argument("--rationale", required=True)
+    compensation_propose.set_defaults(func=compensation_propose_command)
+
+    compensation_approve = sub.add_parser("compensation-approve", help="approve only after baseline-fail and compensated-pass replay")
+    compensation_approve.add_argument("--project", type=Path)
+    compensation_approve.add_argument("--compensation-id", required=True)
+    compensation_approve.add_argument("--judge-id")
+    compensation_approve.set_defaults(func=compensation_approve_command)
+
+    compensation_transition = sub.add_parser("compensation-transition", help="activate, disable, supersede, enter probation, reactivate, or retire")
+    compensation_transition.add_argument("--project", type=Path)
+    compensation_transition.add_argument("--compensation-id", required=True)
+    compensation_transition.add_argument("--action", choices=("activated", "disabled", "superseded", "probation", "reactivated", "retired"), required=True)
+    compensation_transition.add_argument("--reason", required=True)
+    compensation_transition.add_argument("--superseded-by")
+    compensation_transition.set_defaults(func=compensation_transition_command)
+
+    compensation_recommend = sub.add_parser("compensation-recommend", help="read-only probation and retirement recommendation")
+    compensation_recommend.add_argument("--project", type=Path)
+    compensation_recommend.add_argument("--compensation-id", required=True)
+    compensation_recommend.add_argument("--required-consecutive-passes", type=int, default=3)
+    compensation_recommend.add_argument("--distinct-model-minimum", type=int, default=2)
+    compensation_recommend.set_defaults(func=compensation_recommend_command)
+
+    task_propose = sub.add_parser("task-case-propose", help="propose an ordered multi-phase task case")
+    task_propose.add_argument("--project", type=Path)
+    task_propose.add_argument("--title", required=True)
+    task_propose.add_argument("--phases-json", required=True, help="JSON phase array or @path")
+    task_propose.add_argument("--case-ids", required=True)
+    task_propose.add_argument("--stop-condition", required=True)
+    task_propose.add_argument("--cleanup", required=True)
+    task_propose.add_argument("--exclusions")
+    task_propose.add_argument("--blockers")
+    task_propose.add_argument("--run-policy", choices=("every-dev-completion", "relevant-only", "manual", "release-only", "goal-final"), default="every-dev-completion")
+    task_propose.set_defaults(func=task_case_propose_command)
+
+    task_approve = sub.add_parser("task-case-approve", help="approve a task case after Red/Green phase localization")
+    task_approve.add_argument("--project", type=Path)
+    task_approve.add_argument("--task-case-id", required=True)
+    task_approve.add_argument("--red-command-json", required=True)
+    task_approve.add_argument("--green-command-json", required=True)
+    task_approve.add_argument("--expected-red-reason", required=True)
+    task_approve.set_defaults(func=task_case_approve_command)
+
+    policy_set = sub.add_parser("policy-set", help="set bounded case/test budgets with an audit reason")
+    policy_set.add_argument("--project", type=Path)
+    policy_set.add_argument("--target-type", choices=("project", "badcase", "feature_chain", "task_case", "adapter", "snapshot"), required=True)
+    policy_set.add_argument("--target-id", required=True)
+    policy_set.add_argument("--policy-json", required=True)
+    policy_set.add_argument("--reason", required=True)
+    policy_set.set_defaults(func=policy_set_command)
+
+    chain_transition = sub.add_parser("feature-chain-transition", help="disable, reactivate, or retire an approved feature chain")
+    chain_transition.add_argument("--project", type=Path)
+    chain_transition.add_argument("--chain-id", required=True)
+    chain_transition.add_argument("--action", choices=("disabled", "reactivated", "retired"), required=True)
+    chain_transition.add_argument("--reason", required=True)
+    chain_transition.set_defaults(func=feature_chain_transition_command)
+
+    subagent_bind = sub.add_parser("subagent-bind", help="bind a child agent to the exact local project root")
+    subagent_bind.add_argument("--project", type=Path)
+    subagent_bind.add_argument("--platform", required=True)
+    subagent_bind.add_argument("--session-id", required=True)
+    subagent_bind.add_argument("--agent-id", required=True)
+    subagent_bind.add_argument("--child-root", required=True)
+    subagent_bind.add_argument("--parent-session-id")
+    subagent_bind.set_defaults(func=subagent_bind_command)
+
+    subagent_complete = sub.add_parser("subagent-complete", help="record idempotent child completion evidence")
+    subagent_complete.add_argument("--project", type=Path)
+    subagent_complete.add_argument("--binding-id", required=True)
+    subagent_complete.add_argument("--evidence-ids", required=True)
+    subagent_complete.add_argument("--summary", required=True)
+    subagent_complete.set_defaults(func=subagent_complete_command)
+
+    materialization_approve = sub.add_parser("snapshot-materialization-approve", help="approve one external snapshot destination without copying files")
+    materialization_approve.add_argument("--project", type=Path)
+    materialization_approve.add_argument("--snapshot-id", required=True)
+    materialization_approve.add_argument("--destination-parent", type=Path, required=True)
+    materialization_approve.add_argument("--reason", required=True)
+    materialization_approve.set_defaults(func=snapshot_materialization_approve_command)
+
+    materialize = sub.add_parser("snapshot-materialize", help="copy one approved snapshot into its external destination")
+    materialize.add_argument("--project", type=Path)
+    materialize.add_argument("--snapshot-id", required=True)
+    materialize.set_defaults(func=snapshot_materialize_command)
+
+    workflow_transition = sub.add_parser("workflow-transition", help="disable, reactivate, or retire a task case, adapter, or judge")
+    workflow_transition.add_argument("--project", type=Path)
+    workflow_transition.add_argument("--entity-type", choices=("task_case", "adapter", "judge"), required=True)
+    workflow_transition.add_argument("--entity-id", required=True)
+    workflow_transition.add_argument("--action", choices=("disabled", "reactivated", "retired"), required=True)
+    workflow_transition.add_argument("--reason", required=True)
+    workflow_transition.set_defaults(func=workflow_transition_command)
     return root
 
 

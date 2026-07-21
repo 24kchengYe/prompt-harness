@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-MARKER = "prompt_harness.py"
+MARKERS = ("prompt_harness.py", "run_capture.py", "run_stop_capture.py")
 
 
 def timestamp() -> str:
@@ -58,17 +58,23 @@ def is_ours(entry: Any) -> bool:
     if not isinstance(entry, dict):
         return False
     for hook in entry.get("hooks", []):
-        if isinstance(hook, dict) and MARKER in str(hook.get("command", "")):
+        if isinstance(hook, dict) and any(
+            marker in str(hook.get("command", "")) for marker in MARKERS
+        ):
             return True
     return False
 
 
 def command_for(script: Path, platform: str) -> str:
+    if platform == "codex":
+        launcher = script.parent.parent / "hooks" / "run_capture.py"
+        return f'"{sys.executable}" "{launcher}"'
     return f'"{sys.executable}" "{script}" capture-hook --platform {platform}'
 
 
 def stop_recovery_command(script: Path) -> str:
-    return f'"{sys.executable}" "{script}" capture-stop-recovery'
+    launcher = script.parent.parent / "hooks" / "run_stop_capture.py"
+    return f'"{sys.executable}" "{launcher}"'
 
 
 def update_file(path: Path, script: Path, platform: str, remove: bool, dry_run: bool) -> dict[str, Any]:
@@ -127,7 +133,10 @@ def update_stop_recovery_file(
                 for hook in entry.get("hooks", [])
                 if isinstance(hook, dict)
             ]
-        if not any("capture-stop-recovery" in command for command in commands):
+        if not any(
+            "capture-stop-recovery" in command or "run_stop_capture.py" in command
+            for command in commands
+        ):
             kept.append(entry)
     if not remove:
         kept.append(

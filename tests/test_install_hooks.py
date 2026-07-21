@@ -67,7 +67,7 @@ class HookInstallerTests(unittest.TestCase):
         self.assertEqual(len(current["hooks"]["Stop"]), 2)
         commands = [entry["hooks"][0]["command"] for entry in current["hooks"]["Stop"]]
         self.assertIn("python existing_stop.py", commands)
-        self.assertTrue(any("capture-stop-recovery" in command for command in commands))
+        self.assertTrue(any("run_stop_capture.py" in command for command in commands))
         second = installer.update_stop_recovery_file(
             hooks_path,
             SCRIPT,

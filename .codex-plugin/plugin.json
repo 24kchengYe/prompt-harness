@@ -1,7 +1,7 @@
 {
   "name": "prompt-harness",
-  "version": "0.10.0",
-  "description": "Automatically reconcile a private per-project ledger of human prompts, user images, and complete structured agent traces from Claude Code and Codex.",
+  "version": "0.12.1",
+  "description": "Capture private agent evidence and run review-gated adaptive badcase regression across models.",
   "author": {
     "name": "24kchengYe",
     "url": "https://github.com/24kchengYe"
@@ -14,13 +14,16 @@
     "harness",
     "claude-code",
     "codex",
-    "evaluation"
+    "evaluation",
+    "badcase",
+    "test-hub",
+    "model-replay"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Prompt Harness",
-    "shortDescription": "Keep private prompt and agent-trace facts per project.",
-    "longDescription": "Prompt Harness captures human prompts and user images in real time, reconciles assistant text, reasoning, tool traffic, injected instructions, and subagent events from Claude Code and Codex transcripts, isolates history by exact session project root, and maintains private append-only facts with rebuildable Markdown views.",
+    "shortDescription": "Private traces, Test Hub, replay, and adaptive badcases.",
+    "longDescription": "Prompt Harness captures human prompts and complete Claude Code/Codex traces, turns explicit corrections into human-reviewed badcases, runs Red/Green feature and task workflows in Test Hub, pins safe project snapshots, compares approved model adapters, judges outcomes, and manages minimal compensations through probation and retirement.",
     "developerName": "24kchengYe",
     "category": "Productivity",
     "capabilities": [
@@ -32,6 +35,14 @@
       "explicit session-to-project binding and append-only migration",
       "historical backfill",
       "structured agent trace archive",
+      "review-only badcase candidate detection",
+      "append-only badcase decisions and lifecycle",
+      "Red/Green failure contracts",
+      "feature-chain and multi-phase task-case Test Hub",
+      "sanitized immutable project snapshots",
+      "approved cross-model replay adapters and outcome judges",
+      "adaptive compensation probation and retirement",
+      "bounded execution policies and manual attribution",
       "lightweight project indexes and per-session trajectory views",
       "user image archive",
       "offline prompt timeline",
@@ -41,7 +52,7 @@
     "defaultPrompt": [
       "Initialize Prompt Harness for this project and explain what will be stored.",
       "Backfill this project's Claude Code and Codex user prompts, then validate the ledger.",
-      "Search this project's human prompt history for a topic."
+      "Review this project's pending badcase candidates without changing prompts or tests."
     ]
   }
 }

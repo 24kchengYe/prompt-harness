@@ -52,7 +52,7 @@ Each line in `events/YYYY/MM/prompts-YYYY-MM-DD.jsonl` is one self-contained JSO
 - `schema_version`, `record_type`, `event_id`, `occurred_at`, project identity, prompt text, and prompt hash are immutable facts.
 - Later schemas may add fields. A breaking semantic change requires a new major version and a migration that retains the original line or provenance.
 - Generated indexes are never canonical and may be overwritten.
-- A future badcase record references `event_id`; it does not copy or mutate the source prompt.
+- A badcase candidate/case references `event_id`; it does not copy or mutate the source prompt.
 
 ## Agent trace event
 
@@ -140,7 +140,7 @@ When a schema upgrade has already produced two rows for one native message, Prom
 }
 ```
 
-Raw audit tools may read every event line. Prompt indexes, search, session summaries, and future badcase selection use active events after applying supersession relations.
+Raw audit tools may read every event line. Prompt indexes, search, session summaries, and badcase candidate selection use active events after applying supersession relations.
 
 ## Append-only exclusion
 
@@ -212,3 +212,23 @@ Project routing is not part of the prompt event envelope. Explicit routing decis
 ```
 
 The latest valid record for `(platform, session_id)` is active. Rebinding appends; it does not rewrite prior decisions. This ledger contains routing metadata only, never prompt bodies or image bytes.
+
+## Badcase side ledgers
+
+Badcase intake and adaptive regression do not change prompt or trace envelopes. They use project-local append-only side ledgers:
+
+- `badcases/candidates.jsonl`: deterministic `badcase_candidate` records. Candidates reference prompt and trace IDs and must set `detector.asserts_failure` to `false`.
+- `badcases/decisions.jsonl`: `badcase_decision` records with action `confirmed`, `dismissed`, or `merged`.
+- `badcases/case-events.jsonl`: `badcase_case_event` records that create or update one `BC-YYYYMMDD-XXXXXXXX` case.
+- `badcases/feature-chain-events.jsonl`: checkpoint-based workflow guard proposals, approval, policy, and state transitions.
+- `badcases/task-case-events.jsonl`: ordered multi-phase workflow proposals, approval commands, and state transitions.
+- `badcases/snapshot-events.jsonl`: sanitized deterministic project manifests (`snp_...`).
+- `badcases/adapter-events.jsonl`: proposed/approved model protocol adapters (`MA-...`).
+- `badcases/judge-events.jsonl`: judge registry events plus immutable replay outcome decisions.
+- `badcases/run-events.jsonl`: started/completed Red, Green, Test Hub, replay, and judge run facts (`hrn_...`).
+- `badcases/attribution-events.jsonl`: manual attribution overrides that never rewrite the original run.
+- `badcases/compensation-events.jsonl`: minimal compensation proposal, approval, activation, probation, recurrence, supersession, and retirement (`CP-...`).
+- `badcases/policy-events.jsonl`: bounded execution and snapshot-materialization policies.
+- `badcases/subagent-events.jsonl`: exact-root child bindings and idempotent completion evidence.
+
+A confirmed case carries separate issue, guard, compensation, and Harness lifecycle states. Its full v2 contract includes scope, tags, frequency, reproduction, verification, run/artifact/blocker policies, Red, Green, expected failure, reusable guard, feature/task coverage, recurrence, and route-change notes. Schemas for every canonical ledger live in `schemas/`; executable protocol details live in [adaptive-harness.md](adaptive-harness.md).
