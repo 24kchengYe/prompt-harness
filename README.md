@@ -9,7 +9,7 @@
 
 Prompt Harness 同时提供实时 `UserPromptSubmit` Hook、旧任务轮末恢复和自动历史对账。第一次从项目根目录开始对话时，它会自动创建 `.prompt-harness`，先保存当前输入，再在独立后台进程中检查并补齐启动目录恰好等于该项目根目录的 Claude Code 与 Codex 会话。父项目不会自动吸收从子目录启动的会话；确需跨根归属时可显式绑定。它分别保留用户真正输入的指令、用户发送的图片，以及模型可见输出、reasoning/thinking、工具调用与结果、系统/开发者注入和 subagent 内容；导入镜像仍会去重。
 
-这个事实层现在也驱动完整的 review-gated badcase harness：系统从明确的用户纠错中生成待审核 candidate，用户确认后才形成正式 case；Feature Chain 与 Task Case 必须通过 Red/Green 预检才能批准；安全快照、跨模型 replay、窄 Judge、归因、最小补偿、probation 与 retirement 全部保留追加式审计记录。自动检测仍不会认定模型失败、修改 Prompt、注册测试或注入补偿。
+这个事实层现在也驱动完整的 review-gated badcase harness：显式开启 Badcase 自动化后，系统从明确的用户纠错中生成待审核 candidate，用户确认后才形成正式 case；Feature Chain 与 Task Case 必须通过 Red/Green 预检才能批准；安全快照、跨模型 replay、窄 Judge、归因、最小补偿、probation 与 retirement 全部保留追加式审计记录。Badcase 自动化默认关闭；手动命令始终可用，自动检测也不会认定模型失败、修改 Prompt、注册测试或注入补偿。
 
 ## 它解决什么问题
 
@@ -40,7 +40,7 @@ Prompt Harness 将这些内容整理为：
 | 会话项目绑定 | 多根工作区、旧任务或错误 `cwd` 可显式绑定到一个项目；切换和迁移保持追加式审计 |
 | 历史回填 | 扫描本地 Claude Code 与 Codex JSONL，恢复当前项目的历史人类输入 |
 | Agent 轨迹归档 | 从本地 transcript 提取 assistant 文本、reasoning/thinking、工具调用与结果、系统/开发者注入和 subagent 内容，按统一事件格式生成 `MODELOUT.md` |
-| Badcase 候选 | 自动同步后以确定性规则识别明确用户纠错，只生成待审核 candidate，不自动判定失败 |
+| Badcase 候选 | 默认不自动开启；显式启用后在同步完成时以确定性规则识别明确用户纠错，只生成待审核 candidate，不自动判定失败 |
 | Badcase 生命周期 | 支持确认、驳回、合并及 `open/resolved/recurred/deferred` 状态，并跟踪 `active/stable/probation/retired` Harness 生命周期 |
 | 失败契约 | 正式 case 必须定义 Red、Green 和预期失败原因，证据引用稳定的 prompt/trace ID |
 | 跨平台标记 | 每条记录明确区分 `claude` 与 `codex` |
@@ -553,7 +553,17 @@ python scripts/prompt_harness.py rebuild-index --project "<project-root>"
 
 ## Badcase 候选与审核
 
-自动同步会运行高精度、无模型调用的用户纠错检测器。也可以手动重跑；相同来源 Prompt 的 candidate 会按稳定 ID 去重：
+Badcase 自动化默认关闭。项目 `.prompt-harness/config.json` 中的总开关同时控制自动 candidate 检测与 Stop/Goal 完成测试：
+
+```json
+{
+  "badcases": {
+    "automation_enabled": false
+  }
+}
+```
+
+设为 `true` 后，自动同步会运行高精度、无模型调用的用户纠错检测器，并在配置的 Stop/Goal 触发点运行已批准的完成测试。设为 `false` 不影响任何手动 Badcase、Feature Chain、Task Case 或 Test Hub 命令。手动检测如下；相同来源 Prompt 的 candidate 会按稳定 ID 去重：
 
 ```powershell
 python scripts/prompt_harness.py badcase-detect --project "<project>"
@@ -612,7 +622,7 @@ python scripts/prompt_harness.py compensation-recommend --project "<project>" --
 
 - 提示词与完整 Agent trace 的捕获/回填、清洗、去重和 Markdown 索引；
 - 首次对话自动初始化并发现全项目历史，后续每次输入执行游标式增量对账；
-- 从明确用户纠错生成 review-only badcase candidate；
+- 可选地从明确用户纠错自动生成 review-only badcase candidate（默认关闭，也可手动运行）；
 - 以 append-only 决策确认、驳回或合并 candidate，并固化 Red/Green/预期失败原因；
 - 用 Feature Chain 和多阶段 Task Case 覆盖 case，并通过 Red/Green 门禁批准；
 - 在 Test Hub 中并行运行独立检查，失败保留证据、成功清理临时产物；

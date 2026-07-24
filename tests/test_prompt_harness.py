@@ -2544,6 +2544,10 @@ Recent Codex tasks in this project:
         self.assertEqual(duplicate_approval["reason"], "duplicate_feature_chain")
         self.assertEqual(ph.active_feature_chains(store)[duplicate_chain_id]["status"], "proposed")
 
+        config = ph.read_json_object(store / "config.json")
+        self.assertFalse(config["badcases"]["automation_enabled"])
+        config["badcases"]["automation_enabled"] = True
+        ph.write_json(store / "config.json", config)
         passed_sync = ph.auto_sync_project(
             project,
             source_platform="codex",
@@ -3496,9 +3500,29 @@ Recent Codex tasks in this project:
             codex_home=base / ".codex",
         )
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["badcase_candidates_added"], 1)
+        self.assertFalse(result["badcase_automation_enabled"])
+        self.assertEqual(result["badcase_candidates_added"], 0)
         self.assertTrue(result["index_rebuilt"])
         store = project / ".prompt-harness"
+        self.assertEqual(list(ph.iter_badcase_candidates(store)), [])
+
+        config = ph.read_json_object(store / "config.json")
+        self.assertFalse(config["badcases"]["automation_enabled"])
+        config["badcases"]["automation_enabled"] = True
+        ph.write_json(store / "config.json", config)
+        enabled = ph.auto_sync_project(
+            project,
+            source_platform="claude",
+            session_id="badcase-session",
+            trigger="test",
+            source_path=transcript,
+            force=True,
+            claude_home=claude_home,
+            codex_home=base / ".codex",
+        )
+        self.assertEqual(enabled["status"], "completed")
+        self.assertTrue(enabled["badcase_automation_enabled"])
+        self.assertEqual(enabled["badcase_candidates_added"], 1)
         candidate = list(ph.iter_badcase_candidates(store))[0]
         self.assertEqual(candidate["session"]["models"], ["claude-test"])
         self.assertTrue((store / "index" / "BADCASES.md").is_file())

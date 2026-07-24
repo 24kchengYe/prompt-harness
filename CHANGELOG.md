@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Default adaptive Badcase automation to off through one `badcases.automation_enabled` gate while keeping manual detection, lifecycle, and Test Hub commands available.
+- Gate both automatic correction-candidate detection and approved Stop/Goal completion tests behind the same explicit per-project opt-in.
+
 ## 0.12.1 - 2026-07-21
 
 - Emit schema-valid neutral JSON from Codex Prompt Harness hook launchers while keeping capture diagnostics out of hook stdout.

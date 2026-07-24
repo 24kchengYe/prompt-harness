@@ -780,6 +780,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
             },
             "badcases": {
                 "schema_version": "1.0.0",
+                "automation_enabled": False,
                 "automatic_detection": "candidate_only",
                 "detector": "explicit-user-correction-v1",
                 "auto_register_tests": False,
@@ -813,6 +814,7 @@ def init_store(root: Path) -> tuple[Path, dict[str, Any]]:
         badcases = config.setdefault("badcases", {})
         badcase_defaults = {
             "schema_version": "1.0.0",
+            "automation_enabled": False,
             "automatic_detection": "candidate_only",
             "detector": "explicit-user-correction-v1",
             "auto_register_tests": False,
@@ -8448,8 +8450,14 @@ def auto_sync_project(
                 badcase_config = (
                     config.get("badcases") if isinstance(config.get("badcases"), dict) else {}
                 )
+                badcase_automation_enabled = bool(
+                    badcase_config.get("automation_enabled", False)
+                )
                 detection_result = {"added": 0, "skipped": 0, "candidate_ids": []}
-                if badcase_config.get("automatic_detection") == "candidate_only":
+                if (
+                    badcase_automation_enabled
+                    and badcase_config.get("automatic_detection") == "candidate_only"
+                ):
                     detection_result = detect_badcase_candidates(store)
                 completion_result = None
                 completion_config = (
@@ -8458,7 +8466,11 @@ def auto_sync_project(
                     else {}
                 )
                 completion_triggers = set(completion_config.get("triggers") or [])
-                if bool(completion_config.get("enabled", True)) and trigger in completion_triggers:
+                if (
+                    badcase_automation_enabled
+                    and bool(completion_config.get("enabled", True))
+                    and trigger in completion_triggers
+                ):
                     try:
                         completion_result = test_hub_dev_complete(
                             store,
@@ -8475,6 +8487,7 @@ def auto_sync_project(
                     rebuild_index_for_store(store)
                 if results:
                     results[-1]["index_rebuilt"] = index_rebuilt
+                    results[-1]["badcase_automation_enabled"] = badcase_automation_enabled
                     results[-1]["badcase_candidates_added"] = int(detection_result.get("added") or 0)
                     results[-1]["completion_tests"] = completion_result
             except Exception as exc:

@@ -142,9 +142,11 @@ an explicit transition; a post-probation recurrence can recommend reactivation.
 ## Automatic completion and views
 
 Prompt submission remains a bounded append. Trace reconciliation, candidate
-detection, approved Stop/Goal completion tests, and view rebuilding occur in
-the existing detached coalesced worker under project/global locks. Test failure
-does not change hook exit status.
+detection, approved Stop/Goal completion tests, and view rebuilding use the
+existing detached coalesced worker under project/global locks. Candidate
+detection and completion tests run only when `badcases.automation_enabled` is
+explicitly set to `true`; the default is `false`, and manual commands remain
+available. Test failure does not change hook exit status.
 
 Canonical JSONL lives under `badcases/`. `index/BADCASES.md`,
 `index/TEST_HUB.md`, `index/CONTEXT.md`, `index/test-hub/index.html`, and per-case
